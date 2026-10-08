@@ -36,7 +36,7 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
 # Module 1 thresholds (applied identically on every chain)
 POLL_SECONDS = 60
-MIN_PEAK_MC = 10_000_000
+MIN_PEAK_MC = float(os.getenv("MIN_PEAK_MC", "10000000"))
 RETRACE_MIN, RETRACE_MAX = 60.0, 75.0
 MIN_LIQ_TO_MC = 0.06
 MIN_VOL_TO_MC = 0.50
@@ -44,6 +44,22 @@ MIN_TRADERS_24H = 1_000
 MIN_PAIR_AGE_HOURS = 24
 COOLDOWN_SECONDS = 12 * 3600
 MIN_LIVE_LIQUIDITY_USD = 1_000  # pairs below this are treated as dead/drained
+
+# Auto-discovery (the bot finds coins by itself; TOKEN_LIST becomes optional)
+AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "true").lower() != "false"
+DISCOVERY_SECONDS = int(os.getenv("DISCOVERY_SECONDS", "300"))
+MAX_DISCOVERED = int(os.getenv("MAX_DISCOVERED", "400"))
+DISMISS_SECONDS = 24 * 3600          # coins judged hopeless are ignored for 24h
+MAX_BACKFILL_PER_CYCLE = 8           # peak look-ups per minute (free API allows ~30/min)
+MIN_MC_FRACTION = 0.25               # a coin can't be 60-75% down from a peak >= MIN_PEAK_MC
+                                     # unless its current MC is >= 25% of MIN_PEAK_MC
+DISCOVERY_FEEDS = [
+    "https://api.dexscreener.com/token-profiles/latest/v1",
+    "https://api.dexscreener.com/token-boosts/latest/v1",
+    "https://api.dexscreener.com/token-boosts/top/v1",
+]
+GECKO_NETWORK = {"solana": "solana", "ethereum": "eth", "bsc": "bsc",
+                 "base": "base", "robinhood": "robinhood"}
 
 # Module 2 threshold
 MIN_WHALE_TRADE_USD = 5_000
@@ -166,14 +182,15 @@ def short(addr: str) -> str:
 # STATE (peaks + cooldowns), JSON-persisted
 # ----------------------------------------------------------------------------
 _state_lock = threading.Lock()
-state = {"peaks": {}, "cooldowns": {}}
+state = {"peaks": {}, "cooldowns": {}, "discovered": {}, "dismissed": {},
+         "backfilled": {}, "bf_fails": {}}
 
 
 def load_state():
     try:
         with open(STATE_FILE) as f:
             loaded = json.load(f)
-        for bucket in ("peaks", "cooldowns"):
+        for bucket in list(state):
             for k, v in (loaded.get(bucket) or {}).items():
                 state[bucket][k if ":" in k else f"solana:{k}"] = v  # migrate v1 keys
     except (FileNotFoundError, json.JSONDecodeError):
@@ -352,13 +369,122 @@ def build_rerun_message(chain: str, pair: dict, m: dict) -> str:
     )
 
 
+def watch_list() -> list[tuple[str, str]]:
+    """Manual TOKEN_LIST plus everything auto-discovered."""
+    seen, out = set(), []
+    for chain, addr in list(TOKENS) + [tuple(k.split(":", 1)) for k in state["discovered"]]:
+        if (chain, addr) not in seen:
+            seen.add((chain, addr))
+            out.append((chain, addr))
+    return out
+
+
+def dismiss(key: str):
+    state["discovered"].pop(key, None)
+    state["dismissed"][key] = time.time()
+
+
+def discover_tokens() -> int:
+    """Pull DexScreener's free profile/boost feeds and add coins on our chains."""
+    now = time.time()
+    manual = set(TOKENS)
+    for k in [k for k, t in state["dismissed"].items() if now - t > DISMISS_SECONDS]:
+        state["dismissed"].pop(k, None)
+    added = 0
+    for url in DISCOVERY_FEEDS:
+        try:
+            r = http.get(url, timeout=15)
+            r.raise_for_status()
+            items = r.json()
+        except (requests.RequestException, ValueError) as e:
+            log.warning("discovery feed failed (%s): %s", url.rsplit("/", 2)[-2], e)
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            chain = norm_chain(str(it.get("chainId", "")))
+            addr = it.get("tokenAddress")
+            if not chain or not addr:
+                continue
+            addr = norm_addr(chain, addr)
+            key = sk(chain, addr)
+            if (chain, addr) in manual or key in state["discovered"] or key in state["dismissed"]:
+                continue
+            state["discovered"][key] = now
+            added += 1
+    overflow = len(state["discovered"]) - MAX_DISCOVERED
+    if overflow > 0:  # drop the oldest
+        for k in sorted(state["discovered"], key=state["discovered"].get)[:overflow]:
+            state["discovered"].pop(k, None)
+    return added
+
+
+def passes_cheap_checks(pair: dict) -> bool:
+    """Everything except peak/retrace - used to decide if a peak look-up is worth it."""
+    mc = num(pair, "marketCap") or num(pair, "fdv")
+    if mc < MIN_PEAK_MC * MIN_MC_FRACTION:
+        return False
+    created = num(pair, "pairCreatedAt")
+    age_h = (time.time() * 1000 - created) / 3_600_000 if created else 0.0
+    traders = num(pair, "txns", "h24", "buys") + num(pair, "txns", "h24", "sells")
+    return (age_h >= MIN_PAIR_AGE_HOURS
+            and num(pair, "liquidity", "usd") / mc >= MIN_LIQ_TO_MC
+            and num(pair, "volume", "h24") >= mc * MIN_VOL_TO_MC
+            and traders >= MIN_TRADERS_24H)
+
+
+def fetch_peak_mc(chain: str, pair: dict):
+    """
+    Estimate all-time-high market cap from GeckoTerminal daily candles:
+    highest daily high x (current market cap / current price).
+    """
+    net, pool = GECKO_NETWORK.get(chain), pair.get("pairAddress")
+    price = num(pair, "priceUsd")
+    mc = num(pair, "marketCap") or num(pair, "fdv")
+    if not (net and pool and price > 0 and mc > 0):
+        return None
+    r = http.get(
+        f"https://api.geckoterminal.com/api/v2/networks/{net}/pools/{pool}/ohlcv/day",
+        params={"aggregate": 1, "limit": 1000, "currency": "usd"},
+        headers={"Accept": "application/json;version=20230302"}, timeout=20)
+    r.raise_for_status()
+    candles = r.json()["data"]["attributes"]["ohlcv_list"]
+    highs = [float(c[2]) for c in candles if len(c) >= 3]
+    return max(highs) * (mc / price) if highs else None
+
+
+def maybe_backfill_peak(key: str, chain: str, pair: dict, budget: list):
+    if key in state["backfilled"] or budget[0] <= 0 or not passes_cheap_checks(pair):
+        return
+    budget[0] -= 1
+    time.sleep(2.2)  # stay under GeckoTerminal's free rate limit
+    try:
+        peak = fetch_peak_mc(chain, pair)
+    except (requests.RequestException, KeyError, ValueError, TypeError) as e:
+        peak = None
+        log.warning("peak look-up failed for %s: %s", key, e)
+    if peak:
+        state["peaks"][key] = max(state["peaks"].get(key, 0.0), peak)
+        state["backfilled"][key] = time.time()
+        log.info("peak for %s estimated at %s", key, fmt_usd(state["peaks"][key]))
+    else:
+        state["bf_fails"][key] = state["bf_fails"].get(key, 0) + 1
+        if state["bf_fails"][key] >= 3:  # give up, rely on locally observed peak
+            state["backfilled"][key] = time.time()
+
+
 def scan_once():
-    if not TOKENS:
-        log.warning("TOKEN_LIST is empty - nothing to scan")
+    watch = watch_list()
+    if not watch:
+        log.warning("Nothing to scan yet (no TOKEN_LIST and nothing discovered)")
         return
     now = time.time()
+    manual = set(TOKENS)
+    budget = [MAX_BACKFILL_PER_CYCLE]
+    checked = alerts = 0
+
     by_chain: dict[str, list[str]] = {}
-    for chain, addr in TOKENS:
+    for chain, addr in watch:
         by_chain.setdefault(chain, []).append(addr)
 
     for chain, addrs in by_chain.items():
@@ -377,26 +503,47 @@ def scan_once():
 
             for addr in batch:
                 key = sk(chain, addr)
+                is_manual = (chain, addr) in manual
                 pair = best_live_pair(grouped.get(norm_addr(chain, addr), []))
-                if not pair:
-                    log.info("%s: no live pair (dead/migrated/drained) - skipped", key)
+                if not pair:  # dead / migrated / drained
+                    if not is_manual:
+                        dismiss(key)
                     continue
+                mc = num(pair, "marketCap") or num(pair, "fdv")
+                if not is_manual and mc < MIN_PEAK_MC * MIN_MC_FRACTION:
+                    dismiss(key)  # too small to ever qualify
+                    continue
+
+                maybe_backfill_peak(key, chain, pair, budget)
+                checked += 1
                 passed, m, failed = evaluate(key, pair)
                 sym = pair["baseToken"].get("symbol")
                 if not passed:
-                    log.info("[%s] %s no alert: %s", chain, sym, "; ".join(failed))
+                    if len(failed) <= 1:  # near miss - worth seeing in the logs
+                        log.info("[%s] %s NEAR MISS: %s", chain, sym, "; ".join(failed))
                     continue
                 if now - state["cooldowns"].get(key, 0) < COOLDOWN_SECONDS:
                     log.info("%s passed filters but is on cooldown", key)
                     continue
                 if send_telegram(build_rerun_message(chain, pair, m)):
                     state["cooldowns"][key] = now
+                    alerts += 1
                     log.info("ALERT sent for %s", key)
     save_state()
+    log.info("Scan complete: %d coins checked (%d auto-discovered pool, %d manual), %d alerts",
+             checked, len(state["discovered"]), len(manual), alerts)
 
 
 async def scanner_loop():
+    last_discovery = 0.0
     while True:
+        if AUTO_DISCOVER and time.time() - last_discovery >= DISCOVERY_SECONDS:
+            try:
+                added = await asyncio.to_thread(discover_tokens)
+                log.info("Discovery: +%d new coins (pool now %d)", added, len(state["discovered"]))
+            except Exception:
+                log.exception("discovery error")
+            last_discovery = time.time()
         try:
             await asyncio.to_thread(scan_once)
         except Exception:
@@ -584,8 +731,10 @@ async def lifespan(app: FastAPI):
     log.info("EVM whale wallets configured: %d", len(EVM_WHALES))
     await asyncio.to_thread(
         send_telegram,
-        f"✅ Bot is online and watching {len(TOKENS)} token(s). "
-        "You'll get a message here when one matches your filters.",
+        "✅ Bot is online. "
+        + ("Auto-discovery is ON - it finds coins by itself. " if AUTO_DISCOVER else "")
+        + f"Manually watching {len(TOKENS)} coin(s). "
+        "You'll get a message here when a coin matches your filters.",
     )
     task = asyncio.create_task(scanner_loop())
     yield
@@ -599,7 +748,7 @@ app = FastAPI(title="Multi-Chain Alert Bot", lifespan=lifespan)
 @app.get("/")
 @app.get("/health")
 def health():
-    return {"status": "ok", "tracked_tokens": len(TOKENS), "chains": sorted(CHAINS)}
+    return {"status": "ok", "manual_tokens": len(TOKENS), "discovered_tokens": len(state["discovered"]), "chains": sorted(CHAINS)}
 
 
 def process_helius(txs: list) -> int:
