@@ -602,12 +602,7 @@ def health():
     return {"status": "ok", "tracked_tokens": len(TOKENS), "chains": sorted(CHAINS)}
 
 
-@app.post("/webhook")
-def webhook_solana(payload: list | dict, authorization: str | None = Header(default=None)):
-    """Helius enhanced webhook (Solana). Sync def -> runs in a threadpool."""
-    if WEBHOOK_SECRET and authorization != WEBHOOK_SECRET:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    txs = payload if isinstance(payload, list) else [payload]
+def process_helius(txs: list) -> int:
     sent = 0
     for tx in txs:
         try:
@@ -618,6 +613,20 @@ def webhook_solana(payload: list | dict, authorization: str | None = Header(defa
                 sent += 1
         except Exception:
             log.exception("failed to process Solana tx")
+    return sent
+
+
+@app.post("/webhook")
+async def webhook_solana(request: Request, authorization: str | None = Header(default=None)):
+    """Helius enhanced webhook (Solana)."""
+    if WEBHOOK_SECRET and authorization != WEBHOOK_SECRET:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    txs = payload if isinstance(payload, list) else [payload]
+    sent = await asyncio.to_thread(process_helius, txs)
     return {"received": len(txs), "alerts_sent": sent}
 
 
