@@ -247,10 +247,27 @@ def send_telegram(text: str) -> bool:
 # ----------------------------------------------------------------------------
 # DEXSCREENER HELPERS
 # ----------------------------------------------------------------------------
+def get_with_retry(url: str, tries: int = 4, **kw):
+    """GET that backs off and retries when the API says 'Too Many Requests' (429) or errors (5xx).
+    Render's free servers share an IP address, so 429s are common."""
+    kw.setdefault("timeout", 15)
+    for attempt in range(1, tries + 1):
+        r = http.get(url, **kw)
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < tries:
+            try:
+                wait = float(r.headers.get("Retry-After", ""))
+            except (TypeError, ValueError):
+                wait = 4.0 * attempt
+            time.sleep(min(wait, 20.0))
+            continue
+        r.raise_for_status()
+        return r
+    return r
+
+
 def fetch_pairs(chain: str, addrs: list[str]) -> list[dict]:
     """Up to 30 comma-separated token addresses per call, one chain per call."""
-    r = http.get(f"{DEX_API}/{chain}/{','.join(addrs)}", timeout=15)
-    r.raise_for_status()
+    r = get_with_retry(f"{DEX_API}/{chain}/{','.join(addrs)}")
     data = r.json()
     return data if isinstance(data, list) else (data.get("pairs") or [])
 
@@ -390,14 +407,16 @@ def discover_tokens() -> int:
     manual = set(TOKENS)
     for k in [k for k, t in state["dismissed"].items() if now - t > DISMISS_SECONDS]:
         state["dismissed"].pop(k, None)
-    added = 0
-    for url in DISCOVERY_FEEDS:
+    added = failures = 0
+    for n, url in enumerate(DISCOVERY_FEEDS):
+        if n:
+            time.sleep(3)  # space the three feed calls out
         try:
-            r = http.get(url, timeout=15)
-            r.raise_for_status()
-            items = r.json()
+            items = get_with_retry(url).json()
         except (requests.RequestException, ValueError) as e:
-            log.warning("discovery feed failed (%s): %s", url.rsplit("/", 2)[-2], e)
+            failures += 1
+            status = getattr(getattr(e, "response", None), "status_code", "error")
+            log.warning("discovery feed busy (%s) on %s", status, url.rsplit("/", 2)[-2])
             continue
         if not isinstance(items, list):
             continue
@@ -412,6 +431,8 @@ def discover_tokens() -> int:
                 continue
             state["discovered"][key] = now
             added += 1
+    if failures == len(DISCOVERY_FEEDS):
+        return -1  # every feed failed - caller retries soon
     overflow = len(state["discovered"]) - MAX_DISCOVERED
     if overflow > 0:  # drop the oldest
         for k in sorted(state["discovered"], key=state["discovered"].get)[:overflow]:
@@ -476,7 +497,7 @@ def maybe_backfill_peak(key: str, chain: str, pair: dict, budget: list):
 def scan_once():
     watch = watch_list()
     if not watch:
-        log.warning("Nothing to scan yet (no TOKEN_LIST and nothing discovered)")
+        log.info("Nothing to scan yet - waiting for discovery to find coins")
         return
     now = time.time()
     manual = set(TOKENS)
@@ -490,10 +511,12 @@ def scan_once():
     for chain, addrs in by_chain.items():
         for i in range(0, len(addrs), 30):
             batch = addrs[i:i + 30]
+            time.sleep(1.0)  # space requests out - Render's shared IP gets rate-limited easily
             try:
                 pairs = fetch_pairs(chain, batch)
             except requests.RequestException as e:
-                log.error("[%s] DexScreener fetch failed: %s", chain, e)
+                status = getattr(getattr(e, "response", None), "status_code", "error")
+                log.warning("[%s] DexScreener busy (%s) - will retry next minute", chain, status)
                 continue
 
             grouped: dict[str, list[dict]] = {}
@@ -535,12 +558,17 @@ def scan_once():
 
 
 async def scanner_loop():
-    last_discovery = 0.0
+    last_discovery, wait_for = 0.0, 0
     while True:
-        if AUTO_DISCOVER and time.time() - last_discovery >= DISCOVERY_SECONDS:
+        if AUTO_DISCOVER and time.time() - last_discovery >= wait_for:
+            wait_for = DISCOVERY_SECONDS
             try:
                 added = await asyncio.to_thread(discover_tokens)
-                log.info("Discovery: +%d new coins (pool now %d)", added, len(state["discovered"]))
+                if added < 0:
+                    wait_for = 90  # all feeds failed (rate limited) - try again in 90s
+                    log.warning("Discovery failed this round, retrying in %ds", wait_for)
+                else:
+                    log.info("Discovery: +%d new coins (pool now %d)", added, len(state["discovered"]))
             except Exception:
                 log.exception("discovery error")
             last_discovery = time.time()
