@@ -87,7 +87,7 @@ GECKO_DEEP_PAGES = min(10, int(os.getenv("GECKO_DEEP_PAGES", "8")))  # one chain
 MAX_COIN_MC = 1_000_000_000                                  # coins above $1B never do a 60-75% re-run setup
 
 # --- Staying awake, status check-ins, double-copy detection --------------------
-BOT_VERSION = "2.4"
+BOT_VERSION = "2.5"
 # Render's free plan puts a service to sleep after 15 minutes without incoming web traffic, so the bot
 # visits its own web address every few minutes. Render fills in RENDER_EXTERNAL_URL by itself.
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
@@ -112,6 +112,14 @@ NARR_MIN_TRADERS = int(os.getenv("NARR_MIN_TRADERS", "500"))
 NARR_MAX_H24 = float(os.getenv("NARR_MAX_H24", "150"))   # % - skip coins that already ran
 NARR_MIN_AGE_H = float(os.getenv("NARR_MIN_AGE_H", "3"))
 NARR_MAX_PER_DAY = int(os.getenv("NARR_MAX_PER_DAY", "5"))
+NARR_MIN_H24 = float(os.getenv("NARR_MIN_H24", "-35"))              # % - skip coins that are already dumping
+NARR_MIN_LIQ_RATIO = float(os.getenv("NARR_MIN_LIQ_RATIO", "0.05"))  # liquidity / market cap
+NARR_MAX_VOL_LIQ = float(os.getenv("NARR_MAX_VOL_LIQ", "80"))       # 24h volume / liquidity; far above = bots trading with themselves
+
+# --- Protection against one-off bad readings (they happen, above all on brand-new chains) ---
+CONFIRM_MIN_GAP = 20      # seconds: an alert needs two separate scans to agree...
+CONFIRM_MAX_GAP = 300     # ...and they must be no more than this far apart
+RUG_CONFIRM_SECONDS = 240  # a coin with no live pool at all must stay that way this long before it counts as a rug
 
 DEFAULT_THEMES = {
     "stocks": "stonk,stonks,stock,stocks,nasdaq,nyse,nvda,nvidia,tsla,tesla,mstr,spy,aapl,msft,amzn,"
@@ -731,6 +739,31 @@ def maybe_backfill_peak(key: str, chain: str, pair: dict, budget: list):
 last_scan: dict = {}        # what the latest scan saw (feeds the status check-in and /status)
 bot_stats: Counter = Counter()   # alerts sent since this copy of the bot started
 
+_pending: dict[str, tuple[float, float]] = {}   # alert key -> (when first seen, market cap then)
+_missing: Counter = Counter()                    # coin key -> scans in a row with no live pool
+
+
+def confirmed_twice(tag: str, key: str, mc: float, now: float) -> bool:
+    """A new alert is only sent when the coin passed on two separate scans with a similar market cap.
+    One odd price reading (bad data, a one-second spike) therefore can't trigger an alert on its own."""
+    for old in [k for k, (t, _) in _pending.items() if now - t > CONFIRM_MAX_GAP * 2]:
+        _pending.pop(old, None)
+    k = f"{tag}:{key}"
+    prev = _pending.get(k)
+    if (prev and prev[1] > 0 and CONFIRM_MIN_GAP <= now - prev[0] <= CONFIRM_MAX_GAP
+            and 0.7 <= mc / prev[1] <= 1.43):
+        _pending.pop(k, None)
+        return True
+    if not prev or now - prev[0] > CONFIRM_MIN_GAP:  # start (or restart) the wait with this reading
+        _pending[k] = (now, mc)
+    return False
+
+
+def chain_note(chain: str) -> str:
+    """Honest warning for the newest chain, where DexScreener's numbers have been seen to jump around."""
+    return ("⚠️ Robinhood Chain is brand new: DexScreener's numbers for it can jump around. "
+            "Check the chart yourself first.\n" if chain == "robinhood" else "")
+
 
 def scan_once():
     global last_scan
@@ -760,6 +793,11 @@ def scan_once():
                 log.warning("[%s] DexScreener busy (%s) - will retry next minute", chain, status)
                 errors += 1
                 continue
+            if len(batch) >= 3 and not pairs:
+                # several coins and not one answer: a hiccup on their side, not 3+ dead coins at once
+                log.warning("[%s] DexScreener sent an empty answer for %d coins - ignoring it", chain, len(batch))
+                errors += 1
+                continue
 
             grouped: dict[str, list[dict]] = {}
             for p in pairs:
@@ -769,16 +807,21 @@ def scan_once():
             for addr in batch:
                 key = sk(chain, addr)
                 is_manual = (chain, addr) in manual
-                pair = best_live_pair(grouped.get(norm_addr(chain, addr), []))
+                pairs_here = grouped.get(norm_addr(chain, addr), [])
+                pair = best_live_pair(pairs_here)
                 if not pair:  # dead / migrated / drained
                     if open_records(key):
-                        track(key, 0.0, now)  # liquidity gone -> counts as a stop-out
+                        track(key, 0.0, now)  # liquidity gone -> counts as a rug once it has lasted a few minutes
                     elif not is_manual:
-                        dismiss(key)
+                        _missing[key] += 1
+                        if _missing[key] >= 2:  # gone on two scans in a row: not just a one-off hiccup
+                            _missing.pop(key, None)
+                            dismiss(key)
                     continue
+                _missing.pop(key, None)
                 mc = num(pair, "marketCap") or num(pair, "fdv")
                 sym = pair["baseToken"].get("symbol", "?")
-                track(key, mc, now)  # update outcomes of earlier calls on this coin
+                track(key, mc, now, pair, pairs_here)  # update outcomes of earlier calls on this coin
 
                 if not is_manual and mc > MAX_COIN_MC and not open_records(key):
                     dismiss(key)
@@ -817,9 +860,13 @@ def scan_once():
                 if now - state["cooldowns"].get(key, 0) < COOLDOWN_SECONDS:
                     log.info("%s passed filters but is on cooldown", key)
                     continue
+                if not confirmed_twice("rerun", key, m["mc"], now):
+                    log.info("%s passes every filter - the alert goes out if the next scan agrees", key)
+                    continue
                 th, sw = themes_for(key, pair), len(recent_wallets(key))
                 extra = ((f"🏷 Themes: {', '.join(th)}\n" if th else "")
-                         + (f"👛 Tracked wallets that bought in the last 24h: {sw}\n" if sw else ""))
+                         + (f"👛 Tracked wallets that bought in the last 24h: {sw}\n" if sw else "")
+                         + chain_note(chain))
                 if send_telegram(build_rerun_message(chain, pair, m, extra)):
                     state["cooldowns"][key] = now
                     add_record("call", key, chain, pair, m, "", now)
@@ -911,6 +958,8 @@ def add_record(kind: str, key: str, chain: str, pair: dict, m: dict, failed: str
         "key": key, "chain": chain, "sym": pair.get("baseToken", {}).get("symbol", "?"),
         "kind": kind, "failed": failed, "t0": now, "mc0": m["mc"], "max_mc": m["mc"],
         "min_mc": m["mc"], "best": 1.0, "final": 1.0, "status": "open", "t1": None,
+        # which pool + price the call was made on, so later readings are measured the same way
+        "pa": pair.get("pairAddress", ""), "p0": num(pair, "priceUsd"), "last": m["mc"],
         "themes": themes_for(key, pair), "sw": len(recent_wallets(key)),
         "m": {k: round(float(m[k]), 4) for k in ("retrace", "liq_ratio", "vol_ratio", "traders", "age_h", "peak")},
     }
@@ -929,20 +978,58 @@ def maybe_add_shadow(key: str, chain: str, pair: dict, m: dict, code: str, now: 
     add_record("shadow", key, chain, pair, m, code, now)
 
 
-def track(key: str, mc: float, now: float):
-    """Update every open record on this coin; close it on win / stop / expiry. mc=0 means rugged."""
+def read_mc(r: dict, mc: float, pair: dict | None, pairs: list[dict] | None) -> float | None:
+    """Where is this call's coin right now, in the same market-cap terms as when the call was made?
+    It is measured by the PRICE on the pool the call was made on (falling back to the best live pool if
+    that one was drained), because DexScreener's market-cap field can jump between 'marketCap' and 'fdv'
+    or between pools. 0.0 = no live pool left; None = no usable reading this time."""
+    if pair is None:
+        return 0.0
+    p0 = float(r.get("p0") or 0.0)
+    if p0 <= 0:  # record made by an older version of the bot: plain market-cap reading
+        return mc if mc > 0 else None
+    # stay on the original pool while it still holds a real share of the liquidity (a leftover dust pool
+    # after a migration can show a stale price, so it must not be followed forever)
+    floor = max(MIN_LIVE_LIQUIDITY_USD, 0.2 * num(pair, "liquidity", "usd"))
+    same = next((p for p in (pairs or []) if p.get("pairAddress") == r.get("pa")
+                 and num(p, "liquidity", "usd") >= floor), None)
+    px = num(same or pair, "priceUsd")
+    return r["mc0"] * px / p0 if px > 0 else None
+
+
+def track(key: str, mc: float, now: float, pair: dict | None = None, pairs: list[dict] | None = None):
+    """Update every open record on this coin; close it on win / stop / expiry. pair=None means no live pool.
+    A stop or a win only counts when TWO readings in a row agree, so one odd reading can't end a call."""
     for r in open_records(key):
-        if mc > 0:
-            r["max_mc"] = max(r["max_mc"], mc)
-            r["min_mc"] = min(r["min_mc"], mc)
+        cur = read_mc(r, mc, pair, pairs)
+        if cur is None:  # nothing usable this time - only the clock can end the call
+            if now - r["t0"] >= TRACK_HOURS * 3600:
+                close_record(r, "expired", r.get("last", r["mc0"]), now)
+            continue
+        prev = r.get("last", cur)
+        r["last"] = cur
+        if cur > 0:
+            r.pop("z", None)
+        else:
+            r.setdefault("z", now)               # since when has this coin had no live pool at all?
+        hi, lo = max(cur, prev), min(cur, prev)
+        r["max_mc"] = max(r["max_mc"], lo)       # a new high counts once two readings in a row reach it
+        if hi > 0:
+            r["min_mc"] = min(r["min_mc"], hi)   # ...and a new low once two in a row are at or under it
         r["best"] = round(r["max_mc"] / r["mc0"], 3)
-        r["final"] = round(mc / r["mc0"], 3)
-        if mc <= STOP_MULTIPLE * r["mc0"]:
-            close_record(r, "stop", mc, now)
+        r["final"] = round(cur / r["mc0"], 3)
+        # "no live pool" must last a few minutes before it counts as a rug (a data outage looks the same)
+        if hi <= STOP_MULTIPLE * r["mc0"] and (cur > 0 or now - r["z"] >= RUG_CONFIRM_SECONDS):
+            log.info("STOP %s: reading %s (%.2fx) twice in a row; pool %s", key, fmt_usd(cur),
+                     cur / r["mc0"], r.get("pa") or "?")
+            close_record(r, "stop", cur, now)
         elif r["max_mc"] >= WIN_MULTIPLE * r["mc0"]:
-            close_record(r, "win", mc, now)
+            close_record(r, "win", cur, now)
         elif now - r["t0"] >= TRACK_HOURS * 3600:
-            close_record(r, "expired", mc, now)
+            close_record(r, "expired", cur, now)
+        elif cur <= STOP_MULTIPLE * r["mc0"]:
+            log.info("%s: one reading of %s (%.2fx of the call) - waiting for a second one to agree",
+                     key, fmt_usd(cur), cur / r["mc0"])
 
 
 def close_record(r: dict, outcome: str, mc: float, now: float):
@@ -953,14 +1040,15 @@ def close_record(r: dict, outcome: str, mc: float, now: float):
         return
     if r["kind"] not in ALERT_KINDS:
         return  # experiments close silently
-    hrs = (now - r["t0"]) / 3600
     tag = "NARRATIVE " if r["kind"] == "narrative" else ""
     head = {"win": f"🎯 *{tag}CALL HIT*", "stop": f"🛑 *{tag}CALL STOPPED OUT*",
             "expired": f"⏱ *{tag}CALL EXPIRED*"}[outcome]
+    fast = ("\n⚡ That was very fast - look at the chart: it is either a rug or bad price data."
+            if outcome == "stop" and now - r["t0"] < 900 else "")
     send_telegram(
         f"{head}: ${md_escape(r['sym'])} | {CHAINS[r['chain']]['name']}\n"
         f"Called at {fmt_usd(r['mc0'])} → now {fmt_usd(mc)} (*{r['final']:.2f}x*, best {r['best']:.2f}x) "
-        f"after {hrs:.1f}h\nThe bot is learning from this result.")
+        f"after {ago(now - r['t0'])}{fast}\nThe bot is learning from this result.")
 
 
 def summarize(rs: list[dict]) -> dict:
@@ -1162,8 +1250,10 @@ def maybe_narrative(key: str, chain: str, pair: dict, now: float, m: dict | None
     if not m or not (NARR_MIN_MC <= m["mc"] <= NARR_MAX_MC):
         return False
     h24 = num(pair, "priceChange", "h24")
-    if (m["liq"] < NARR_MIN_LIQ or m["liq_ratio"] < 0.04 or m["vol_ratio"] < NARR_MIN_VOL_RATIO
-            or m["traders"] < NARR_MIN_TRADERS or m["age_h"] < NARR_MIN_AGE_H or h24 > NARR_MAX_H24):
+    if (m["liq"] < NARR_MIN_LIQ or m["liq_ratio"] < NARR_MIN_LIQ_RATIO or m["vol_ratio"] < NARR_MIN_VOL_RATIO
+            or m["traders"] < NARR_MIN_TRADERS or m["age_h"] < NARR_MIN_AGE_H
+            or h24 > NARR_MAX_H24 or h24 < NARR_MIN_H24            # already ran, or already dumping
+            or m["vol24"] > m["liq"] * NARR_MAX_VOL_LIQ):          # volume wildly out of line with the liquidity
         return False
     ckey = "narr:" + key
     if now - state["cooldowns"].get(ckey, 0) < 24 * 3600:
@@ -1171,6 +1261,8 @@ def maybe_narrative(key: str, chain: str, pair: dict, now: float, m: dict | None
     stamps = [t for t in state["tuning"].get("narr_ts", []) if now - t < 86400]
     state["tuning"]["narr_ts"] = stamps
     if len(stamps) >= NARR_MAX_PER_DAY:
+        return False
+    if not confirmed_twice("narr", key, m["mc"], now):
         return False
     sw = len(recent_wallets(key))
     base = pair.get("baseToken", {})
@@ -1182,7 +1274,8 @@ def maybe_narrative(key: str, chain: str, pair: dict, now: float, m: dict | None
         f"📊 24h volume: {fmt_usd(m['vol24'])} (*{m['vol_ratio']:.1f}x* its market cap)\n"
         f"👥 24h txns: {m['traders']:,}  |  📈 24h price: {h24:+.0f}%\n"
         + (f"👛 Tracked wallets that bought in the last 24h: {sw}\n" if sw else "")
-        + f"\n⚠️ Early-stage theme play, NOT a re-run setup - higher risk. Tracked for {TRACK_HOURS:.0f}h.\n\n"
+        + f"\n⚠️ Early-stage theme play, NOT a re-run setup - higher risk. Tracked for {TRACK_HOURS:.0f}h.\n"
+        + chain_note(chain) + "\n"
         f"`{addr}`\n\n"
         f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
         f"[Explorer]({link(chain, 'token', addr)})")
@@ -1641,7 +1734,11 @@ def build_checkin() -> str:
                   "; ".join(f"{fail_label(c)} ×{n}" for c, n in top)]
     sent = ", ".join(f"{n} {k}" for k, n in (("re-run", bot_stats["rerun"]), ("narrative", bot_stats["narrative"]),
                                               ("whale", bot_stats["whale"])))
-    L += ["", f"📣 Alerts sent since this copy started: {sent}.",
+    L += ["", f"⚙️ Rules in use: past high of at least {fmt_usd(MIN_PEAK_MC)}, now down {T['retrace_min']:.0f}-"
+              f"{T['retrace_max']:.0f}% from it, liquidity at least {T['liq'] * 100:.0f}% and 24h volume at least "
+              f"{T['vol'] * 100:.0f}% of market cap, {T['traders']:.0f}+ trades in 24h, pair at least "
+              f"{MIN_PAIR_AGE_HOURS}h old.",
+          f"📣 Alerts sent since this copy started: {sent}.",
           f"👀 Following now: {len(open_records(kind='call'))} calls, {len(open_records(kind='narrative'))} narrative, "
           f"{len(open_records(kind='shadow'))} experiments.",
           "ℹ️ No alert just means nothing passed ALL of your filters at once - that is by design.",
