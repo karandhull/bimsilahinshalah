@@ -15,10 +15,12 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import requests
 from fastapi import FastAPI, Header, Request
@@ -74,12 +76,28 @@ AUTO_TUNE = os.getenv("AUTO_TUNE", "false").lower() == "true"  # let the bot adj
 MIN_CALLS_TUNE = int(os.getenv("MIN_CALLS_TUNE", "10"))    # finished calls needed before self-tuning
 MIN_SHADOWS_TUNE = 8                                       # finished near-misses needed per experiment
 REPORT_EVERY_CALLS = int(os.getenv("REPORT_EVERY_CALLS", "3"))
-MAX_SHADOWS_OPEN = 60
 SHADOW_COOLDOWN = 24 * 3600
 TELEGRAM_BACKUP = os.getenv("TELEGRAM_BACKUP", "true").lower() != "false"
 BACKUP_TAG = "BOT_STATE_BACKUP v1"
-BACKUP_MIN_GAP = 300
+BACKUP_MIN_GAP = 300                  # never re-save the memory more often than this...
+BACKUP_REFRESH_SECONDS = 6 * 3600     # ...and re-save at least this often even if only prices moved
 MAX_SHADOWS_OPEN = 150
+GECKO_POOL_PAGES = int(os.getenv("GECKO_POOL_PAGES", "2"))   # pages (20 pools each) per chain, every round; 0 = off
+GECKO_DEEP_PAGES = min(10, int(os.getenv("GECKO_DEEP_PAGES", "8")))  # one chain per round is searched this deep
+MAX_COIN_MC = 1_000_000_000                                  # coins above $1B never do a 60-75% re-run setup
+
+# --- Staying awake, status check-ins, double-copy detection --------------------
+BOT_VERSION = "2.4"
+# Render's free plan puts a service to sleep after 15 minutes without incoming web traffic, so the bot
+# visits its own web address every few minutes. Render fills in RENDER_EXTERNAL_URL by itself.
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+KEEPALIVE_SECONDS = max(30, int(os.getenv("KEEPALIVE_SECONDS", "240")))
+KEEPALIVE_START_DELAY = 30                                # seconds to let the server finish starting first
+CHECKIN_HOURS = float(os.getenv("CHECKIN_HOURS", "6"))   # status message (closest coins etc.); 0 = off
+FIRST_CHECKIN_MINUTES = 12                                # first check-in this long after start-up
+HEARTBEAT_SECONDS = 300                                   # how often copies of the bot look for each other
+INSTANCE_ID = secrets.token_hex(3)                        # identifies THIS running copy of the bot
+STARTED_AT = time.time()
 
 # --- Smart wallets, themes, narrative radar -----------------------------------
 SMART_CLUSTER_MIN = int(os.getenv("SMART_CLUSTER_MIN", "2"))   # wallets buying the same coin...
@@ -183,7 +201,7 @@ SOL_QUOTES = SOL_STABLES | {WSOL}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 http = requests.Session()
-http.headers.update({"User-Agent": "multichain-alert-bot/2.0"})
+http.headers.update({"User-Agent": f"multichain-alert-bot/{BOT_VERSION}"})
 
 
 # ----------------------------------------------------------------------------
@@ -265,7 +283,11 @@ def merge_state(loaded: dict):
     state["backup"].update(loaded.get("backup") or {})
 
 
+restore_pending = False   # True if a memory backup exists but could not be read yet (never overwrite it!)
+
+
 def load_state():
+    global restore_pending
     loaded = None
     try:
         with open(STATE_FILE) as f:
@@ -281,7 +303,8 @@ def load_state():
             else:
                 log.info("No Telegram backup found - starting with a fresh memory")
         except Exception as e:
-            log.warning("Could not restore from Telegram backup: %s", scrub(e))
+            restore_pending = True  # Telegram hiccup: retry later and don't overwrite the saved memory meanwhile
+            log.warning("Could not restore from Telegram backup (will retry): %s", scrub(e))
     try:
         for ref, peak in json.loads(RAW_PEAK_SEEDS).items():
             t = parse_token_ref(ref)
@@ -557,12 +580,87 @@ def discover_tokens() -> int:
             if desc:
                 state["meta"][key] = {"d": desc}  # used for theme detection
             added += 1
-    if failures == len(DISCOVERY_FEEDS):
+    try:
+        added += discover_from_volume_leaders(now)
+    except Exception:
+        log.exception("volume-leader discovery error")
+    if failures == len(DISCOVERY_FEEDS) and not added:
         return -1  # every feed failed - caller retries soon
     overflow = len(state["discovered"]) - MAX_DISCOVERED
     if overflow > 0:  # drop the oldest
         for k in sorted(state["discovered"], key=state["discovered"].get)[:overflow]:
             state["discovered"].pop(k, None)
+    return added
+
+
+def is_quote_token(chain: str, addr: str) -> bool:
+    """SOL / ETH / BNB / stablecoins - never a coin we want to scan."""
+    if chain == "solana":
+        return addr in SOL_QUOTES
+    return addr == WRAPPED_NATIVE.get(chain) or addr in EVM_STABLES.get(chain, set())
+
+
+_gecko_round = 0
+_gecko_skip: set = set()   # chains GeckoTerminal says it doesn't know (nothing to look up there)
+
+
+def discover_from_volume_leaders(now: float) -> int:
+    """
+    Add the highest-24h-volume pools on each chain (GeckoTerminal, free). Coins that already
+    have real volume and a real market cap are exactly the ones that can do a re-run.
+    Every round looks at the top GECKO_POOL_PAGES pages of each chain, and one chain per round (taking turns)
+    is searched much deeper, because mid-size coins - the usual re-run candidates - sit further down the list.
+    """
+    global _gecko_round
+    if GECKO_POOL_PAGES <= 0:
+        return 0
+    manual, added = set(TOKENS), 0
+    live = [c for c in GECKO_NETWORK if c not in _gecko_skip]
+    deep_chain = live[_gecko_round % len(live)] if live else None
+    _gecko_round += 1
+    for chain in live:
+        net = GECKO_NETWORK[chain]
+        last_page = max(GECKO_POOL_PAGES, GECKO_DEEP_PAGES) if chain == deep_chain else GECKO_POOL_PAGES
+        for page in range(1, last_page + 1):
+            time.sleep(2.5)  # GeckoTerminal's free limit is ~30 calls/min
+            try:
+                r = get_with_retry(
+                    f"https://api.geckoterminal.com/api/v2/networks/{net}/pools", tries=2,
+                    params={"page": page, "sort": "h24_volume_usd_desc"},
+                    headers={"Accept": "application/json;version=20230302"}, timeout=20)
+                pools = r.json().get("data") or []
+            except (requests.RequestException, ValueError) as e:
+                status = getattr(getattr(e, "response", None), "status_code", "error")
+                if status == 404 and page == 1:
+                    _gecko_skip.add(chain)
+                    log.warning("GeckoTerminal does not list %s - leaving it out of the volume-leader search", chain)
+                else:
+                    log.warning("volume-leader feed busy (%s) for %s", status, chain)
+                    bot_stats["gecko_busy"] += 1
+                break
+            if not pools:
+                break
+            for pool in pools:
+                try:
+                    attrs = pool.get("attributes") or {}
+                    base_id = ((pool.get("relationships") or {}).get("base_token") or {}).get("data", {}).get("id", "")
+                    if "_" not in base_id:
+                        continue
+                    addr = norm_addr(chain, base_id.split("_", 1)[1])
+                    key = sk(chain, addr)
+                    if (is_quote_token(chain, addr) or (chain, addr) in manual
+                            or key in state["discovered"] or key in state["dismissed"]):
+                        continue
+                    mc = float(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or 0)
+                    if not (MIN_PEAK_MC * MIN_MC_FRACTION <= mc <= MAX_COIN_MC):
+                        continue
+                    created = datetime.fromisoformat(str(attrs.get("pool_created_at", "")).replace("Z", "+00:00"))
+                    if now - created.timestamp() < MIN_PAIR_AGE_HOURS * 3600:
+                        continue
+                    state["discovered"][key] = now
+                    added += 1
+                except (ValueError, TypeError, AttributeError):
+                    continue
     return added
 
 
@@ -591,11 +689,10 @@ def fetch_peak_mc(chain: str, pair: dict):
     mc = num(pair, "marketCap") or num(pair, "fdv")
     if not (net and pool and price > 0 and mc > 0):
         return None
-    r = http.get(
+    r = get_with_retry(
         f"https://api.geckoterminal.com/api/v2/networks/{net}/pools/{pool}/ohlcv/day",
         params={"aggregate": 1, "limit": 1000, "currency": "usd"},
         headers={"Accept": "application/json;version=20230302"}, timeout=20)
-    r.raise_for_status()
     candles = r.json()["data"]["attributes"]["ohlcv_list"]
     highs = [float(c[2]) for c in candles if len(c) >= 3]
     return max(highs) * (mc / price) if highs else None
@@ -608,7 +705,17 @@ def maybe_backfill_peak(key: str, chain: str, pair: dict, budget: list):
     time.sleep(2.2)  # stay under GeckoTerminal's free rate limit
     try:
         peak = fetch_peak_mc(chain, pair)
-    except (requests.RequestException, KeyError, ValueError, TypeError) as e:
+    except requests.RequestException as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (None, 429, 500, 502, 503, 504):
+            # busy / timed out: that says nothing about this coin, so don't count it as a failure
+            log.warning("peak look-up busy (%s) for %s - will retry", status or "timeout", key)
+            bot_stats["gecko_busy"] += 1
+            budget[0] = 0  # the shared connection is being throttled - stop look-ups for this minute
+            return
+        peak = None
+        log.warning("peak look-up failed for %s: %s", key, scrub(e))
+    except (KeyError, ValueError, TypeError) as e:
         peak = None
         log.warning("peak look-up failed for %s: %s", key, e)
     if peak:
@@ -621,7 +728,12 @@ def maybe_backfill_peak(key: str, chain: str, pair: dict, budget: list):
             state["backfilled"][key] = time.time()
 
 
+last_scan: dict = {}        # what the latest scan saw (feeds the status check-in and /status)
+bot_stats: Counter = Counter()   # alerts sent since this copy of the bot started
+
+
 def scan_once():
+    global last_scan
     watch = watch_list()
     if not watch:
         log.info("Nothing to scan yet - waiting for discovery to find coins")
@@ -629,7 +741,9 @@ def scan_once():
     now = time.time()
     manual = set(TOKENS)
     budget = [MAX_BACKFILL_PER_CYCLE]
-    checked = alerts = 0
+    checked = alerts = errors = 0
+    rows: list[dict] = []
+    fail_counts: Counter = Counter()
 
     by_chain: dict[str, list[str]] = {}
     for chain, addr in watch:
@@ -644,6 +758,7 @@ def scan_once():
             except requests.RequestException as e:
                 status = getattr(getattr(e, "response", None), "status_code", "error")
                 log.warning("[%s] DexScreener busy (%s) - will retry next minute", chain, status)
+                errors += 1
                 continue
 
             grouped: dict[str, list[dict]] = {}
@@ -665,6 +780,9 @@ def scan_once():
                 sym = pair["baseToken"].get("symbol", "?")
                 track(key, mc, now)  # update outcomes of earlier calls on this coin
 
+                if not is_manual and mc > MAX_COIN_MC and not open_records(key):
+                    dismiss(key)
+                    continue
                 if not is_manual and mc < MIN_PEAK_MC * MIN_MC_FRACTION and not open_records(key):
                     # too small for a re-run setup; keep it only if it matches a theme (narrative radar)
                     if NARRATIVE_ALERTS and mc >= NARR_MIN_MC and themes_for(key, pair):
@@ -676,6 +794,14 @@ def scan_once():
                 maybe_backfill_peak(key, chain, pair, budget)
                 checked += 1
                 passed, m, fails = evaluate(key, pair)
+                if m:  # remember how close every coin is, for the status check-in
+                    codes_now = [c for c, _ in fails]
+                    if "peak" in codes_now and key not in state["backfilled"]:
+                        # its past high hasn't been looked up, so "peak" and "retrace" aren't meaningful yet
+                        codes_now = ["peak_unknown" if c == "peak" else c for c in codes_now if c != "retrace_lo"]
+                    rows.append({"key": key, "chain": chain, "sym": sym, "pair": pair.get("pairAddress", ""),
+                                 "mc": m["mc"], "peak": m["peak"], "retrace": m["retrace"], "fails": codes_now})
+                    fail_counts.update(set(codes_now))
                 if not passed:
                     codes = {c for c, _ in fails}
                     if len(fails) <= 1:  # near miss - worth seeing in the logs
@@ -698,8 +824,11 @@ def scan_once():
                     state["cooldowns"][key] = now
                     add_record("call", key, chain, pair, m, "", now)
                     alerts += 1
+                    bot_stats["rerun"] += 1
                     log.info("ALERT sent for %s", key)
 
+    last_scan = {"t": time.time(), "checked": checked, "pool": len(watch), "rows": rows,
+                 "fails": dict(fail_counts), "errors": errors}
     try:
         learning_cycle()
     except Exception:
@@ -717,6 +846,7 @@ def scan_once():
 async def scanner_loop():
     last_discovery, wait_for = 0.0, 0
     while True:
+        round_started = time.time()
         if AUTO_DISCOVER and time.time() - last_discovery >= wait_for:
             wait_for = DISCOVERY_SECONDS
             try:
@@ -733,7 +863,12 @@ async def scanner_loop():
             await asyncio.to_thread(scan_once)
         except Exception:
             log.exception("scanner loop error")
-        await asyncio.sleep(POLL_SECONDS)
+        try:
+            await asyncio.to_thread(housekeeping)
+        except Exception:
+            log.exception("housekeeping error")
+        # one round every POLL_SECONDS, however long the work took (but always a short breather)
+        await asyncio.sleep(max(min(5.0, POLL_SECONDS), POLL_SECONDS - (time.time() - round_started)))
 
 
 # ----------------------------------------------------------------------------
@@ -1055,6 +1190,7 @@ def maybe_narrative(key: str, chain: str, pair: dict, now: float, m: dict | None
         return False
     state["cooldowns"][ckey] = now
     stamps.append(now)
+    bot_stats["narrative"] += 1
     add_record("narrative", key, chain, pair, m, "", now)
     log.info("NARRATIVE alert for %s (%s)", key, ",".join(th))
     return True
@@ -1112,6 +1248,8 @@ def handle_whale_swap(swap: dict) -> bool:
                 extra = "🔥 *SMART MONEY RE-RUN ACCUMULATION*\n" + extra
             add_record("whale", key, chain, ctx["pair"], m, "", now, extra={"wallet": wallet, "zone": zone})
     ok = send_telegram(build_whale_message(swap, extra))
+    if ok:
+        bot_stats["whale"] += 1
     if len(cluster) >= SMART_CLUSTER_MIN and now - state["cooldowns"].get("cluster:" + key, 0) > 7200:
         state["cooldowns"]["cluster:" + key] = now
         total = sum(u for t, w, u in state["whale_buys"][key] if now - t <= CLUSTER_WINDOW)
@@ -1132,23 +1270,63 @@ def tg_api(method: str, **kw):
 
 
 def core_hash() -> str:
-    core = json.dumps([state["records"], state["cooldowns"], state["tuning"]], sort_keys=True)
-    return hashlib.md5(core.encode()).hexdigest()
+    """Fingerprint of the things that matter for the memory file: which calls are open/closed, cooldowns,
+    tuning, tracked wallets. Price ticks don't change it, so the memory isn't re-saved every few minutes."""
+    core = [[(r["key"], r["kind"], r["status"], round(r["t0"])) for r in state["records"]],
+            sorted(state["cooldowns"].items()), state["tuning"], sorted(state["wallets"])]
+    return hashlib.md5(json.dumps(core, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def backup_state_to_telegram():
-    if not (TELEGRAM_BACKUP and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+# --- Heartbeats: every running copy of the bot notes "I'm alive" in the pinned file's caption, so a
+# --- second copy (e.g. two Render services using the same bot) can be spotted and reported.
+HB_RE = re.compile(r"([0-9a-f]{6}),([\w.\-]*),(\d{9,11})")
+_hb_seen: dict[str, tuple[str, float]] = {}   # copy id -> (host, last heartbeat) as last read from Telegram
+
+
+def my_host() -> str:
+    return PUBLIC_URL.split("://", 1)[-1] if PUBLIC_URL else "local"
+
+
+def parse_heartbeats(caption: str) -> dict[str, tuple[str, float]]:
+    return {i: (h, float(t)) for i, h, t in HB_RE.findall(caption or "")}
+
+
+def backup_caption(others: dict | None = None) -> str:
+    now = time.time()
+    beats = {i: v for i, v in (others or {}).items() if i != INSTANCE_ID and now - v[1] < 3600}
+    beats[INSTANCE_ID] = (my_host(), now)
+    newest = sorted(beats.items(), key=lambda kv: -kv[1][1])[:6]
+    return BACKUP_TAG + " | live: " + "; ".join(f"{i},{h},{int(t)}" for i, (h, t) in newest)
+
+
+def backup_state_to_telegram(force: bool = False):
+    """Keep ONE pinned file in the chat up to date. It is edited in place, so the chat doesn't fill up with
+    'pinned a file' / 'pinned Deleted message' notices (a new file is only sent if the old one is gone)."""
+    if not (TELEGRAM_BACKUP and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) or restore_pending:
         return
     now, b = time.time(), state["backup"]
-    h = core_hash()
-    unchanged = h == b.get("hash") and now - b.get("ts", 0) < 12 * 3600
-    if unchanged or now - b.get("ts", 0) < BACKUP_MIN_GAP:
+    h, since = core_hash(), now - b.get("ts", 0)
+    changed = h != b.get("hash")
+    if not force and not ((changed and since >= BACKUP_MIN_GAP) or since >= BACKUP_REFRESH_SECONDS):
         return
-    data = json.dumps(state).encode()
-    msg = tg_api("sendDocument", data={"chat_id": TELEGRAM_CHAT_ID, "caption": BACKUP_TAG,
+    data, caption, old = json.dumps(state).encode(), backup_caption(_hb_seen), b.get("msg_id")
+    if old:
+        try:
+            tg_api("editMessageMedia",
+                   data={"chat_id": TELEGRAM_CHAT_ID, "message_id": old,
+                         "media": json.dumps({"type": "document", "media": "attach://memory", "caption": caption})},
+                   files={"memory": ("bot_memory.json", data)})
+            b.update(ts=now, hash=h)
+            return
+        except requests.RequestException as e:
+            body = getattr(getattr(e, "response", None), "text", "") or ""
+            if "not modified" in body:  # identical content - nothing to do
+                b.update(ts=now, hash=h)
+                return
+            log.info("Could not update the pinned memory file in place (%s) - sending a fresh one", scrub(body or e))
+    msg = tg_api("sendDocument", data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption,
                                        "disable_notification": "true"},
                  files={"document": ("bot_memory.json", data)})
-    old = b.get("msg_id")
     tg_api("pinChatMessage", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": msg["message_id"],
                                    "disable_notification": True})
     b.update(msg_id=msg["message_id"], ts=now, hash=h)
@@ -1163,7 +1341,7 @@ def restore_from_telegram() -> bool:
     chat = tg_api("getChat", json={"chat_id": TELEGRAM_CHAT_ID}) or {}
     pm = chat.get("pinned_message") or {}
     doc = pm.get("document")
-    if not doc or pm.get("caption") != BACKUP_TAG:
+    if not doc or not (pm.get("caption") or "").startswith(BACKUP_TAG):
         return False
     info = tg_api("getFile", json={"file_id": doc["file_id"]})
     r = http.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}", timeout=30)
@@ -1171,6 +1349,52 @@ def restore_from_telegram() -> bool:
     merge_state(r.json())
     state["backup"].update(msg_id=pm["message_id"], ts=time.time(), hash=core_hash())
     return True
+
+
+def retry_restore():
+    """If the memory couldn't be read at start-up (Telegram hiccup), keep trying - and don't overwrite it."""
+    global restore_pending
+    if not restore_pending:
+        return
+    try:
+        if restore_from_telegram():
+            log.info("Restored memory from Telegram backup on retry (%d tracked calls)", len(state["records"]))
+        restore_pending = False
+    except Exception as e:
+        log.warning("Memory restore still failing: %s", scrub(e))
+
+
+def heartbeat_check():
+    """Note on the pinned file that this copy is alive, and warn if ANOTHER copy is alive too."""
+    global _hb_seen
+    if not (TELEGRAM_BACKUP and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) or restore_pending:
+        return
+    pm = (tg_api("getChat", json={"chat_id": TELEGRAM_CHAT_ID}) or {}).get("pinned_message") or {}
+    caption = pm.get("caption") or ""
+    if not pm.get("document") or not caption.startswith(BACKUP_TAG):
+        return  # no memory file pinned yet (the first one appears after the first scan)
+    now, b = time.time(), state["backup"]
+    _hb_seen = parse_heartbeats(caption)
+    b["msg_id"] = pm["message_id"]  # follow the file that is pinned right now
+    others = {i: v for i, v in _hb_seen.items() if i != INSTANCE_ID and now - v[1] < 600}
+    # a copy that is being replaced during an update disappears within a minute or two, so only
+    # complain when another copy is still writing heartbeats well after this one has started
+    if others and now - STARTED_AT > 900 and now - b.get("dup_warned", 0) > 6 * 3600:
+        names = ", ".join(sorted({h or "?" for h, _ in others.values()}))
+        if send_telegram(
+                "⚠️ *TWO COPIES OF THE BOT ARE RUNNING*\n\n"
+                f"This copy: {md_escape(my_host())}\nThe other copy: {md_escape(names)}\n\n"
+                "Both use the same Telegram bot, so every alert arrives twice and they overwrite each other's "
+                "memory. Fix: open dashboard.render.com, find the extra service (the one you are NOT keeping) "
+                "and delete it. Two always-on free services also use up Render's free monthly hours twice as "
+                "fast, and then Render switches them all off until next month."):
+            b["dup_warned"] = now
+    try:
+        tg_api("editMessageCaption", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": pm["message_id"],
+                                           "caption": backup_caption(_hb_seen)})
+    except requests.RequestException as e:
+        if "not modified" not in (getattr(getattr(e, "response", None), "text", "") or ""):
+            raise
 
 
 # ----------------------------------------------------------------------------
@@ -1345,27 +1569,187 @@ def process_evm(payload: dict) -> int:
 
 
 # ----------------------------------------------------------------------------
+# STATUS CHECK-IN: proof of life + the coins that came closest to qualifying
+# ----------------------------------------------------------------------------
+def fail_label(code: str) -> str:
+    return {
+        "peak": f"peak never reached {fmt_usd(MIN_PEAK_MC)}",
+        "peak_unknown": "past high not checked yet",
+        "retrace_lo": f"not down {T['retrace_min']:.0f}% from its peak yet",
+        "retrace_hi": f"down more than {T['retrace_max']:.0f}% from its peak",
+        "liq": f"liquidity under {T['liq'] * 100:.0f}% of market cap",
+        "vol": f"24h volume under {T['vol'] * 100:.0f}% of market cap",
+        "traders": f"under {T['traders']:.0f} trades in 24h",
+        "age": f"pair younger than {MIN_PAIR_AGE_HOURS}h",
+        "nomc": "no market-cap data",
+    }.get(code, code)
+
+
+def ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def closest_coins(rows: list[dict], n: int = 5) -> list[dict]:
+    """The coins that came nearest to passing every filter: fewest broken rules first, then the ones that
+    did reach the minimum peak, then the ones nearest the retrace band."""
+    def off_band(r: dict) -> float:
+        lo, hi = T["retrace_min"], T["retrace_max"]
+        return 0.0 if lo <= r["retrace"] <= hi else min(abs(r["retrace"] - lo), abs(r["retrace"] - hi))
+    def peak_problem(r: dict) -> bool:
+        return "peak" in r["fails"] or "peak_unknown" in r["fails"]
+    return sorted(rows, key=lambda r: (len(r["fails"]), peak_problem(r), off_band(r), -r["peak"]))[:n]
+
+
+def build_checkin() -> str:
+    now, s = time.time(), last_scan
+    L = [f"🩺 *BOT CHECK-IN*  (v{BOT_VERSION})", ""]
+    if not s:
+        L.append("✅ I'm running, but my first scan hasn't finished yet.")
+    else:
+        rows = s["rows"]
+        per_chain = Counter(r["chain"] for r in rows)
+        chains = ", ".join(f"{CHAINS[c]['name']} {n}" for c, n in per_chain.most_common())
+        L.append(f"✅ Running. My last scan was {ago(now - s['t'])} ago.")
+        L.append(f"🔎 Pool: {s['pool']} coins found by auto-discovery; {len(rows)} were large enough to "
+                 "examine closely" + (f" ({chains})." if chains else "."))
+        L.append(f"📚 Past highs looked up so far: {len(state['backfilled'])} coins.")
+        if s.get("errors"):
+            L.append(f"⚠️ {s['errors']} price request(s) were rate-limited in that scan (normal on a free server; "
+                     "I retry every minute).")
+        if bot_stats["gecko_busy"]:
+            L.append(f"⚠️ The coin-list / price-history service (GeckoTerminal) was busy {bot_stats['gecko_busy']} "
+                     "time(s) since I started. That only slows down finding coins and their past highs; I keep retrying.")
+        best = closest_coins(rows)
+        if best:
+            L += ["", "🎯 *Closest to qualifying right now:*"]
+            for i, r in enumerate(best, 1):
+                why = "✅ passes every filter" if not r["fails"] else "✗ " + "; ".join(fail_label(c) for c in r["fails"])
+                chart = f"  [chart](https://dexscreener.com/{r['chain']}/{r['pair']})" if r["pair"] else ""
+                L.append(f"{i}. ${md_escape(r['sym'])} ({CHAINS[r['chain']]['name']}): market cap {fmt_usd(r['mc'])}, "
+                         f"peak {fmt_usd(r['peak'])}, down {r['retrace']:.0f}%")
+                L.append(f"    {why}{chart}")
+        elif s["pool"]:
+            L += ["", "No coin in the pool is large enough to examine closely yet - discovery keeps adding more."]
+        if s["fails"]:
+            top = sorted(s["fails"].items(), key=lambda kv: -kv[1])[:5]
+            L += ["", "📋 *Why coins were skipped (how many broke each rule):*",
+                  "; ".join(f"{fail_label(c)} ×{n}" for c, n in top)]
+    sent = ", ".join(f"{n} {k}" for k, n in (("re-run", bot_stats["rerun"]), ("narrative", bot_stats["narrative"]),
+                                              ("whale", bot_stats["whale"])))
+    L += ["", f"📣 Alerts sent since this copy started: {sent}.",
+          f"👀 Following now: {len(open_records(kind='call'))} calls, {len(open_records(kind='narrative'))} narrative, "
+          f"{len(open_records(kind='shadow'))} experiments.",
+          "ℹ️ No alert just means nothing passed ALL of your filters at once - that is by design.",
+          "", f"copy {INSTANCE_ID} · {md_escape(my_host())} · up {ago(now - STARTED_AT)}"]
+    return "\n".join(L)[:3900]
+
+
+_next_checkin = STARTED_AT + FIRST_CHECKIN_MINUTES * 60
+
+
+def maybe_checkin():
+    """Send the status message when it's due: first a few minutes after start-up, then every CHECKIN_HOURS."""
+    global _next_checkin
+    if CHECKIN_HOURS <= 0 or time.time() < _next_checkin or not last_scan:
+        return
+    ok = send_telegram(build_checkin())
+    _next_checkin = time.time() + (CHECKIN_HOURS * 3600 if ok else 600)
+
+
+_last_beat = 0.0
+
+
+def housekeeping():
+    """Runs after every scan: memory-restore retry, double-copy check, status check-in."""
+    global _last_beat
+    if time.time() - _last_beat >= HEARTBEAT_SECONDS:
+        _last_beat = time.time()
+        retry_restore()
+        try:
+            heartbeat_check()
+        except Exception as e:
+            log.warning("heartbeat check failed: %s", scrub(e))
+    maybe_checkin()
+
+
+# ----------------------------------------------------------------------------
+# STAYING AWAKE: Render's free plan sleeps after 15 minutes without incoming web traffic
+# ----------------------------------------------------------------------------
+keepalive = {"pings": 0, "ok": 0, "last_ok": 0.0}
+
+
+def ping_self() -> bool:
+    """Visit our own public web address - to Render that counts as incoming traffic, so it never goes to sleep."""
+    keepalive["pings"] += 1
+    try:
+        r = http.get(PUBLIC_URL + "/health", timeout=20)
+        if r.status_code < 500:
+            keepalive["ok"] += 1
+            keepalive["last_ok"] = time.time()
+            return True
+        log.warning("stay-awake ping got HTTP %s", r.status_code)
+    except requests.RequestException as e:
+        log.warning("stay-awake ping failed: %s", scrub(e))
+    return False
+
+
+async def keepalive_loop():
+    if not PUBLIC_URL:
+        log.info("No public web address found (RENDER_EXTERNAL_URL / PUBLIC_URL) - stay-awake pings are off")
+        return
+    await asyncio.sleep(KEEPALIVE_START_DELAY)
+    while True:
+        ok = await asyncio.to_thread(ping_self)
+        if keepalive["pings"] % 15 == 1 or not ok:  # roughly once an hour when all is well
+            log.info("Stay-awake ping %s (%d sent) -> %s", "OK" if ok else "FAILED", keepalive["pings"], PUBLIC_URL)
+        await asyncio.sleep(KEEPALIVE_SECONDS)
+
+
+class _HideHealthVisits(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:  # keep Render's log readable
+        return "/health" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_HideHealthVisits())
+
+
+# ----------------------------------------------------------------------------
 # FASTAPI APP
 # ----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(load_state)
+    log.info("Bot v%s copy %s starting at %s", BOT_VERSION, INSTANCE_ID, my_host())
     log.info("Tracking %d tokens across %s", len(TOKENS), sorted({c for c, _ in TOKENS}))
     log.info("EVM whale wallets configured: %d", len(EVM_WHALES))
     await asyncio.to_thread(
         send_telegram,
-        "✅ Bot is online. "
-        + ("Auto-discovery is ON - it finds coins by itself. " if AUTO_DISCOVER else "")
-        + f"Manually watching {len(TOKENS)} coin(s). "
-        f"Learning is ON: every call is followed for {TRACK_HOURS:.0f}h and scored "
-        f"(self-tuning {'ON' if AUTO_TUNE else 'OFF'}). "
-        f"Narrative radar {'ON' if NARRATIVE_ALERTS else 'OFF'}. "
-        "You'll get a message here when a coin matches your filters.",
+        f"✅ Bot is online (v{BOT_VERSION}, copy {INSTANCE_ID}). "
+        + ("Auto-discovery ON. " if AUTO_DISCOVER else "")
+        + (f"Manually watching {len(TOKENS)} coin(s). " if TOKENS else "")
+        + f"Learning ON (self-tuning {'ON' if AUTO_TUNE else 'OFF'}), "
+        f"narrative radar {'ON' if NARRATIVE_ALERTS else 'OFF'}.\n"
+        + (f"😴 Stay-awake ON: it visits {md_escape(my_host())} every {KEEPALIVE_SECONDS // 60} min.\n"
+           if PUBLIC_URL else
+           "😴 Stay-awake OFF (no web address found) - on Render's free plan it will sleep when idle.\n")
+        + (f"📋 First status check-in in about {FIRST_CHECKIN_MINUTES} min, then every {CHECKIN_HOURS:g}h.\n"
+           if CHECKIN_HOURS > 0 else "")
+        + "You get a coin alert only when it passes ALL your filters.",
     )
-    task = asyncio.create_task(scanner_loop())
+    tasks = [asyncio.create_task(scanner_loop()), asyncio.create_task(keepalive_loop())]
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
     save_state()
+    try:  # last chance to save the memory before this copy stops (an update or a restart)
+        await asyncio.wait_for(asyncio.to_thread(backup_state_to_telegram, True), timeout=10)
+    except Exception:
+        pass
 
 
 app = FastAPI(title="Multi-Chain Alert Bot", lifespan=lifespan)
@@ -1380,10 +1764,26 @@ def run_in_background(fn, *args):
     task.add_done_callback(_bg_tasks.discard)
 
 
-@app.get("/")
-@app.get("/health")
+@app.get("/", include_in_schema=False)
+@app.head("/", include_in_schema=False)
+@app.get("/health", include_in_schema=False)
+@app.head("/health", include_in_schema=False)
 def health():
-    return {"status": "ok", "manual_tokens": len(TOKENS), "discovered_tokens": len(state["discovered"]), "chains": sorted(CHAINS)}
+    now, s = time.time(), last_scan
+    return {
+        "status": "ok", "version": BOT_VERSION, "copy": INSTANCE_ID, "uptime_minutes": round((now - STARTED_AT) / 60),
+        "manual_tokens": len(TOKENS), "discovered_tokens": len(state["discovered"]), "chains": sorted(CHAINS),
+        "last_scan_seconds_ago": round(now - s["t"]) if s else None,
+        "coins_examined_last_scan": len(s["rows"]) if s else None,
+        "stay_awake": {"on": bool(PUBLIC_URL), "pings_sent": keepalive["pings"], "pings_ok": keepalive["ok"],
+                       "last_ok_seconds_ago": round(now - keepalive["last_ok"]) if keepalive["last_ok"] else None},
+    }
+
+
+@app.get("/status")
+def status_page():
+    """Open https://<your-app>.onrender.com/status in a browser for the same summary as the Telegram check-in."""
+    return PlainTextResponse(build_checkin().replace("*", "").replace("\\", ""))
 
 
 def process_helius(txs: list) -> int:
