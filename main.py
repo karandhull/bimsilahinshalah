@@ -83,7 +83,8 @@ MIN_WHALE_TRADE_USD = 5_000
 # --- Learning system ---------------------------------------------------------
 WIN_MULTIPLE = float(os.getenv("WIN_MULTIPLE", "2.0"))     # win = reaches 2x the call market cap...
 STOP_MULTIPLE = float(os.getenv("STOP_MULTIPLE", "0.5"))   # ...before falling to 0.5x of it
-TRACK_HOURS = float(os.getenv("TRACK_HOURS", "72"))        # how long each call is followed
+TRACK_HOURS = float(os.getenv("TRACK_HOURS", "168"))       # how long each call is followed (v3.4: 7 days - some coins take longer than 3 days to cook)
+WALLET_TRACK_HOURS = env_float("WALLET_TRACK_HOURS", 336)  # v3.4: a wallet's buy (and a coin your wallets hold in a dip) is followed this long: 14 days
 AUTO_TUNE = os.getenv("AUTO_TUNE", "false").lower() == "true"  # let the bot adjust its own filters
 MIN_CALLS_TUNE = int(os.getenv("MIN_CALLS_TUNE", "10"))    # finished calls needed before self-tuning
 MIN_SHADOWS_TUNE = 8                                       # finished near-misses needed per experiment
@@ -93,13 +94,15 @@ TELEGRAM_BACKUP = os.getenv("TELEGRAM_BACKUP", "true").lower() != "false"
 BACKUP_TAG = "BOT_STATE_BACKUP v1"
 BACKUP_MIN_GAP = 300                  # never re-save the memory more often than this...
 BACKUP_REFRESH_SECONDS = 6 * 3600     # ...and re-save at least this often even if only prices moved
+SNAPSHOT_DAYS = env_float("SNAPSHOT_DAYS", 7)   # v3.4: a dated safety copy of the memory is left in the chat this often, and one before every update (0 = none)
+MAX_MEMORY_FILE_MB = 19               # Telegram lets a bot read files up to 20 MB
 MAX_SHADOWS_OPEN = 150
 GECKO_POOL_PAGES = int(os.getenv("GECKO_POOL_PAGES", "2"))   # pages (20 pools each) per chain, every round; 0 = off
 GECKO_DEEP_PAGES = min(10, int(os.getenv("GECKO_DEEP_PAGES", "8")))  # one chain per round is searched this deep
 MAX_COIN_MC = 1_000_000_000                                  # coins above $1B never do a deep-dip re-run setup
 
 # --- Staying awake, status check-ins, double-copy detection --------------------
-BOT_VERSION = "2.9"
+BOT_VERSION = "3.4"
 # Render's free plan puts a service to sleep after 15 minutes without incoming web traffic, so the bot
 # visits its own web address every few minutes. Render fills in RENDER_EXTERNAL_URL by itself.
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
@@ -116,7 +119,7 @@ STARTED_AT = time.time()
 # --- Smart wallets, themes, narrative radar -----------------------------------
 SMART_CLUSTER_MIN = int(os.getenv("SMART_CLUSTER_MIN", "2"))   # wallets buying the same coin...
 CLUSTER_WINDOW = 1800                                          # ...within 30 minutes = cluster
-NARRATIVE_ALERTS = os.getenv("NARRATIVE_ALERTS", "true").lower() != "false"
+NARRATIVE_ALERTS = os.getenv("NARRATIVE_ALERTS", "false").lower() == "true"      # v3.0: off unless switched on (/alerts narrative on)
 NARR_MIN_MC = float(os.getenv("NARR_MIN_MC", "250000"))
 NARR_MAX_MC = float(os.getenv("NARR_MAX_MC", "25000000"))
 NARR_MIN_LIQ = float(os.getenv("NARR_MIN_LIQ", "40000"))
@@ -147,6 +150,45 @@ WATCH_SWEEP_SECONDS = max(120, int(env_float("WATCH_SWEEP_SECONDS", 600)))   # h
 WATCH_DIP_ALERTS = os.getenv("WATCH_DIP_ALERTS", "true").lower() != "false"  # alert on dipped coins your wallets hold, even if volume etc. is short
 WATCH_MIN_HOLDERS = max(1, int(env_float("WATCH_MIN_HOLDERS", 1)))           # watched wallets that must hold the coin for that alert
 WATCH_DIP_MAX_PER_DAY = int(env_float("WATCH_DIP_MAX_PER_DAY", 6))
+# --- v3.2: a ready-made wallet list, and a limit on the "<wallet> BOUGHT / SOLD" messages ------------------------------------
+WATCH_MOVES_MAX_PER_DAY = int(env_float("WATCH_MOVES_MAX_PER_DAY", 12))      # such messages per 24h (0 = no limit); past it the moves are still followed and scored, just not announced one by one
+WATCH_MOVES_PER_WALLET = int(env_float("WATCH_MOVES_PER_WALLET", 3))         # v3.3: ...and at most this many per wallet per 24h (0 = no limit), so one very busy wallet cannot use up the whole day's messages
+# --- v3.4: "several of my wallets keep adding to the same coin" - small top-ups over days that never trigger a 'bought' message ----
+ACCUM_ON = os.getenv("ACCUM_ALERTS", "true").lower() != "false"              # (it also needs the 'smart' alerts to be on: /alerts smart on)
+ACCUM_DAYS = env_float("ACCUM_DAYS", 7)                                      # adds are added up over this many days
+ACCUM_STEP_MIN = 0.02                                                        # a change of less than 2% of what the wallet holds is rounding / dust, not a trade
+ACCUM_NOTE_MIN_USD = env_float("ACCUM_NOTE_MIN_USD", 25)                     # ...and a change worth less than this many dollars is not written down either
+ACCUM_MIN_WALLET_USD = env_float("ACCUM_MIN_WALLET_USD", 500)                # a wallet counts as "adding" when its net adds are worth this much...
+ACCUM_MIN_GROWTH = env_float("ACCUM_MIN_GROWTH", 0.10)                       # ...and its position grew by at least this share (a big holder adding 0.3% is nothing)
+ACCUM_MIN_WALLETS = max(1, int(env_float("ACCUM_MIN_WALLETS", 2)))           # this many of your wallets adding the same coin (one of them in 2+ steps) = a signal...
+ACCUM_SOLO_USD = env_float("ACCUM_SOLO_USD", 2000)                           # ...or ONE wallet adding at least this much...
+ACCUM_SOLO_STEPS = 3                                                         # ...in at least this many separate top-ups (one big buy is already announced)
+ACCUM_MAX_PER_DAY = int(env_float("ACCUM_MAX_PER_DAY", 3))                   # such messages per 24h
+ACCUM_COOLDOWN_DAYS = env_float("ACCUM_COOLDOWN_DAYS", 3)                    # the same coin is not announced again for this long
+ACCUM_SHOW_USD = 250                                                         # the scorecard lists a wallet's adds / sells of a coin above this much
+ACCUM_MAX_ROWS = 60                                                          # changes remembered per wallet and coin
+STARTER_WALLETS_ON = os.getenv("STARTER_WALLETS", "true").lower() != "false" # "false" = do not add the built-in list below
+MAX_PASTED_COMMANDS = 12                                                     # several /watch lines in ONE chat message: this many at most
+# Found on 15-16 Oct 2026 from DOPE and baton (coins that dipped hard on Solana and then ran): wallets that bought near the bottom
+# AND have a good 30-day record on Defined.fi (older wallets, no bots, profitable on other coins too). A clue, not a guarantee -
+# the wallet book keeps scoring everything they buy. "dip" = bought at the low; "base" = bought in the base just before the run.
+STARTER_WALLETS = (
+    ("DOPE dip 6F5x", "6F5x9fKqXCfPf8Rufs6ZvLjzPfCicytUgWexzx6LxoDi"),
+    ("DOPE dip A8pZ", "A8pZuUXnN4bAC66DMfJkKYSgNGDvWGz7KCVFdYnfJynr"),
+    ("DOPE dip BQKq", "BQKqM6L1QTbmqZ7CvkiYuCGRNUVxmS5EXeQYa9zBoYJ3"),
+    ("DOPE dip 9aU4", "9aU4GWeG6F6dc94ZJTRXzC8xuSkHyiNidWYcfyhcTqB3"),
+    ("DOPE dip DKaw", "DKawRGCQaB7gSyjwczSNqjbbWYywVQCdvrC7JnKbFefk"),
+    ("DOPE early bcAT", "bcATZhi2mDrJ1JdP4Hvn99ksmaYE2fppS9igY8jAVSz"),
+    ("baton dip ESVP", "ESVPiw89EPDawTyqXWmot6nJ8D92MMNHH5fmDmficY32"),
+    ("baton dip DZZV", "DZZVfvX7qyW468KgLa1mS5bdDunAoMq2JXPqHi2HjAvR"),
+    ("baton dip CM9c", "CM9cJ6EK65YreZ4tJC8pW4MQjQ3JX9MZDstmwPBN2CtZ"),
+    ("baton dip AEKU", "AEKU5rbkAXUmMK4cWsvJbPoEHTruGzV6P32rRC6TaL22"),
+    ("baton dip AgDt", "AgDt6WfypoeY5upuoLnVZCRCNHHvXborLvSeRXP9uUuY"),
+    ("baton base 6Cpi", "6CpipySaXTAiUKDyyhWeCfYSMQLCiHrbCN1WvRv5s8kF"),
+    ("baton base Cr1n", "Cr1n5ZTc1W42zxHQ2LEAHUyvKPrm3ABAHKmFABMh9bKT"),
+    ("baton base ethu", "ethuWdnPxqmwFskE4EpN18qdjzfCM79kALftiAGDw8Z"),
+)
+STARTER_ADDED: list[str] = []       # names of the built-in wallets added during this start-up (the start-up message mentions them once)
 COMMANDS = os.getenv("TELEGRAM_COMMANDS", "true").lower() != "false"         # chat commands (/watch, /check ...)
 YOUNG_DAYS = 30                                                              # "young coin" signal
 
@@ -205,6 +247,39 @@ BOOK_KEEP_DAYS = 21                                                             
 FLOW_KEEP_DAYS = 7                                                              # buys seen over several looks add up for this long
 SMART_BUY_MAX_PER_DAY = int(env_float("SMART_BUY_MAX_PER_DAY", 8))
 SMART_BUY_ALERTS = os.getenv("SMART_BUY_ALERTS", "true").lower() != "false"
+
+# --- v3.0: which alerts reach your chat (everything is still followed and scored; "off" only stops the message) ------------
+RERUN_ALERTS = os.getenv("RERUN_ALERTS", "false").lower() == "true"     # the "ZIPCOIN RE-RUN SETUP" message: off since v3.0 (such setups are still followed in silence)
+ALERT_DEFAULT = {"rerun": RERUN_ALERTS, "narrative": NARRATIVE_ALERTS, "walletdip": WATCH_DIP_ALERTS,
+                 "bottom": BOTTOM_ALERTS, "chart": CHART_ALERTS, "smartbuy": SMART_BUY_ALERTS}
+ALERT_MENU = (    # what /alerts lists, in this order: (word you type, internal name, what it is)
+    ("smart", "smartbuy", "🧠 Smart-wallet buying - wallets with a good record are accumulating a coin, or several wallets you watch keep adding to one over days"),
+    ("wallet", "walletdip", "👛 Wallet-backed dip - a dipped coin that wallets YOU watch are holding"),
+    ("bottom", "bottom", "🧭 Bottom signal - coins on Sparsity's bottom map"),
+    ("chart", "chart", "📈 Chart setup - cup & handle, base, double bottom"),
+    ("rerun", "rerun", "🔁 Zipcoin re-run setup - a dipped coin that passes all the volume rules"),
+    ("narrative", "narrative", "📰 Narrative watch - themed coins (AI, stocks, animals...) waking up"),
+)
+ALERT_WORDS = {"smart": "smartbuy", "smartbuy": "smartbuy", "smartwallet": "smartbuy", "smart-wallet": "smartbuy",
+               "wallet": "walletdip", "walletdip": "walletdip", "wallet-backed": "walletdip", "dip": "walletdip",
+               "bottom": "bottom", "bottoms": "bottom", "sparsity": "bottom",
+               "chart": "chart", "charts": "chart", "pattern": "chart", "patterns": "chart",
+               "rerun": "rerun", "re-run": "rerun", "zipcoin": "rerun", "zip": "rerun", "zipper": "rerun", "ziper": "rerun",
+               "narrative": "narrative", "narr": "narrative", "theme": "narrative", "themes": "narrative"}
+CHECK_MAX_PER_MESSAGE = 3                                                       # coin addresses scored per message
+CHECK_TRACK_HOURS = env_float("CHECK_TRACK_HOURS", 168)                         # a coin you ask about is followed this long (silently)
+
+# --- v3.1: honest numbers -------------------------------------------------------------------------------------------------
+# 1) Coins that barely move (stock tokens, gold, wrapped coins, stable coins) cannot "dip and re-run": the dips and wins the bot
+#    saw on them were bad price data. A coin whose whole daily history stayed inside this band is a "steady asset" and is left out.
+STEADY_BAND = max(1.1, env_float("STEADY_BAND", 1.5))                           # highest / lowest daily price over its whole life
+STEADY_MIN_DAYS = max(3, int(env_float("STEADY_MIN_DAYS", 4)))                  # days of history needed before that can be said
+STEADY_RECHECK_DAYS = 10                                                        # a steady coin gets another look after this long (it may wake up)
+STEADY_PROBES_PER_SCAN = 1                                                      # coins looked up for this, per scan, in the background
+# 2) A crowd is one piece of evidence, not many: when lots of saved wallets bought the same coin they all "win" or all "lose"
+#    together. A coin that this many saved wallets (or fewer) bought counts fully for each of them; a bigger crowd counts less.
+CROWD_FULL_WEIGHT = max(1, int(env_float("CROWD_FULL_WEIGHT", 3)))
+PROMISING_MIN_WEIGHT = env_float("PROMISING_MIN_WEIGHT", 0.6)                   # "promising" = at least this much good evidence (one good buy on a coin few of the saved wallets bought)
 
 DEFAULT_THEMES = {
     "stocks": "stonk,stonks,stock,stocks,nasdaq,nyse,nvda,nvidia,tsla,tesla,mstr,spy,aapl,msft,amzn,"
@@ -393,6 +468,11 @@ def fmt_age(hours: float) -> str:
     return f"{days:.0f}d" if days < 60 else f"{days / 30.4:.0f}mo"
 
 
+def span_text(hours: float) -> str:
+    """How long a call is followed, in words: '36h' for a short follow-up, '7 days' for a longer one."""
+    return f"{hours:.0f}h" if hours < 48 else f"{hours / 24:g} days"
+
+
 _odd_mc: Counter = Counter()   # coin key -> readings in a row whose market cap did not fit its usual supply
 
 
@@ -437,10 +517,26 @@ _state_lock = threading.Lock()
 state = {"peaks": {}, "cooldowns": {}, "discovered": {}, "dismissed": {}, "backfilled": {},
          "bf_fails": {}, "shadow_cd": {}, "meta": {}, "whale_buys": {},
          "records": [], "tuning": {}, "backup": {}, "wallets": {}, "watch": {}, "supply": {}, "bottoms": {},
-         "charts": {}, "book": {}}
+         "charts": {}, "book": {}, "steady": {}, "steady_seen": {}, "accum": {}}
 DICT_BUCKETS = ("peaks", "cooldowns", "discovered", "dismissed", "backfilled", "bf_fails",
-                "shadow_cd", "meta", "whale_buys", "supply", "bottoms", "charts")
+                "shadow_cd", "meta", "whale_buys", "supply", "bottoms", "charts", "steady", "steady_seen")
 OLD_RESULTS_SET_ASIDE = 0   # how many results from older versions were set aside when the memory was loaded
+
+
+def alert_on(kind: str) -> bool:
+    """Does this kind of alert go to your chat? What you set with /alerts wins over the server settings."""
+    over = state["tuning"].get("alerts")
+    if isinstance(over, dict) and kind in over:
+        return bool(over[kind])
+    return bool(ALERT_DEFAULT.get(kind, True))
+
+
+def set_alert(kind: str, on: bool):
+    over = state["tuning"].get("alerts")
+    if not isinstance(over, dict):
+        over = state["tuning"]["alerts"] = {}
+    over[kind] = bool(on)
+    save_state()
 
 
 def quarantine_old_results() -> int:
@@ -467,6 +563,9 @@ def sanitize_new_memory():
     for bucket in ("bottoms", "charts"):
         for k in [k for k, v in state[bucket].items() if not isinstance(v, dict)]:
             del state[bucket][k]
+    for bucket in ("steady", "steady_seen"):
+        for k in [k for k, v in state[bucket].items() if isinstance(v, bool) or not isinstance(v, (int, float))]:
+            del state[bucket][k]
     for w in list(state["book"]):
         d = state["book"][w]
         picks = d.get("picks")
@@ -478,19 +577,58 @@ def sanitize_new_memory():
                 d[f] = 0
         if not isinstance(d.get("chain"), str):
             d["chain"] = "solana"
+    # v3.4: the notes on how much each watched wallet added or sold of each coin: [[time, change in coins], ...]
+    acc = state["accum"]
+    for w in list(acc):
+        led = acc[w]
+        if not isinstance(led, dict):
+            del acc[w]
+            continue
+        for mint in list(led):
+            rows = led[mint]
+            led[mint] = [[r[0], r[1]] for r in (rows if isinstance(rows, list) else [])
+                         if isinstance(r, (list, tuple)) and len(r) == 2
+                         and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in r)]
+            if not led[mint]:
+                del led[mint]
+        if not led:
+            del acc[w]
+
+
+def valid_record(r) -> bool:
+    """A tracked call that is complete enough to be followed and counted (a damaged one would break a scan)."""
+    return (isinstance(r, dict) and isinstance(r.get("key"), str) and isinstance(r.get("kind"), str)
+            and isinstance(r.get("status"), str) and all(isinstance(r.get(f), (int, float)) for f in ("t0", "mc0")))
+
+
+def record_id(r: dict) -> tuple:
+    """What makes a tracked call 'the same call' (reading the same memory twice must not double it)."""
+    return (r["key"], r["kind"], r.get("wallet"), r["t0"])
 
 
 def merge_state(loaded: dict):
+    """Read a saved memory into this (empty) one - at start-up. The file wins; nothing in it is dropped."""
     for bucket in DICT_BUCKETS:
         for k, v in (loaded.get(bucket) or {}).items():
             state[bucket][k if ":" in k else f"solana:{k}"] = v  # migrate v1 keys
     state["wallets"].update(loaded.get("wallets") or {})
     state["watch"].update(loaded.get("watch") or {})
     state["book"].update({w: d for w, d in (loaded.get("book") or {}).items() if isinstance(d, dict)})   # (wallet addresses: no key migration)
+    state["accum"].update({w: d for w, d in (loaded.get("accum") or {}).items() if isinstance(d, dict)})
+    for k, v in loaded.items():     # v3.4: notes this version does not know (a newer version's, after a roll-back) travel along untouched
+        if isinstance(k, str) and k not in state:
+            state[k] = v
     sanitize_new_memory()
-    state["records"].extend(loaded.get("records") or [])
+    have = {record_id(r) for r in state["records"] if valid_record(r)}
+    for r in loaded.get("records") or []:                       # v3.4: ...and the same call is never added twice
+        if valid_record(r) and record_id(r) not in have:
+            have.add(record_id(r))
+            state["records"].append(r)
     quarantine_old_results()
     state["tuning"].update(loaded.get("tuning") or {})
+    gone = set(state["tuning"].get("watch_removed") or [])      # v3.2: a wallet you removed with /unwatch must not come back
+    for k in [k for k in state["watch"] if k in gone]:          # from the built-in list when the memory is read in late
+        del state["watch"][k]
     state["backup"].update(loaded.get("backup") or {})
     # A wider dip range lets smaller coins qualify. Coins thrown out earlier for being "too small" must get
     # another look, so those throw-outs are forgotten whenever the smallest allowed size has gone down.
@@ -504,11 +642,100 @@ def merge_state(loaded: dict):
     state["tuning"]["floor"] = mc_floor()
 
 
+def merge_book_entry(mine: dict, d: dict):
+    """Two notes on the same wallet (the one here, and one from a memory file): keep the bigger counts and every followed buy."""
+    for f in ("n", "good", "win", "stop", "flat", "seen"):
+        if isinstance(d.get(f), (int, float)) and d[f] > (mine.get(f) or 0):
+            mine[f] = d[f]
+    if isinstance(d.get("first"), (int, float)) and d["first"] and (not mine.get("first") or d["first"] < mine["first"]):
+        mine["first"] = d["first"]
+    if isinstance(d.get("last"), (int, float)) and d["last"] > (mine.get("last") or 0):
+        mine["last"] = d["last"]
+    picks = [p for p in (mine.get("picks") or []) if isinstance(p, dict)]
+    seen = {(p.get("k"), p.get("t")) for p in picks}
+    picks += [p for p in (d.get("picks") or []) if isinstance(p, dict) and (p.get("k"), p.get("t")) not in seen]
+    picks.sort(key=lambda p: p.get("t") or 0)
+    while len(picks) > BOOK_PICKS:                      # the same rule as everywhere else: the oldest finished buy goes first
+        i = next((j for j, p in enumerate(picks) if p.get("st") != "o"), None)
+        if i is None:
+            break
+        picks.pop(i)
+    mine["picks"] = picks
+
+
+def merge_state_live(loaded: dict) -> dict:
+    """v3.4: a memory file the owner sent into the chat. It only FILLS IN - a wallet, result or setting that is already here is
+    never removed, and newer data here is never replaced by older data from the file. Returns counts for the reply."""
+    out = {"watch": 0, "wallets": 0, "book": 0, "records": 0}
+    removed = set(state["tuning"].get("watch_removed") or [])            # a wallet taken off with /unwatch stays off
+    for w, d in (loaded.get("watch") or {}).items():
+        if not isinstance(w, str) or not isinstance(d, dict):
+            continue
+        mine = state["watch"].get(w)
+        if mine is None:
+            if w in removed:
+                continue
+            state["watch"][w] = dict(d)
+            out["watch"] += 1
+            if d.get("kind") == "solana":
+                _sweep["now"] = True                                     # look inside it in the next minute
+        elif d.get("name") and not mine.get("name"):
+            mine["name"] = d["name"]
+    for w, d in (loaded.get("wallets") or {}).items():                   # how each wallet's buys turned out: the bigger count wins
+        if not isinstance(w, str) or not isinstance(d, dict):
+            continue
+        mine = state["wallets"].get(w)
+        if mine is None:
+            state["wallets"][w] = dict(d)
+            out["wallets"] += 1
+            continue
+        for f in ("w", "s", "e"):
+            if isinstance(d.get(f), (int, float)) and d[f] > (mine.get(f) or 0):
+                mine[f] = d[f]
+    for w, d in (loaded.get("book") or {}).items():                      # the wallet book
+        if not isinstance(w, str) or not isinstance(d, dict):
+            continue
+        if w in state["book"]:
+            merge_book_entry(state["book"][w], d)
+        else:
+            state["book"][w] = d
+            out["book"] += 1
+    have = {record_id(r) for r in state["records"] if valid_record(r)}   # tracked calls and finished results not here yet
+    for r in loaded.get("records") or []:
+        if valid_record(r) and record_id(r) not in have:
+            have.add(record_id(r))
+            state["records"].append(r)
+            out["records"] += 1
+    for bucket in DICT_BUCKETS:                                          # coin notes (past highs, supply...): only what is missing
+        for k, v in (loaded.get(bucket) or {}).items():
+            if isinstance(k, str):
+                state[bucket].setdefault(k if ":" in k else f"solana:{k}", v)
+    for w, d in (loaded.get("accum") or {}).items():
+        if isinstance(w, str) and isinstance(d, dict):
+            state["accum"].setdefault(w, d)
+    lt = loaded.get("tuning") if isinstance(loaded.get("tuning"), dict) else {}
+    for k, v in lt.items():                                              # settings: only those not set here
+        if k not in state["tuning"]:
+            state["tuning"][k] = v
+    gone = state["tuning"].get("watch_removed")
+    if not isinstance(gone, list):
+        gone = state["tuning"]["watch_removed"] = []
+    for g in (lt.get("watch_removed") if isinstance(lt.get("watch_removed"), list) else []):
+        if isinstance(g, str) and g not in gone and g not in state["watch"]:
+            gone.append(g)
+    for k, v in loaded.items():
+        if isinstance(k, str) and k not in state:
+            state[k] = v
+    sanitize_new_memory()
+    quarantine_old_results()
+    return out
+
+
 restore_pending = False   # True if a memory backup exists but could not be read yet (never overwrite it!)
 
 
 def load_state():
-    global restore_pending
+    global restore_pending, _restore_failing_since
     loaded = None
     try:
         with open(STATE_FILE) as f:
@@ -523,8 +750,10 @@ def load_state():
                 log.info("Restored memory from Telegram backup (%d tracked calls)", len(state["records"]))
             else:
                 log.info("No Telegram backup found - starting with a fresh memory")
+                _fresh_start["on"] = not _pin_problem["other"]    # (if something else is pinned, the warning about that is shown instead)
         except Exception as e:
             restore_pending = True  # Telegram hiccup: retry later and don't overwrite the saved memory meanwhile
+            _restore_failing_since = time.time()
             log.warning("Could not restore from Telegram backup (will retry): %s", scrub(e))
     try:
         for ref, peak in json.loads(RAW_PEAK_SEEDS).items():
@@ -551,6 +780,7 @@ def load_state():
         seed_watch_wallets()
     except Exception:
         log.exception("WATCH_WALLETS could not be read - ignored")
+    state["tuning"]["ver"] = BOT_VERSION     # v3.4: which version last saved this memory (an update leaves a safety copy first)
 
 
 def save_state():
@@ -784,7 +1014,8 @@ def signals_text(sig: list[str]) -> str:
             + "\n")
 
 
-def build_rerun_message(chain: str, pair: dict, m: dict, extra: str = "", title: str = "🔁 ZIPCOIN RE-RUN SETUP") -> str:
+def build_rerun_message(chain: str, pair: dict, m: dict, extra: str = "", title: str = "🔁 ZIPCOIN RE-RUN SETUP",
+                        track_hours: float | None = None) -> str:
     base = pair.get("baseToken", {})
     addr = base.get("address", "")
     symbol = md_escape(base.get("symbol", "?"))
@@ -798,7 +1029,7 @@ def build_rerun_message(chain: str, pair: dict, m: dict, extra: str = "", title:
         f"📊 24h Volume: {fmt_usd(m['vol24'])} ({m['vol24']/m['mc']*100:.0f}% of MC)\n"
         f"👥 24h Txns (buys+sells): {m['traders']:,}\n"
         f"⏱ Pair age: {fmt_age(m['age_h'])}\n"
-        f"📌 Tracking this call for {TRACK_HOURS:.0f}h (win = {WIN_MULTIPLE:g}x)\n"
+        f"📌 Tracking this call for {span_text(track_hours or TRACK_HOURS)} (win = {WIN_MULTIPLE:g}x)\n"
         + extra + "\n"
         f"`{addr}`\n\n"
         f"[DexScreener](https://dexscreener.com/{chain}/{pair_addr}) | "
@@ -958,22 +1189,172 @@ def passes_cheap_checks(pair: dict, relax: float = 1.0, key: str | None = None) 
             and traders >= T["traders"] * relax)
 
 
+# ----------------------------------------------------------------------------
+# v3.1 - STEADY ASSETS. Stock tokens, gold, wrapped coins and stable coins barely move, so they cannot dip and re-run. But their
+# thin pools show an odd price now and then, and that looked like a deep dip, a "chart setup" or a 2x win - and it counted
+# toward the wallets that held them. They are recognised from the coin's daily history (one GeckoTerminal request per coin),
+# left out of every alert, and taken out of every wallet's record.
+# ----------------------------------------------------------------------------
+_steady_fails: Counter = Counter()     # coin key -> failed look-ups of its daily history
+
+
+def daily_candles(chain: str, pair: dict) -> list:
+    """The coin's daily candles from GeckoTerminal: [time, open, high, low, close, volume] rows, newest first."""
+    net, pool = GECKO_NETWORK.get(chain), pair.get("pairAddress")
+    if not (net and pool):
+        raise ValueError("no pool to read")
+    r = gecko_get(
+        f"https://api.geckoterminal.com/api/v2/networks/{net}/pools/{pool}/ohlcv/day",
+        params={"aggregate": 1, "limit": 1000, "currency": "usd"}, timeout=20)
+    return r.json()["data"]["attributes"]["ohlcv_list"]
+
+
+def steady_from_candles(candles) -> bool:
+    """Did the open and the close of every day of this coin's whole history stay inside STEADY_BAND (highest / lowest)?
+    A coin that once fell 60% or rose 60% is not steady, however calm it is now."""
+    prices: list[float] = []
+    days = 0
+    for c in candles if isinstance(candles, list) else []:
+        try:
+            o, cl = float(c[1]), float(c[4])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if o > 0 and cl > 0 and math.isfinite(o) and math.isfinite(cl):
+            days += 1
+            prices += [o, cl]
+    return days >= STEADY_MIN_DAYS and max(prices) / min(prices) <= STEADY_BAND
+
+
+def purge_steady(key: str, now: float):
+    """A coin turned out to be a steady asset: what was recorded on it is set aside (it stops counting and nothing more is
+    sent about it) and the wallet buys on it are taken back out of every wallet's numbers."""
+    for r in state["records"]:
+        if r["key"] == key and not r.get("void"):
+            r["void"] = True
+            if r["status"] == "open":
+                r["status"], r["t1"] = "expired", now
+    for d in list(state["book"].values()):
+        if not any(p.get("k") == key for p in d.get("picks", [])):
+            continue
+        keep = []
+        for p in d["picks"]:
+            if p.get("k") != key:
+                keep.append(p)
+                continue
+            d["seen"] = max(0, d.get("seen", 0) - 1)
+            if p.get("st") != "o":                       # a finished buy had been counted: take it back out
+                d["n"] = max(0, d.get("n", 0) - 1)
+                fld = {"w": "win", "s": "stop", "f": "flat"}.get(p.get("st"))
+                if fld:
+                    d[fld] = max(0, d.get(fld, 0) - 1)
+                if p.get("st") == "w" or p.get("mx", 1.0) >= SMART_GOOD_MULT:
+                    d["good"] = max(0, d.get("good", 0) - 1)
+        d["picks"] = keep
+    state["charts"].pop(key, None)
+    state["peaks"].pop(key, None)                         # its "past high" was only bad data
+
+
+def note_steady(key: str, steady: bool, now: float | None = None):
+    """Remember what the daily history said about a coin."""
+    now = now or time.time()
+    state["steady_seen"][key] = now
+    if steady:
+        newly = key not in state["steady"]
+        state["steady"][key] = now
+        if newly:
+            log.info("%s barely moves (stock token, gold, wrapped coin or stable): left out of the alerts and of every wallet's record", key)
+            bot_stats["steady"] += 1
+            purge_steady(key, now)
+    else:
+        state["steady"].pop(key, None)
+
+
+def ensure_steady(key: str, chain: str, pair: dict) -> bool | None:
+    """Is this coin a steady asset? True or False - or None when that cannot be found out just now (GeckoTerminal busy).
+    The answer is remembered, so a coin's daily history is asked for once (a steady coin again after STEADY_RECHECK_DAYS)."""
+    now = time.time()
+    seen = state["steady_seen"].get(key)
+    if seen is not None and (key not in state["steady"] or now - seen < STEADY_RECHECK_DAYS * 86400):
+        return key in state["steady"]
+    if not (GECKO_NETWORK.get(chain) and pair.get("pairAddress")):
+        note_steady(key, False, now)                       # nothing to look at: an ordinary coin
+        return False
+    if gecko_backlog() > 20:
+        return None                                        # the shared connection is busy: ask again on a later scan
+    try:
+        candles = daily_candles(chain, pair)
+    except requests.RequestException as e:
+        if getattr(getattr(e, "response", None), "status_code", None) in (None, 429, 500, 502, 503, 504):
+            bot_stats["gecko_busy"] += 1
+            return None
+        _steady_fails[key] += 1
+    except (KeyError, ValueError, TypeError, AttributeError, IndexError):
+        _steady_fails[key] += 1
+    else:
+        _steady_fails.pop(key, None)
+        steady = steady_from_candles(candles)
+        note_steady(key, steady, now)
+        if key not in state["backfilled"]:           # the same candles give the coin's past high: no second request needed
+            try:
+                peak = peak_from_candles(key, pair, candles)
+            except (ValueError, TypeError, IndexError):
+                peak = None
+            if peak:
+                store_peak(key, peak)
+                state["backfilled"][key] = now
+        return steady
+    if _steady_fails[key] >= 3:                            # no usable history after three tries: an ordinary coin
+        _steady_fails.pop(key, None)
+        note_steady(key, False, now)
+        return False
+    return None
+
+
+def steady_due(key: str, now: float) -> bool:
+    """Has this coin's daily history never been looked at - or is it a steady coin whose last look is old?"""
+    seen = state["steady_seen"].get(key)
+    return seen is None or (key in state["steady"] and now - seen >= STEADY_RECHECK_DAYS * 86400)
+
+
+def clear_to_alert(key: str, chain: str, pair: dict) -> bool:
+    """The last check before an alert goes out: the coin is not a steady asset. (If that is not known yet, it is looked up
+    now; if the look-up is busy, the alert simply waits for a later scan.)"""
+    return ensure_steady(key, chain, pair) is False
+
+
+def store_peak(key: str, peak: float):
+    """Save a coin's past high. A steady asset has no real one (the number would only be bad data), so its is simply 'now'."""
+    if key in state["steady"]:
+        state["peaks"][key] = peak
+    else:
+        state["peaks"][key] = max(state["peaks"].get(key, 0.0), peak)
+
+
+def peak_from_candles(key: str | None, pair: dict, candles) -> float | None:
+    """A coin's past high as a market cap from its daily candles: highest daily high x (current market cap / current price).
+    A steady asset has no real past high to fall from, so its market cap today is returned."""
+    price = num(pair, "priceUsd")
+    mc = pair_mc(key, pair) if key else (num(pair, "marketCap") or num(pair, "fdv"))
+    if not (price > 0 and mc > 0):
+        return None
+    if key and key in state["steady"]:
+        return mc
+    highs = [float(c[2]) for c in candles if len(c) >= 3]
+    return max(highs) * (mc / price) if highs else None
+
+
 def fetch_peak_mc(chain: str, pair: dict, key: str | None = None):
     """
     Estimate all-time-high market cap from GeckoTerminal daily candles:
     highest daily high x (current market cap / current price).
+    The same candles tell whether the coin is a steady asset (see above).
     """
-    net, pool = GECKO_NETWORK.get(chain), pair.get("pairAddress")
-    price = num(pair, "priceUsd")
-    mc = pair_mc(key, pair) if key else (num(pair, "marketCap") or num(pair, "fdv"))
-    if not (net and pool and price > 0 and mc > 0):
+    if not (GECKO_NETWORK.get(chain) and pair.get("pairAddress") and num(pair, "priceUsd") > 0):
         return None
-    r = gecko_get(
-        f"https://api.geckoterminal.com/api/v2/networks/{net}/pools/{pool}/ohlcv/day",
-        params={"aggregate": 1, "limit": 1000, "currency": "usd"}, timeout=20)
-    candles = r.json()["data"]["attributes"]["ohlcv_list"]
-    highs = [float(c[2]) for c in candles if len(c) >= 3]
-    return max(highs) * (mc / price) if highs else None
+    candles = daily_candles(chain, pair)
+    if key:
+        note_steady(key, steady_from_candles(candles))
+    return peak_from_candles(key, pair, candles)
 
 
 def maybe_backfill_peak(key: str, chain: str, pair: dict, budget: list, force: bool = False):
@@ -997,7 +1378,7 @@ def maybe_backfill_peak(key: str, chain: str, pair: dict, budget: list, force: b
         peak = None
         log.warning("peak look-up failed for %s: %s", key, e)
     if peak:
-        state["peaks"][key] = max(state["peaks"].get(key, 0.0), peak)
+        store_peak(key, peak)
         state["backfilled"][key] = time.time()
         log.info("peak for %s estimated at %s", key, fmt_usd(state["peaks"][key]))
     else:
@@ -1044,9 +1425,16 @@ def scan_once():
     now = time.time()
     manual = set(TOKENS)
     budget = [MAX_BACKFILL_PER_CYCLE]
+    probes = [STEADY_PROBES_PER_SCAN]   # coins whose daily history may be looked at during this scan, to find steady assets
     caps = [BUYER_PER_SCAN]        # coins whose buyers may be looked at during this scan
     book_index()                   # which wallet buys are being followed (by coin)
     chart_cands: list = []         # coins whose chart may be read / whose buyers may be looked at once the pass is done
+    accum_cands: list = []         # v3.4: coins that several of your watched wallets keep adding to (looked at once the pass is done)
+    try:
+        accum_keys = accum_candidates(now)
+    except Exception:
+        accum_keys = set()
+        log.exception("wallet accumulation check error")
     checked = alerts = errors = 0
     rows: list[dict] = []
     fail_counts: Counter = Counter()
@@ -1096,9 +1484,23 @@ def scan_once():
                 _missing.pop(key, None)
                 mc = pair_mc(key, pair)
                 sym = pair["baseToken"].get("symbol", "?")
+                # v3.1: a coin that barely moves (stock token, gold, wrapped coin, stable) is not a runner. Coins that matter
+                # (followed, bought by a saved wallet, on Sparsity's map, or big enough to read) get one look at their daily
+                # history, a few per scan; a steady one is left out of everything from here on (this comes first, so an odd
+                # price on such a coin can never end a call or a wallet's buy as a "win").
+                if (steady_due(key, now) and probes[0] > 0 and gecko_backlog() < 12
+                        and (open_records(key) or _book_idx.get(key) or bottom_entry(key) or chart_eligible(chain, pair, mc))):
+                    probes[0] -= 1
+                    ensure_steady(key, chain, pair)
+                if key in state["steady"]:
+                    if not is_manual:
+                        dismiss(key)
+                    continue
                 track(key, mc, now, pair, pairs_here)  # update outcomes of earlier calls on this coin
                 if _book_idx.get(key):
                     book_track(key, pair, pairs_here, now)   # ...and of the buys of wallets in the wallet book
+                if key in accum_keys:
+                    accum_cands.append((key, chain, pair, mc))   # v3.4: your wallets keep adding to it
 
                 bt = bottom_entry(key)   # Sparsity lists this coin right now: never thrown out for size or age
                 picked = bool(_book_idx.get(key))
@@ -1115,7 +1517,7 @@ def scan_once():
                 if not is_manual and not bt and mc < mc_floor() and not open_records(key):
                     # too small for a re-run setup. A themed coin goes to the narrative radar, a coin whose chart can be
                     # read stays for the chart reader, anything else is dropped
-                    if NARRATIVE_ALERTS and mc >= NARR_MIN_MC and themes_for(key, pair):
+                    if alert_on("narrative") and mc >= NARR_MIN_MC and themes_for(key, pair):
                         maybe_narrative(key, chain, pair, now)
                     elif not ce and not picked:
                         dismiss(key)
@@ -1151,7 +1553,7 @@ def scan_once():
                         maybe_add_shadow(key, chain, pair, m, "+".join(sorted(codes)), now)
                     if m:
                         maybe_narrative(key, chain, pair, now, m)
-                        if WATCH_DIP_ALERTS and state["watch"]:
+                        if alert_on("walletdip") and state["watch"]:
                             try:  # a dipped coin that YOUR watched wallets are holding
                                 maybe_watch_dip(key, chain, pair, m, fails, now, budget)
                             except Exception:
@@ -1170,6 +1572,21 @@ def scan_once():
                          + (f"👛 Tracked wallets that bought in the last 24h: {sw}\n" if sw else "")
                          + wallets_line(held) + signals_text(sig)
                          + chain_note(chain))
+                if not alert_on("rerun"):
+                    # v3.0: a re-run setup is no longer sent to your chat. It is still followed in silence and scored (so the
+                    # report keeps showing how this idea does), and it is only sent when wallets you trust are holding it.
+                    if not clear_to_alert(key, chain, pair):
+                        continue      # v3.1: a steady asset, or not checked yet (the check was busy): not followed this time
+                    state["cooldowns"][key] = now
+                    if alert_on("walletdip") and wallet_backed_rerun(key, chain, pair, m, held, sig, now):
+                        alerts += 1
+                    else:
+                        add_record("call", key, chain, pair, m, "", now, extra={"sig": sig, "quiet": True})
+                        bot_stats["rerun_quiet"] += 1
+                        log.info("re-run setup for %s followed in silence (that alert is switched off)", key)
+                    continue
+                if not clear_to_alert(key, chain, pair):
+                    continue          # a steady asset, or not checked yet (the check was busy): no alert this time
                 if send_telegram(build_rerun_message(chain, pair, m, extra)):
                     state["cooldowns"][key] = now
                     add_record("call", key, chain, pair, m, "", now, extra={"sig": sig})
@@ -1185,6 +1602,10 @@ def scan_once():
         capture_pass(chart_cands, now, caps)  # who is buying the other coins (whatever is left of this scan's allowance)
     except Exception:
         log.exception("buyer capture pass error")
+    try:
+        slow_accum_pass(accum_cands, now)     # v3.4: several of your wallets keep adding to a coin over days
+    except Exception:
+        log.exception("slow-accumulation pass error")
     last_scan = {"t": time.time(), "checked": checked, "pool": len(watch), "rows": rows,
                  "fails": dict(fail_counts), "errors": errors}
     try:
@@ -1268,6 +1689,8 @@ def themes_for(key: str, pair: dict) -> list[str]:
 
 def add_record(kind: str, key: str, chain: str, pair: dict, m: dict, failed: str, now: float,
                extra: dict | None = None):
+    if key in state["steady"] and kind != "check":
+        return                   # v3.1: a steady asset (stock token, gold, wrapped coin, stable) is never followed
     for r in open_records(key):  # already following this coin (for whales: this wallet's buy)
         if r["kind"] == kind and (kind != "whale" or r.get("wallet") == (extra or {}).get("wallet")):
             return
@@ -1292,6 +1715,8 @@ def maybe_add_shadow(key: str, chain: str, pair: dict, m: dict, code: str, now: 
         return
     if len(open_records(kind="shadow")) >= MAX_SHADOWS_OPEN:
         return
+    if not clear_to_alert(key, chain, pair):
+        return                        # v3.1: a steady asset (or not checked yet): not worth an experiment
     state["shadow_cd"][key] = now
     add_record("shadow", key, chain, pair, m, code, now)
 
@@ -1359,8 +1784,8 @@ def close_record(r: dict, outcome: str, mc: float, now: float):
         w = state["wallets"].setdefault(r["wallet"], {"w": 0, "s": 0, "e": 0, "chain": r["chain"]})
         w[{"win": "w", "stop": "s"}.get(outcome, "e")] += 1
         return
-    if r["kind"] not in ALERT_KINDS:
-        return  # experiments close silently
+    if r["kind"] not in ALERT_KINDS or r.get("quiet"):
+        return  # experiments (and setups followed in silence) close silently
     tag = {"narrative": "NARRATIVE ", "wallet": "WALLET-BACKED ", "bottom": "BOTTOM ", "chart": "CHART ",
            "smartbuy": "SMART-WALLET "}.get(r["kind"], "")
     head = {"win": f"🎯 *{tag}CALL HIT*", "stop": f"🛑 *{tag}CALL STOPPED OUT*",
@@ -1508,8 +1933,11 @@ def build_report(sugg: list[tuple], applied: list[tuple[str, str]]) -> str:
     c, nr, wd = summarize(calls), summarize(narrs), summarize(wdips)
     L = ["📊 *BOT REPORT*", ""]
     if c["n"]:
-        L.append(f"Real re-run calls finished: *{c['n']}*  ✅ {c['w']} wins | 🛑 {c['s']} stopped | ⏱ {c['e']} flat")
+        L.append(f"Re-run setups finished: *{c['n']}*  ✅ {c['w']} wins | 🛑 {c['s']} stopped | ⏱ {c['e']} flat")
         L.append(f"Win rate: *{c['wr']:.0%}* | average best move: *{c['avg_best']:.2f}x*")
+        quiet_n = sum(1 for r in calls if r.get("quiet"))
+        if quiet_n:
+            L.append(f"(Since v3.0 these are no longer sent to you: {quiet_n} of the {c['n']} were followed quietly.)")
         by_chain: dict[str, list[dict]] = {}
         for r in calls:
             by_chain.setdefault(r["chain"], []).append(r)
@@ -1523,7 +1951,8 @@ def build_report(sugg: list[tuple], applied: list[tuple[str, str]]) -> str:
                 for lab, k in (("liquidity/MC", "liq_ratio"), ("volume/MC", "vol_ratio"), ("txns", "traders"))))
     else:
         L.append("No real re-run calls have finished yet.")
-    L.append(f"(Win = reaches {WIN_MULTIPLE:g}x before falling to {STOP_MULTIPLE:g}x, within {TRACK_HOURS:.0f}h)")
+    L.append(f"(Win = reaches {WIN_MULTIPLE:g}x before falling to {STOP_MULTIPLE:g}x, within {span_text(TRACK_HOURS)}; "
+             f"a wallet's buy gets {span_text(WALLET_TRACK_HOURS)})")
 
     if nr["n"]:
         L += ["", f"📰 Narrative alerts finished: *{nr['n']}*  ✅ {nr['w']} wins | 🛑 {nr['s']} stopped "
@@ -1583,9 +2012,13 @@ def build_report(sugg: list[tuple], applied: list[tuple[str, str]]) -> str:
                 exp.append(f"{lab} {ss['w']}/{ss['n']}")
         if exp:
             L.append("Near-misses by the single rule that blocked them (won/followed): " + " | ".join(exp))
-    set_aside = sum(1 for r in state["records"] if r.get("void"))
+    steady_n = sum(1 for r in state["records"] if r.get("void") and r["key"] in state["steady"])
+    set_aside = sum(1 for r in state["records"] if r.get("void")) - steady_n
     if set_aside:
         L += ["", f"🧹 {set_aside} older result(s) from before the price-glitch fixes were set aside - not counted."]
+    if state["steady"]:
+        L += ["", f"🪙 {len(state['steady'])} coin(s) that barely move (stock tokens, gold, wrapped coins) are left out: their "
+                  f"\"dips\" and \"wins\" were bad price data" + (f" ({steady_n} result(s) taken back out)." if steady_n else ".")]
     L += ["", f"Following now: {len(open_records(kind='call'))} calls, {len(open_records(kind='narrative'))} "
               f"narrative, {len(open_records(kind='wallet'))} wallet-backed, {len(open_records(kind='bottom'))} bottom, "
               f"{len(open_records(kind='chart'))} chart, {len(open_records(kind='smartbuy'))} smart-wallet, "
@@ -1608,7 +2041,7 @@ def build_report(sugg: list[tuple], applied: list[tuple[str, str]]) -> str:
 
 def build_report_part2() -> str:
     """The second report message: which chart shapes paid, and how the wallet book is doing."""
-    L = chart_report_lines() + book_report_lines()
+    L = chart_report_lines() + book_report_lines() + scorecard_report_lines()
     if not L:
         return ""
     L += ["", f"(Charts are read for coins of {fmt_usd(CHART_MIN_MC)}+; a wallet buy is followed from the price the wallet paid.)"]
@@ -1618,7 +2051,7 @@ def build_report_part2() -> str:
 def learning_cycle():
     now = time.time()
     tun = state["tuning"]
-    closed_alerts = sum(len(closed_records(k)) for k in ALERT_KINDS)
+    closed_alerts = sum(1 for k in ALERT_KINDS for r in closed_records(k) if not r.get("quiet"))
     due_calls = closed_alerts - tun.get("reported_calls", 0) >= REPORT_EVERY_CALLS
     total_closed = sum(1 for r in state["records"] if r["status"] != "open" and not r.get("void"))
     due_week = total_closed >= 5 and now - tun.get("last_report", 0) >= 7 * 86400
@@ -1647,6 +2080,9 @@ def learning_cycle():
     for k in [k for k, b in state["bottoms"].items() if now - b.get("last", 0) > 21 * 86400 and not open_records(k)]:
         state["bottoms"].pop(k, None)     # Sparsity has not listed it for three weeks
     open_keys = {r["key"] for r in state["records"] if r["status"] == "open"}
+    for k in [k for k, t in state["steady_seen"].items()
+              if k not in state["steady"] and now - t > 60 * 86400 and k not in state["discovered"] and k not in open_keys]:
+        state["steady_seen"].pop(k, None)     # an old "not steady" answer: it is simply asked again if the coin comes back
     for k in [k for k, c in state["charts"].items()
               if now - max(c.get("seen", 0), c.get("t", 0)) > CHART_KEEP_HOURS * 3600 and k not in open_keys]:
         state["charts"].pop(k, None)      # a coin that has not been in the scan for days: its chart notes are forgotten
@@ -1664,7 +2100,7 @@ def learning_cycle():
 # NARRATIVE RADAR: themed coins (stocks, AI, politics...) waking up BEFORE a big run
 # ----------------------------------------------------------------------------
 def maybe_narrative(key: str, chain: str, pair: dict, now: float, m: dict | None = None) -> bool:
-    if not NARRATIVE_ALERTS:
+    if not alert_on("narrative"):
         return False
     th = themes_for(key, pair)
     if not th:
@@ -1687,6 +2123,8 @@ def maybe_narrative(key: str, chain: str, pair: dict, now: float, m: dict | None
         return False
     if not confirmed_twice("narr", key, m["mc"], now):
         return False
+    if not clear_to_alert(key, chain, pair):
+        return False                  # v3.1: a steady asset (a stock token, say) is not a theme play
     sw = len(recent_wallets(key))
     base = pair.get("baseToken", {})
     addr = base.get("address", "")
@@ -1697,7 +2135,7 @@ def maybe_narrative(key: str, chain: str, pair: dict, now: float, m: dict | None
         f"📊 24h volume: {fmt_usd(m['vol24'])} (*{m['vol_ratio']:.1f}x* its market cap)\n"
         f"👥 24h txns: {m['traders']:,}  |  📈 24h price: {h24:+.0f}%\n"
         + (f"👛 Tracked wallets that bought in the last 24h: {sw}\n" if sw else "")
-        + f"\n⚠️ Early-stage theme play, NOT a re-run setup - higher risk. Tracked for {TRACK_HOURS:.0f}h.\n"
+        + f"\n⚠️ Early-stage theme play, NOT a re-run setup - higher risk. Tracked for {span_text(TRACK_HOURS)}.\n"
         + chain_note(chain) + "\n"
         f"`{addr}`\n\n"
         f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
@@ -1731,7 +2169,7 @@ def token_context(chain: str, token: str):
         try:
             peak = fetch_peak_mc(chain, pair, key)
             if peak:
-                state["peaks"][key] = max(state["peaks"].get(key, 0.0), peak)
+                store_peak(key, peak)
                 state["backfilled"][key] = time.time()
         except (requests.RequestException, KeyError, ValueError, TypeError):
             pass
@@ -1739,8 +2177,9 @@ def token_context(chain: str, token: str):
     return {"pair": pair, "m": m, "key": key} if m else None
 
 
-def handle_whale_swap(swap: dict) -> bool:
-    """Send the whale alert, tag re-run accumulation, detect clusters, and start scoring this wallet."""
+def handle_whale_swap(swap: dict, quiet: bool = False) -> bool:
+    """Send the whale alert, tag re-run accumulation, detect clusters, and start scoring this wallet.
+    quiet = (v3.2) everything happens except the one-wallet message itself (the daily limit on those was reached)."""
     now = time.time()
     chain, token, wallet = swap["chain"], swap["token"], swap["wallet"]
     key = sk(chain, token)
@@ -1761,8 +2200,8 @@ def handle_whale_swap(swap: dict) -> bool:
                      f"(market cap now {fmt_usd(m['mc'])})\n")
             if zone:
                 extra = "🔥 *SMART MONEY RE-RUN ACCUMULATION*\n" + extra
-            add_record("whale", key, chain, ctx["pair"], m, "", now, extra={"wallet": wallet, "zone": zone})
-    ok = send_telegram(build_whale_message(swap, extra))
+            add_record("whale", key, chain, ctx["pair"], m, "", now, extra={"wallet": wallet, "zone": zone, "th": WALLET_TRACK_HOURS})
+    ok = False if quiet else send_telegram(build_whale_message(swap, extra))
     if ok:
         bot_stats["whale"] += 1
     if len(cluster) >= SMART_CLUSTER_MIN and now - state["cooldowns"].get("cluster:" + key, 0) > 7200:
@@ -1825,6 +2264,7 @@ def find_watch(text: str) -> str | None:
 
 def remove_watch(key: str):
     state["watch"].pop(key, None)
+    state["accum"].pop(key, None)       # v3.4: ...and the notes of what it added
     _snaps.pop(key, None)
     for k in [k for k in list(_hold_cache) if k[0] == key]:
         _hold_cache.pop(k, None)
@@ -1834,8 +2274,17 @@ def remove_watch(key: str):
 
 
 def seed_watch_wallets():
-    """WATCH_WALLETS="Whale1:address,address2" - an optional extra on top of adding wallets in the chat."""
+    """The built-in wallet list (v3.2, grown in v3.3) and WATCH_WALLETS="Whale1:address,address2" join the watch list - an extra on top of
+    adding wallets in the chat. A wallet you removed with /unwatch stays removed, and one already on the list keeps your name."""
     gone = set(state["tuning"].get("watch_removed") or [])
+    STARTER_ADDED.clear()
+    if STARTER_WALLETS_ON:
+        for name, addr in STARTER_WALLETS:
+            kind = wallet_kind(addr)
+            key = addr.lower() if kind == "evm" else addr
+            if kind and key not in gone and key not in state["watch"]:
+                add_watch(addr, name)
+                STARTER_ADDED.append(name)
     for item in WATCH_WALLETS_SEED.split(","):
         item = item.strip()
         if not item:
@@ -2010,6 +2459,11 @@ def price_coins(mints: list[str]) -> dict[str, dict]:
     return out
 
 
+def _last_day(stamps, now: float) -> list:
+    """The time stamps from the last 24 hours (anything odd in a damaged memory file is simply dropped)."""
+    return [t for t in (stamps if isinstance(stamps, list) else []) if isinstance(t, (int, float)) and now - t < 86400]
+
+
 def handle_watch_move(wallet: str, mint: str, side: str, usd: float, pair: dict) -> bool:
     """A watched wallet picked up or dumped a coin: tell the owner (it also feeds clusters + wallet scoring)."""
     now, key = time.time(), sk("solana", mint)
@@ -2020,7 +2474,36 @@ def handle_watch_move(wallet: str, mint: str, side: str, usd: float, pair: dict)
             "signature": f"sweep:{wallet}:{mint}:{int(now // 600)}", "src": "watch"}
     if _is_duplicate(swap["signature"]):
         return False
-    return handle_whale_swap(swap)
+    # v3.2: busy wallets can move a lot of coins in a day. After WATCH_MOVES_MAX_PER_DAY messages in 24 hours the rest of
+    # the moves are still followed and scored (and a cluster of wallets buying one coin still gets its alert) - just not announced one by one.
+    stamps = _last_day(state["tuning"].get("wmove_ts"), now)
+    state["tuning"]["wmove_ts"] = stamps
+    # v3.3: ...and one very busy wallet may not use up the whole day's messages: at most WATCH_MOVES_PER_WALLET per wallet per 24h
+    by = state["tuning"].get("wmove_by")
+    if not isinstance(by, dict):
+        by = state["tuning"]["wmove_by"] = {}
+    for w_ in list(by):
+        by[w_] = _last_day(by[w_], now)
+        if not by[w_]:
+            del by[w_]
+    mine = by.get(wallet, [])
+    day_full = WATCH_MOVES_MAX_PER_DAY > 0 and len(stamps) >= WATCH_MOVES_MAX_PER_DAY
+    wallet_full = WATCH_MOVES_PER_WALLET > 0 and len(mine) >= WATCH_MOVES_PER_WALLET
+    quiet = day_full or wallet_full
+    if day_full and now - state["cooldowns"].get("wmove_cap", 0) > 20 * 3600:
+        state["cooldowns"]["wmove_cap"] = now
+        send_telegram(
+            f"🔕 *Wallet moves: quiet for now.* That was {len(stamps)} 'wallet bought / sold' messages in 24 hours, so I'll stop "
+            "sending them one by one until some of those hours have passed. I still follow every coin your wallets buy, still "
+            "score them, and still warn you when two or more of them buy the same coin together. "
+            "(To allow more per day, change the `WATCH_MOVES_MAX_PER_DAY` setting on Render, or ask Claude.)")
+    ok = handle_whale_swap(swap, quiet=quiet)
+    if ok:
+        stamps.append(now)
+        if WATCH_MOVES_PER_WALLET > 0:
+            mine.append(now)
+            by[wallet] = mine
+    return ok
 
 
 def wallet_sweep() -> int:
@@ -2039,7 +2522,22 @@ def wallet_sweep() -> int:
         need = [m_ for m_, a in snap.items() if first or a >= 1.5 * prev.get(m_, 0.0)]        # new coins, or positions that grew 50%+
         need += [m_ for m_, a in prev.items() if snap.get(m_, 0.0) < 0.5 * a and m_ not in need]   # coins it mostly sold
         need = [m_ for m_ in need if not is_quote_token("solana", m_)]
-        priced = price_coins(need)
+        # v3.4: a coin whose amount changed by even a little is priced too, so that small top-ups can be added up over days
+        # (a single look only catches a big jump: a new position, or +50%)
+        moved = [] if first else accum_moved(snap, prev)
+        priced = price_coins(need + [m_ for m_ in moved if m_ not in need])
+        if moved:
+            try:
+                accum_note(w, snap, prev, moved, priced, now)
+                for mint in moved:      # a coin it only topped up a little still joins the scanner's list once the position is big enough
+                    pair = priced.get(mint) if mint not in need else None
+                    key = sk("solana", mint)
+                    if (pair and snap.get(mint, 0.0) * num(pair, "priceUsd") >= WATCH_MIN_HOLD_USD
+                            and pool_floor() <= (num(pair, "marketCap") or num(pair, "fdv")) <= MAX_COIN_MC and not too_old(pair)
+                            and key not in state["discovered"] and key not in state["dismissed"] and not manual_coin("solana", mint)):
+                        state["discovered"][key] = now
+            except Exception:
+                log.exception("could not note a wallet's changes")
         for mint in need:
             pair = priced.get(mint)
             if not pair:
@@ -2061,7 +2559,242 @@ def wallet_sweep() -> int:
                     sent += bool(handle_watch_move(w, mint, "SELL", (was - cur) * px, pair))
             except Exception:
                 log.exception("wallet move could not be reported")
+    try:                                                     # v3.4: tidy the notes of what the wallets changed
+        for w_ in list(state["accum"]):
+            if w_ in state["watch"]:
+                accum_trim(w_, now)
+            else:
+                state["accum"].pop(w_, None)                 # (a wallet that is not watched any more)
+    except Exception:
+        log.exception("could not tidy the wallet change notes")
     return sent
+
+
+# --- v3.4: wallets that keep ADDING to a coin over several days ---
+# One look inside a wallet only catches a big jump (a new coin, or +50% since the last look). A wallet that builds a position in
+# many small top-ups over days never trips that. So what each watched wallet changes is written down (in the memory file, so it
+# survives every update) and added up over the last ACCUM_DAYS days. Solana wallets only: EVM wallets cannot be looked into for free.
+def accum_moved(snap: dict, prev: dict) -> list:
+    """Coins whose amount in a wallet changed by at least ACCUM_STEP_MIN of what it holds (less than that is dust or rounding)."""
+    out = []
+    for mint in set(snap) | set(prev):
+        a, b = snap.get(mint, 0.0), prev.get(mint, 0.0)
+        if a != b and abs(a - b) >= ACCUM_STEP_MIN * max(a, b) and not is_quote_token("solana", mint):
+            out.append(mint)
+    return out
+
+
+def accum_note(wallet: str, snap: dict, prev: dict, moved: list, priced: dict, now: float):
+    """Write down what changed in a watched wallet since the last look: [when, change in tokens] per coin. Only coins with a live
+    pool and a change worth at least ACCUM_NOTE_MIN_USD are kept (junk airdrops and dust are not worth remembering)."""
+    ledger = state["accum"].setdefault(wallet, {})
+    for mint in moved:
+        pair = priced.get(mint)
+        px = num(pair, "priceUsd") if pair else 0.0
+        d = snap.get(mint, 0.0) - prev.get(mint, 0.0)
+        if px > 0 and abs(d) * px >= ACCUM_NOTE_MIN_USD:
+            ledger.setdefault(mint, []).append([round(now), float(f"{d:.8g}")])
+    accum_trim(wallet, now)
+
+
+def accum_trim(wallet: str, now: float):
+    """Forget changes older than ACCUM_DAYS days. A coin with too many notes gets its two oldest merged into one."""
+    ledger = state["accum"].get(wallet)
+    if not isinstance(ledger, dict):
+        state["accum"].pop(wallet, None)
+        return
+    horizon = now - ACCUM_DAYS * 86400
+    for mint in list(ledger):
+        rows = [r for r in ledger[mint] if r[0] >= horizon]
+        while len(rows) > ACCUM_MAX_ROWS:
+            rows[1] = [rows[1][0], rows[0][1] + rows[1][1]]
+            del rows[0]
+        if rows:
+            ledger[mint] = rows
+        else:
+            del ledger[mint]
+    if not ledger:
+        state["accum"].pop(wallet, None)
+
+
+def accum_view(mint: str, now: float, since: float = 0.0) -> dict:
+    """Which watched wallets have been adding to this coin over the last ACCUM_DAYS days (what they sold is taken off):
+    {wallet: {"net": coins added, "held": coins held now, "steps": separate top-ups, "first": when the first top-up was}}.
+    A wallet only counts while it still holds the coin, and when what it added is a real share of what it holds.
+    since = only look at changes after this time (a coin that was already announced needs NEW adds to be announced again)."""
+    out: dict = {}
+    horizon = max(now - ACCUM_DAYS * 86400, since)
+    for w, coins in list(state["accum"].items()):
+        rows = [r for r in list((coins or {}).get(mint) or []) if r[0] >= horizon]
+        ups = [r for r in rows if r[1] > 0]
+        net = sum(r[1] for r in rows)
+        snap = _snaps.get(w)
+        held = snap[1].get(mint, 0.0) if snap else 0.0
+        if not ups or net <= 0 or held <= 0:
+            continue
+        before = max(0.0, held - net)
+        if before > 0 and net < ACCUM_MIN_GROWTH * before:
+            continue                      # a big holder adding a sliver of its position is not "accumulating"
+        out[w] = {"net": net, "held": held, "steps": len(ups), "first": min(r[0] for r in ups)}
+    return out
+
+
+def accum_candidates(now: float) -> set:
+    """Coins (as state keys) worth a closer look this scan: two or more watched wallets adding to the same one (at least one of
+    them in more than one step), or one wallet adding in several separate steps. (A quick check on coin counts only - what it is
+    worth in dollars is looked at later.)"""
+    if not (ACCUM_ON and state["accum"]):
+        return set()
+    mints: set = set()
+    for coins in list(state["accum"].values()):
+        if isinstance(coins, dict):
+            mints.update(list(coins))
+    out = set()
+    for mint in mints:
+        steps = sorted((x["steps"] for x in accum_view(mint, now).values()), reverse=True)
+        if steps and ((len(steps) >= ACCUM_MIN_WALLETS and steps[0] >= 2) or steps[0] >= ACCUM_SOLO_STEPS):
+            out.add(sk("solana", mint))
+    return out
+
+
+def accum_lines(pair: dict) -> list:
+    """For the scorecard: what the wallets you watch added to / sold from this coin over the last ACCUM_DAYS days (from the notes
+    taken at every look inside a wallet). Information only - it never changes the points."""
+    try:
+        px = num(pair, "priceUsd")
+        mint = (pair.get("baseToken") or {}).get("address", "")
+        if not (ACCUM_ON and px > 0 and mint and state["accum"]):
+            return []
+        horizon = time.time() - ACCUM_DAYS * 86400
+        adds, sells = [], []
+        for w, coins in list(state["accum"].items()):
+            rows = [r for r in list((coins or {}).get(mint) or []) if r[0] >= horizon]
+            up, down = sum(r[1] for r in rows if r[1] > 0) * px, -sum(r[1] for r in rows if r[1] < 0) * px
+            if up >= ACCUM_SHOW_USD:
+                adds.append((up, wallet_label(w)))
+            if down >= ACCUM_SHOW_USD:
+                sells.append((down, wallet_label(w)))
+        span, out = span_text(ACCUM_DAYS * 24), []
+        if adds:
+            out.append(f"👛 In the last {span} wallets you watch added: "
+                       + ", ".join(f"{md_escape(n)} {fmt_usd(u)}" for u, n in sorted(adds, reverse=True)[:4]))
+        if sells:
+            out.append((f"🔻 ...and these sold: " if adds else f"🔻 In the last {span} wallets you watch sold: ")
+                       + ", ".join(f"{md_escape(n)} {fmt_usd(u)}" for u, n in sorted(sells, reverse=True)[:4]))
+        return out
+    except Exception:
+        return []
+
+
+def since_text(seconds: float) -> str:
+    """'40 min', '5 h' or '3 days': how long ago something was."""
+    if seconds < 3600:
+        return f"{max(1, round(seconds / 60))} min"
+    if seconds < 48 * 3600:
+        return f"{seconds / 3600:.0f} h"
+    return f"{seconds / 86400:.0f} days"
+
+
+def slow_accum_pass(cands: list, now: float):
+    """Every scan: a coin that several of your wallets (or one wallet, step by step) keep adding to gets one message."""
+    if not (ACCUM_ON and alert_on("smartbuy")):
+        return
+    for key, chain, pair, mc in cands:
+        if chain != "solana":
+            continue
+        if (now - state["cooldowns"].get("sbs:" + key, 0) < ACCUM_COOLDOWN_DAYS * 86400
+                or now - state["cooldowns"].get("sb:" + key, 0) < 24 * 3600):
+            continue                      # announced lately (as a slow build-up, or as a smart-wallet buy)
+        try:
+            maybe_slow_accum(key, chain, pair, now)
+        except Exception:
+            log.exception("slow-accumulation check error")
+
+
+def maybe_slow_accum(key: str, chain: str, pair: dict, now: float) -> bool:
+    mint = key.split(":", 1)[1]
+    px = num(pair, "priceUsd")
+    if px <= 0 or num(pair, "liquidity", "usd") < BOTTOM_MIN_LIQ_USD or too_old(pair):
+        return False
+    since = state["cooldowns"].get("sbs:" + key, 0.0)       # announced before? then only NEW adds count
+    rows = []                             # (wallet, $ added, $ held now, top-ups, when the first was)
+    for w, x in accum_view(mint, now, since).items():
+        added, held_usd = x["net"] * px, x["held"] * px
+        if added >= ACCUM_MIN_WALLET_USD and held_usd >= WATCH_MIN_HOLD_USD:
+            rows.append((w, added, held_usd, x["steps"], x["first"]))
+    # several wallets adding (one of them more than once: a single buy by each is already announced as it happens), or ONE wallet adding a lot in several steps
+    many = len(rows) >= ACCUM_MIN_WALLETS and max((r[3] for r in rows), default=0) >= 2
+    solo = any(r[1] >= ACCUM_SOLO_USD and r[3] >= ACCUM_SOLO_STEPS for r in rows)
+    if not (many or solo):
+        return False
+    rows.sort(key=lambda r: -r[1])
+    # a bottom or chart alert for this coin just went out (or is on its way): it already shows who is buying
+    b = state["bottoms"].get(key)
+    if now - state["cooldowns"].get("chart:" + key, 0) < 12 * 3600 or (b and now - b.get("alerted", 0) < 12 * 3600):
+        return False
+    if bottom_alert_coming(key, now) or chart_alert_coming(key, now):
+        return False
+    stamps = _last_day(state["tuning"].get("sbs_ts"), now)
+    state["tuning"]["sbs_ts"] = stamps
+    if len(stamps) >= ACCUM_MAX_PER_DAY:
+        return False
+    m = compute_metrics(key, pair)
+    if not m or m["mc"] < pool_floor() or (m["mc"] > MAX_COIN_MC and not manual_coin(chain, mint)):
+        return False
+    if not confirmed_twice("sbs", key, m["mc"], now):
+        return False
+    if not clear_to_alert(key, chain, pair):
+        return False                      # a steady asset (or not checked yet)
+    held = watch_holders(chain, mint, px, max_age=1800)
+    shown = rows[:5]
+    if not send_telegram(build_slow_accum_message(chain, pair, m, shown, held, now, since)):
+        return False
+    state["cooldowns"]["sbs:" + key] = now
+    state["cooldowns"]["sb:" + key] = now    # (the ordinary smart-wallet message waits too: one message, not two)
+    stamps.append(now)
+    c = state["charts"].get(key) or {}
+    add_record("smartbuy", key, chain, pair, m, "", now,
+               extra={"th": WALLET_TRACK_HOURS, "sig": signals_for(m, len(held["in"])), "strong": len(rows), "soft": 0,
+                      "wal": [r[0] for r in shown][:4], "signs": (b.get("signs") if b and bottom_active(b) else None),
+                      "pat": c.get("pat", "") if c.get("ok") else "", "slow": True})
+    bot_stats["smartbuy"] += 1
+    log.info("SLOW-ACCUMULATION alert for %s (%d wallets adding)", key, len(rows))
+    return True
+
+
+def build_slow_accum_message(chain: str, pair: dict, m: dict, rows: list, held: dict, now: float, since: float = 0.0) -> str:
+    base = pair.get("baseToken", {})
+    addr, sym = base.get("address", ""), md_escape(base.get("symbol", "?"))
+    key = sk(chain, addr)
+    span = (f"since my last message about it ({since_text(now - since)} ago)" if since > 0
+            else f"over the last {span_text(ACCUM_DAYS * 24)}")
+    L = [f"*🧠 SMART WALLETS KEEP BUYING: ${sym}*  |  {CHAINS[chain]['name']}", "",
+         (f"{len(rows)} of your watched wallets have been adding to it {span}:" if len(rows) > 1 else
+          f"One of your watched wallets has been adding to it, step by step, {span}:")]
+    for w, added, held_usd, steps, first in rows:
+        when = since_text(now - first)
+        L.append(f"• *{md_escape(wallet_label(w))}* added about {fmt_usd(added)}"
+                 + (f" in {steps} top-ups, the first {when} ago" if steps > 1 else f", {when} ago")
+                 + f" · holds {fmt_usd(held_usd)} now")
+    if len(rows) > 1:
+        L.append(f"   Together about {fmt_usd(sum(r[1] for r in rows))} added")
+    down = f"down {m['retrace']:.0f}% from its high of {fmt_usd(m['peak'])}" if m["retrace"] >= 5 else "close to its high"
+    L += ["",
+          f"💰 Market cap *{fmt_usd(m['mc'])}* · {down}",
+          f"💧 liquidity {fmt_usd(m['liq'])} ({m['liq_ratio'] * 100:.1f}% of MC) · 📊 24h volume {fmt_usd(m['vol24'])} "
+          f"({m['vol_ratio'] * 100:.0f}% of MC) · 👥 {m['traders']:,} txns · ⏱ {fmt_age(m['age_h'])}"]
+    body = "\n".join(L) + "\n"
+    c = state["charts"].get(key)
+    if c and c.get("ok"):
+        body += chart_lines(key, c, m, num(pair, "priceUsd"))
+    body += wallets_line(held)
+    body += ("ℹ️ This is the slow build-up over days, which one 'wallet bought' message can miss. "
+             "Wallets also sell later, so it is a clue, not a guarantee.\n")
+    body += (f"📌 Tracking this for {span_text(WALLET_TRACK_HOURS)} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x).\n\n"
+             f"`{addr}`\n\n"
+             f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
+             f"[Explorer]({link(chain, 'token', addr)})")
+    return body
 
 
 DIP_HARD = {"peak", "retrace_lo", "retrace_hi", "age", "nomc", "old"}   # problems a wallet-backed alert cannot excuse
@@ -2099,17 +2832,45 @@ def maybe_watch_dip(key: str, chain: str, pair: dict, m: dict, fails: list, now:
             return False   # it passes everything after all: the normal alert path will pick it up
     if not confirmed_twice("wal", key, m["mc"], now):
         return False
+    if not clear_to_alert(key, chain, pair):
+        return False   # v3.1: a steady asset (or not checked yet)
     sig = signals_for(m, len(held["in"]))
     extra = (wallets_line(held) + signals_text(sig)
              + f"ℹ️ Not a full re-run setup ({'; '.join(fail_label(c) for c in sorted(codes))}), "
                "but wallets you trust are still holding it.\n" + chain_note(chain))
-    if not send_telegram(build_rerun_message(chain, pair, m, extra, title="👛 WALLET-BACKED DIP")):
+    if not send_telegram(build_rerun_message(chain, pair, m, extra, title="👛 WALLET-BACKED DIP", track_hours=WALLET_TRACK_HOURS)):
         return False
     state["cooldowns"][ckey] = now
     stamps.append(now)
     bot_stats["walletdip"] += 1
-    add_record("wallet", key, chain, pair, m, "", now, extra={"sig": sig})
+    add_record("wallet", key, chain, pair, m, "", now, extra={"sig": sig, "th": WALLET_TRACK_HOURS})
     log.info("WALLET-BACKED DIP alert for %s", key)
+    return True
+
+
+def wallet_backed_rerun(key: str, chain: str, pair: dict, m: dict, held: dict, sig: list, now: float) -> bool:
+    """v3.0: the re-run alert is off, but this coin passes every re-run rule AND wallets you trust are holding it - that is
+    still worth a message. It goes out as a wallet-backed alert (same daily limit as the other wallet-backed ones)."""
+    if len(held["in"]) < WATCH_MIN_HOLDERS:
+        return False
+    ckey = "wal:" + key
+    if now - state["cooldowns"].get(ckey, 0) < COOLDOWN_SECONDS:
+        return False
+    stamps = [t for t in state["tuning"].get("wal_ts", []) if now - t < 86400]
+    state["tuning"]["wal_ts"] = stamps
+    if len(stamps) >= WATCH_DIP_MAX_PER_DAY:
+        return False
+    if not clear_to_alert(key, chain, pair):
+        return False   # v3.1: a steady asset (or not checked yet)
+    extra = (wallets_line(held) + signals_text(sig)
+             + "ℹ️ It also passes every re-run rule, and wallets you trust are still holding it.\n" + chain_note(chain))
+    if not send_telegram(build_rerun_message(chain, pair, m, extra, title="👛 WALLET-BACKED DIP", track_hours=WALLET_TRACK_HOURS)):
+        return False
+    state["cooldowns"][ckey] = now
+    stamps.append(now)
+    bot_stats["walletdip"] += 1
+    add_record("wallet", key, chain, pair, m, "", now, extra={"sig": sig, "th": WALLET_TRACK_HOURS})
+    log.info("WALLET-BACKED alert for %s (it also passes the re-run rules)", key)
     return True
 
 
@@ -2744,7 +3505,7 @@ def refresh_sparsity(force: bool = False) -> int:
     if not state["tuning"].get("sp_intro"):
         state["tuning"]["sp_intro"] = True
         ready = [b for b in list(state["bottoms"].values()) if bottom_active(b) and b["signs"] >= BOTTOM_MIN_SIGNS]
-        if BOTTOM_ALERTS and len(ready) >= 3:
+        if alert_on("bottom") and len(ready) >= 3:
             send_telegram(
                 f"🧭 *Bottomed-coin list is live.* Sparsity currently shows {len(ready)} coins with "
                 f"{BOTTOM_MIN_SIGNS} of 3 bottom signs: "
@@ -3049,6 +3810,8 @@ def maybe_add_bottom_shadow(key: str, chain: str, pair: dict, m: dict, b: dict, 
         return
     if len(open_records(kind="bshadow")) >= MAX_BOTTOM_SHADOWS:
         return
+    if not clear_to_alert(key, chain, pair):
+        return                        # v3.1: a steady asset (or not checked yet)
     state["shadow_cd"]["b:" + key] = now
     add_record("bshadow", key, chain, pair, m, "", now, extra={"signs": b.get("signs"), "th": BOTTOM_TRACK_HOURS})
 
@@ -3080,7 +3843,7 @@ def bottom_backing(key: str, b: dict, now: float):
 def bottom_alert_coming(key: str, now: float) -> bool:
     """Is a bottom alert about to go out for this coin? Then that alert already shows who is buying."""
     b = state["bottoms"].get(key)
-    if not (BOTTOM_ALERTS and b and bottom_active(b)) or now - b.get("alerted", 0) < BOTTOM_COOLDOWN_DAYS * 86400:
+    if not (alert_on("bottom") and b and bottom_active(b)) or now - b.get("alerted", 0) < BOTTOM_COOLDOWN_DAYS * 86400:
         return False
     if len([t for t in state["tuning"].get("bottom_ts", []) if now - t < 86400]) >= BOTTOM_MAX_PER_DAY:
         return False
@@ -3107,11 +3870,13 @@ def maybe_bottom(key: str, chain: str, pair: dict, b: dict, now: float, caps: li
     eligible = signs >= BOTTOM_MIN_SIGNS or (signs == 2 and backed)
     stamps = [t for t in state["tuning"].get("bottom_ts", []) if now - t < 86400]
     state["tuning"]["bottom_ts"] = stamps
-    if BOTTOM_ALERTS and eligible and not cooling and len(stamps) < BOTTOM_MAX_PER_DAY:
+    if alert_on("bottom") and eligible and not cooling and len(stamps) < BOTTOM_MAX_PER_DAY:
         if capture_due(b, now, bottom_cap_hours(b)):
             return False                          # the buyers are looked at at the end of this scan: the alert follows
         if not confirmed_twice("bottom", key, m["mc"], now):
             return False
+        if not clear_to_alert(key, chain, pair):
+            return False                          # v3.1: a steady asset (or not checked yet)
         held = watch_holders(chain, key.split(":", 1)[1], num(pair, "priceUsd"), max_age=1800)
         title = ("🧭 BOTTOM SIGNAL" if signs >= 3 else "🧭 BOTTOM + WALLET YOU TRUST" if smart
                  else f"🧭 BOTTOM ({signs} of 3) + BACKING")
@@ -3164,7 +3929,7 @@ def open_pick_keys() -> set:
 def book_add(w: str, key: str, chain: str, pair: dict, row: list, now: float) -> bool:
     """Save one accumulating wallet and its buy: row = [wallet, bought $, sold $, trades, average price paid, last trade]."""
     px_now = num(pair, "priceUsd")
-    if not w or px_now <= 0:
+    if not w or px_now <= 0 or key in state["steady"]:      # (v3.1: a steady asset says nothing about a wallet)
         return False
     book = state["book"]
     d = book.get(w)
@@ -3251,29 +4016,53 @@ def book_close(w: str, p: dict, outcome: str, now: float):
         d["good"] += 1
 
 
+def crowd_sizes() -> dict[str, int]:
+    """How many saved wallets bought each coin (finished buys and open ones)."""
+    sizes: dict[str, int] = {}
+    for d in list(state["book"].values()):
+        for k in {p.get("k") for p in d.get("picks", []) if p.get("k")}:
+            sizes[k] = sizes.get(k, 0) + 1
+    return sizes
+
+
+def crowd_weight(crowd: int) -> float:
+    """How much one wallet's result on a coin counts. When many saved wallets bought the same coin, they all win or all lose
+    together - that is one piece of evidence, not many. A group of CROWD_FULL_WEIGHT wallets or fewer counts in full."""
+    return min(1.0, CROWD_FULL_WEIGHT / max(1, crowd))
+
+
 def wallet_scores() -> dict[str, dict]:
     """Per wallet: how many of its followed buys were GOOD (the coin reached SMART_GOOD_MULT x the price it paid, or hit
-    the win mark). From the wallet book, plus the older 'whale buy' records. One count per coin."""
+    the win mark). From the wallet book, plus the older 'whale buy' records. One count per coin.
+    'wg' is the number of good buys with each one weighted by crowd_weight (a coin that a big crowd of saved wallets
+    bought counts less); the grades below are judged on that."""
     out: dict[str, dict] = {}
     seen = set()
+    crowd = crowd_sizes()
     for w, d in list(state["book"].items()):
         for p in d.get("picks", []):
             if p.get("st") != "o":
                 seen.add((w, p["k"]))
         if d.get("n"):
+            fin = [p for p in d["picks"] if p.get("st") != "o"]
+            wts = [crowd_weight(crowd.get(p["k"], 1)) for p in fin]
+            goods = [bool(p["st"] == "w" or p.get("mx", 1.0) >= SMART_GOOD_MULT) for p in fin]
+            old_n = max(0, d["n"] - len(fin))                       # finished buys no longer in the list (the oldest are forgotten)
+            old_g = min(old_n, max(0, d.get("good", 0) - sum(goods)))
             out[w] = {"n": d["n"], "good": d.get("good", 0), "win": d.get("win", 0), "chain": d.get("chain", "solana"),
-                      "coins": [(p["s"], p["c"], p["st"] == "w" or p.get("mx", 1.0) >= SMART_GOOD_MULT)
-                                for p in d["picks"] if p.get("st") != "o"]}
+                      "wg": round(sum(x for x, g in zip(wts, goods) if g) + old_g, 2),
+                      "coins": [(p["s"], p["c"], g) for p, g in zip(fin, goods)]}
     for r in state["records"]:
         w = r.get("wallet")
         if r["kind"] != "whale" or r["status"] == "open" or r.get("void") or not w or (w, r["key"]) in seen:
             continue
         seen.add((w, r["key"]))
-        d = out.setdefault(w, {"n": 0, "good": 0, "win": 0, "coins": [], "chain": r["chain"]})
+        d = out.setdefault(w, {"n": 0, "good": 0, "win": 0, "coins": [], "chain": r["chain"], "wg": 0.0})
         good = r["status"] == "win" or r.get("best", 0) >= SMART_GOOD_MULT
         d["n"] += 1
         d["good"] += bool(good)
         d["win"] += r["status"] == "win"
+        d["wg"] = round(d.get("wg", 0.0) + bool(good), 2)
         d["coins"].append((r["sym"], r["chain"], bool(good)))
     return out
 
@@ -3285,16 +4074,24 @@ def book_grade(w: str, scores: dict | None = None) -> str:
     return record_grade(w, scores)
 
 
-def record_grade(w: str, scores: dict | None = None) -> str:
-    """The same, judged by results only (a wallet on your list is graded too)."""
-    d = (scores if scores is not None else wallet_scores()).get(w)
+def grade_of(d: dict | None) -> str:
+    """'proven', 'promising' or '' for one wallet's score. Judged on the crowd-weighted good buys (v3.1): a good result on a coin
+    that a whole crowd of saved wallets bought barely counts, so a wallet has to be right on coins of its own - while every
+    finished buy, good or bad, counts in full in its hit rate."""
     if not d or not d["n"]:
         return ""
-    if d["n"] >= SMART_MIN_BUYS and d["good"] >= SMART_MIN_GOOD and d["good"] / d["n"] >= SMART_MIN_RATE:
+    wg = float(d.get("wg", d["good"]))
+    rate = wg / d["n"]
+    if d["n"] >= SMART_MIN_BUYS and wg >= SMART_MIN_GOOD - 1e-9 and rate >= SMART_MIN_RATE:
         return "proven"
-    if d["good"] >= 1 and d["good"] / d["n"] >= SMART_MIN_RATE:
+    if wg >= PROMISING_MIN_WEIGHT - 1e-9 and rate >= SMART_MIN_RATE:
         return "promising"
     return ""
+
+
+def record_grade(w: str, scores: dict | None = None) -> str:
+    """The same, judged by results only (a wallet on your list is graded too)."""
+    return grade_of((scores if scores is not None else wallet_scores()).get(w))
 
 
 def trusted_wallet(w: str, scores: dict | None = None) -> bool:
@@ -3309,6 +4106,8 @@ def wallet_record_text(w: str, scores: dict | None = None) -> str:
     sc = (scores if scores is not None else wallet_scores()).get(w)
     g = book_grade(w, scores)
     rec = f"{sc['good']} of {sc['n']} followed buys good" if sc and sc["n"] else "no finished buys yet"
+    if sc and sc["n"] and sc.get("wg", sc["good"]) < sc["good"] - 0.05:
+        rec += " (a crowd bought those coins too, so they count less)"
     return (GRADE_ICON.get(g, "") + " " if g else "") + rec
 
 
@@ -3372,7 +4171,7 @@ def auto_wallets() -> list:
 def smart_buy_pass(cands: list, now: float):
     """Every scan: a coin whose latest look at the buyers shows a wallet with a good record (or two promising ones)
     accumulating it gets an alert."""
-    if not SMART_BUY_ALERTS:
+    if not alert_on("smartbuy"):
         return
     scores = None
     for key, chain, pair, mc in cands:
@@ -3412,6 +4211,8 @@ def maybe_smart_buy(key: str, chain: str, pair: dict, cap: dict, scores: dict, n
         return False
     if not confirmed_twice("sb", key, m["mc"], now):
         return False
+    if not clear_to_alert(key, chain, pair):
+        return False                   # v3.1: a steady asset (or not checked yet)
     held = watch_holders(chain, key.split(":", 1)[1], num(pair, "priceUsd"), max_age=1800)
     shown = (strong + soft)[:4]
     if not send_telegram(build_smart_buy_message(chain, pair, m, shown, scores, held, bool(strong))):
@@ -3472,9 +4273,8 @@ def promote_smart_wallets():
         return
     removed = set(state["tuning"].get("watch_removed") or [])
     auto_n = sum(1 for d in state["watch"].values() if d.get("auto"))
-    for w, d in sorted(wallet_scores().items(), key=lambda kv: (-kv[1]["good"], kv[1]["n"])):
-        if (auto_n >= SMART_MAX_AUTO or d["n"] < SMART_MIN_BUYS or d["good"] < SMART_MIN_GOOD
-                or d["good"] / d["n"] < SMART_MIN_RATE):
+    for w, d in sorted(wallet_scores().items(), key=lambda kv: (-kv[1].get("wg", kv[1]["good"]), kv[1]["n"])):
+        if auto_n >= SMART_MAX_AUTO or grade_of(d) != "proven":      # (v3.1: judged on the crowd-weighted record)
             continue
         kind = wallet_kind(w)
         key = w.lower() if kind == "evm" else w
@@ -3498,6 +4298,30 @@ def promote_smart_wallets():
         log.info("smart wallet promoted: %s (%d/%d)", short(key), d["good"], d["n"])
 
 
+def book_crowd_note() -> str:
+    """An honest warning when the finished wallet buys are really a few coins that many saved wallets bought together."""
+    per: Counter = Counter()
+    wins: Counter = Counter()
+    names: dict[str, str] = {}
+    for d in list(state["book"].values()):
+        for p in d.get("picks", []):
+            if p.get("st") != "o":
+                per[p["k"]] += 1
+                names[p["k"]] = str(p.get("s", "?"))
+                if p.get("st") == "w":
+                    wins[p["k"]] += 1
+    total = sum(per.values())
+    if total < 10 or total < 1.5 * len(per):
+        return ""
+    line = (f"   ⚠️ Those {total} finished wallet buys are only {len(per)} different coins (about {total / len(per):.1f} wallets per coin)")
+    n_win = sum(wins.values())
+    top = wins.most_common(3)
+    if n_win >= 10 and sum(n for _, n in top) / n_win >= 0.4:
+        line += (f", and {sum(n for _, n in top) / n_win:.0%} of the wins sit on just 3 coins ("
+                 + ", ".join("$" + md_escape(names[k]) for k, _ in top) + ")")
+    return line + ": wallets that bought the same coin win or lose together, so a crowd counts as one piece of evidence, not many."
+
+
 def book_report_lines() -> list[str]:
     """The wallet part of the learning report."""
     s = book_stats()
@@ -3506,10 +4330,14 @@ def book_report_lines() -> list[str]:
         out.append(f"🧠 Wallet book: *{s['wallets']}* wallets saved · {s['open']} buys followed · {s['finished']} with finished "
                    f"results · {s['proven']} proven · {s['promising']} promising")
     scores = wallet_scores()
-    bestw = sorted(((w, d) for w, d in scores.items() if d["good"] >= 1), key=lambda kv: (-kv[1]["good"] / kv[1]["n"], -kv[1]["n"]))[:4]
+    bestw = sorted(((w, d) for w, d in scores.items() if grade_of(d)),
+                   key=lambda kv: (-kv[1].get("wg", kv[1]["good"]) / kv[1]["n"], -kv[1].get("wg", kv[1]["good"])))[:4]
     if bestw:
-        out.append("   Best so far (good/finished buys): " + ", ".join(
+        out.append("   Best so far (good/finished buys, crowded coins counted less): " + ", ".join(
             f"{short(w)} {d['good']}/{d['n']}" for w, d in bestw))
+    crowd = book_crowd_note()
+    if crowd:
+        out.append(crowd)
     sb = closed_records("smartbuy")
     if sb:
         x = summarize(sb)
@@ -3520,6 +4348,10 @@ def book_report_lines() -> list[str]:
         if len(strong) >= 2 and len(weak) >= 2:
             a, c = summarize(strong), summarize(weak)
             out.append(f"   Proven/watched wallet involved: {a['w']}/{a['n']} won | two promising wallets: {c['w']}/{c['n']}")
+        slow = [r for r in sb if r.get("slow")]
+        if slow:      # v3.4: the "wallets keep adding over days" messages, on their own
+            z = summarize(slow)
+            out.append(f"   Of those, 'wallets keep adding' messages: {z['w']}/{z['n']} won, average best move {z['avg_best']:.2f}x")
     return out
 
 
@@ -3638,7 +4470,7 @@ def chart_pass(cands: list, now: float):
             c["seen"] = now
         if c and ((c.get("fail_t") and now - c["fail_t"] < 1800) or now - c.get("t", 0) < CHART_REFRESH_HOURS * 3600):
             continue
-        if not (chart_eligible(chain, pair, mc) or bottom_entry(key)):
+        if key in state["steady"] or not (chart_eligible(chain, pair, mc) or bottom_entry(key)):
             continue
         m = compute_metrics(key, pair)
         todo.append((chart_priority(key, m, c, now), key, chain, pair, m))
@@ -3769,6 +4601,8 @@ def maybe_add_chart_shadow(key: str, chain: str, pair: dict, m: dict, c: dict, b
         return
     if len(open_records(kind="cshadow")) >= MAX_CHART_SHADOWS:
         return
+    if not clear_to_alert(key, chain, pair):
+        return                        # v3.1: a steady asset (or not checked yet)
     state["shadow_cd"]["c:" + key] = now
     b = state["bottoms"].get(key)
     add_record("cshadow", key, chain, pair, m, "", now,
@@ -3777,13 +4611,20 @@ def maybe_add_chart_shadow(key: str, chain: str, pair: dict, m: dict, c: dict, b
                       "sp": (b.get("signs") if b and bottom_active(b) else None)})
 
 
+def alerted_just_now(key: str, now: float, hours: float = 12.0) -> bool:
+    """Did this coin get a bottom or smart-wallet alert in the last few hours? Those messages already show the chart reading."""
+    b = state["bottoms"].get(key)
+    return bool((b and now - b.get("alerted", 0) < hours * 3600) or now - state["cooldowns"].get("sb:" + key, 0) < hours * 3600)
+
+
 def chart_alert_coming(key: str, now: float) -> bool:
     """Is a chart-setup alert about to go out for this coin? Then that alert already shows who is buying."""
     c = state["charts"].get(key)
-    if not (CHARTS and CHART_ALERTS and c and c.get("ok") and c.get("pat") and c.get("score", 0) >= CHART_MIN_SCORE
+    if not (CHARTS and alert_on("chart") and c and c.get("ok") and c.get("pat") and c.get("score", 0) >= CHART_MIN_SCORE
             and now - c.get("t", 0) < 12 * 3600):
         return False
-    if now - state["cooldowns"].get("chart:" + key, 0) < CHART_COOLDOWN_DAYS * 86400 or any(r["kind"] == "bottom" for r in open_records(key)):
+    if now - state["cooldowns"].get("chart:" + key, 0) < CHART_COOLDOWN_DAYS * 86400 or any(r["kind"] == "bottom" for r in open_records(key)) \
+            or alerted_just_now(key, now):
         return False
     bonus, _ = chart_support(key, c)
     if not (bonus >= 5 and c["score"] + bonus >= CHART_ALERT_RANK):
@@ -3804,13 +4645,15 @@ def maybe_chart_alert(key: str, chain: str, pair: dict, c: dict, now: float) -> 
     ok = c["score"] >= CHART_MIN_SCORE and bonus >= 5 and c["score"] + bonus >= CHART_ALERT_RANK
     cool = now - state["cooldowns"].get("chart:" + key, 0) < CHART_COOLDOWN_DAYS * 86400
     b = state["bottoms"].get(key)
-    if ok and any(r["kind"] == "bottom" for r in open_records(key)):
+    if ok and (any(r["kind"] == "bottom" for r in open_records(key)) or alerted_just_now(key, now)):
         ok = False        # a bottom alert on this coin is still being followed: it already shows the chart reading
     stamps = [t for t in state["tuning"].get("chart_ts", []) if now - t < 86400]
     state["tuning"]["chart_ts"] = stamps
-    if ok and CHART_ALERTS and not cool and len(stamps) < CHART_MAX_PER_DAY:
+    if ok and alert_on("chart") and not cool and len(stamps) < CHART_MAX_PER_DAY:
         if not confirmed_twice("chart", key, m["mc"], now):
             return False
+        if not clear_to_alert(key, chain, pair):
+            return False                          # v3.1: a steady asset (or not checked yet)
         held = watch_holders(chain, key.split(":", 1)[1], num(pair, "priceUsd"), max_age=1800)
         if not send_telegram(build_chart_message(chain, pair, m, c, why, held)):
             return False
@@ -3838,7 +4681,7 @@ def maybe_chart_alert(key: str, chain: str, pair: dict, c: dict, now: float) -> 
 def cmd_patterns() -> str:
     """/patterns - the coins whose charts show a setup right now."""
     if not CHARTS:
-        return "Chart reading is switched off (CHARTS=false)."
+        return "Chart reading is switched off (`CHARTS=false`)."
     now = time.time()
     fresh = [(k, c) for k, c in list(state["charts"].items()) if c.get("ok") and now - c.get("t", 0) < CHART_KEEP_HOURS * 3600]
     if not fresh:
@@ -3865,26 +4708,6 @@ def cmd_patterns() -> str:
                  + f"\n    `{ca}`  [chart](https://dexscreener.com/{chain}/{ca})")
     L.append("\nA shape is a hunch to test, not a promise: /report shows which shapes have actually paid.")
     return "\n".join(L)
-
-
-def chart_check_text(key: str, chain: str, pair: dict, m: dict) -> str:
-    """The chart part of /check: uses the latest reading, or reads the chart now if there is none."""
-    if not CHARTS:
-        return ""
-    now = time.time()
-    c = state["charts"].get(key)
-    stale = not (c and c.get("ok") is not None and c.get("t") and now - c["t"] < CHART_REFRESH_HOURS * 3600)
-    if stale and GECKO_NETWORK.get(chain) and pair.get("pairAddress") and gecko_backlog() < 20:
-        try:
-            read_chart(key, chain, pair, m, now)
-        except Exception:
-            log.exception("chart look-up for /check failed")
-        c = state["charts"].get(key)
-    if not c or c.get("ok") is None:
-        return "📈 Chart: couldn't read it just now.\n"
-    if not c.get("ok"):
-        return "📈 Chart: not enough trading history to read a shape.\n"
-    return chart_lines(key, c, m, num(pair, "priceUsd"))
 
 
 def chart_report_lines() -> list[str]:
@@ -3927,6 +4750,8 @@ def capture_pass(cands: list, now: float, caps: list):
         return
     todo = []
     for key, chain, pair, mc in cands:
+        if key in state["steady"]:
+            continue
         b = bottom_entry(key)
         if b:
             if num(pair, "liquidity", "usd") < BOTTOM_MIN_LIQ_USD or not capture_due(b, now, bottom_cap_hours(b)):
@@ -3962,6 +4787,11 @@ def capture_pass(cands: list, now: float, caps: list):
 def resolve_coin_ref(ref: str):
     """'<address>' or 'base:0x...' -> (chain, address, None), or (None, None, a message explaining the problem)."""
     ref = ref.strip()
+    if ref.lower().startswith("dex:") and ref.count(":") >= 2:       # a DexScreener link: its last part is a trading pair, not the coin
+        _, ch, pid = ref.split(":", 2)
+        chain0 = norm_chain(ch)
+        if chain0:
+            ref = f"{chain0}:{pair_to_token(chain0, pid) or pid}"
     if ":" in ref:
         t = parse_token_ref(ref)
         chain, addr = t if t else (None, ref)
@@ -3979,7 +4809,7 @@ def resolve_coin_ref(ref: str):
 
 def cmd_bottoms() -> str:
     if not SPARSITY_FEED:
-        return "The bottomed-coin list is switched off (SPARSITY_FEED=false)."
+        return "The bottomed-coin list is switched off (`SPARSITY_FEED=false`)."
     now = time.time()
     items = [(k, b) for k, b in list(state["bottoms"].items()) if bottom_active(b)]
     if not items:
@@ -4074,7 +4904,103 @@ def cmd_smart() -> str:
         for w, ps in multi:
             L.append(f"• `{w}`{' ⭐' if w in state['watch'] else ''}\n   " + ", ".join(
                 f"${md_escape(p['s'])} ({fmt_usd(p.get('usd', 0))})" for p in ps[:4]))
-    L.append("\nWallets you add yourself: /watch <address> <name>. Who is buying a coin right now: /buyers <address>.")
+    L.append("\nWhich coins they are buying right now: /coins. Wallets you add yourself: /watch <address> <name>. "
+             "Who is buying one coin: /buyers <address>.")
+    out = "\n".join(L)
+    return out if len(out) <= 3800 else out[:3800].rsplit("\n", 1)[0]
+
+
+# --- v3.0: which coins are the saved wallets buying? ---
+def book_coins_now(hours: float = 72.0, limit: int = 8) -> list[dict]:
+    """The coins the wallets in the wallet book are buying right now: one row per coin, with the wallets whose buy of it
+    (from the last `hours`) is still being followed. Coins with the most wallets that have a record come first."""
+    now = time.time()
+    scores = wallet_scores()
+    coins: dict[str, dict] = {}
+    for w, d in list(state["book"].items()):
+        for p in (d.get("picks") or []) if isinstance(d, dict) else []:
+            if not isinstance(p, dict) or p.get("st") != "o" or not isinstance(p.get("k"), str) or ":" not in p["k"] \
+                    or now - num(p, "t") > hours * 3600:
+                continue
+            c = coins.setdefault(p["k"], {"key": p["k"], "sym": p.get("s") or "?", "chain": p.get("c") or "solana", "wallets": [],
+                                          "usd": 0.0, "lr": [], "t": 0.0, "strong": 0, "soft": 0})
+            c["wallets"].append(w)
+            c["usd"] += num(p, "usd")
+            c["lr"].append(num(p, "lr", default=1.0) or 1.0)
+            c["t"] = max(c["t"], num(p, "t"))
+            g = book_grade(w, scores)
+            if g in ("watched", "proven"):
+                c["strong"] += 1
+            elif g == "promising":
+                c["soft"] += 1
+    rows = sorted(coins.values(), key=lambda c: (-(3 * c["strong"] + 2 * c["soft"] + len(c["wallets"])), -c["usd"]))
+    return rows[:limit]
+
+
+def book_paid_off(days: float = 7.0, limit: int = 6) -> list[dict]:
+    """Coins that rose SMART_GOOD_MULT x or more from the price a saved wallet paid, within the last `days` days."""
+    now = time.time()
+    coins: dict[str, dict] = {}
+    for w, d in list(state["book"].items()):
+        for p in (d.get("picks") or []) if isinstance(d, dict) else []:
+            if not isinstance(p, dict) or not isinstance(p.get("k"), str) or ":" not in p["k"] \
+                    or now - num(p, "t") > days * 86400 or num(p, "mx", default=1.0) < SMART_GOOD_MULT:
+                continue
+            c = coins.setdefault(p["k"], {"key": p["k"], "sym": p.get("s") or "?", "chain": p.get("c") or "solana",
+                                          "n": 0, "mx": 0.0, "won": 0})
+            c["n"] += 1
+            c["mx"] = max(c["mx"], num(p, "mx", default=1.0))
+            c["won"] += 1 if p.get("st") == "w" else 0
+    return sorted(coins.values(), key=lambda c: (-c["mx"], -c["n"]))[:limit]
+
+
+def coin_row(i: int, c: dict, now: float) -> str:
+    chain, ca = c["chain"], c["key"].split(":", 1)[1]
+    n = len(c["wallets"])
+    grades = ("🏅" * min(c["strong"], 3) + "🌱" * min(c["soft"], 3))
+    bits = [f"${md_escape(str(c['sym']))}", CHAINS.get(chain, {"name": chain})["name"],
+            f"{n} wallet{'s' if n != 1 else ''}" + (f" ({grades})" if grades else "") + f" bought {fmt_usd(c['usd'])}",
+            f"{median(c['lr']) - 1:+.0%} since their buys", f"last buy {ago(now - c['t'])} ago"]
+    return f"{i}. " + " · ".join(bits) + f"\n    `{ca}`  [chart](https://dexscreener.com/{chain}/{ca})"
+
+
+def smart_coin_lines(limit: int = 3) -> list[str]:
+    """A short 'what are the saved wallets buying' block for the status check-in."""
+    try:
+        rows = book_coins_now(limit=limit)
+        if not rows:
+            return []
+        now = time.time()
+        return ["", "🧠 *Coins the saved wallets are buying right now* (/coins shows more):"] + [coin_row(i, c, now) for i, c in enumerate(rows, 1)]
+    except Exception:
+        log.exception("could not list the coins the saved wallets are buying")
+        return []
+
+
+def cmd_coins() -> str:
+    """/coins - which coins the wallets in the wallet book are buying right now, and which ones paid off lately."""
+    s = book_stats()
+    if not s["wallets"]:
+        return ("The wallet book is still empty - it fills up as I look at who is buying each coin (about one coin a minute). "
+                "Check back in a few hours.")
+    now = time.time()
+    L = [f"🪙 *Coins the saved wallets are buying right now*  ({s['wallets']} wallets saved · {s['proven']} proven · "
+         f"{s['promising']} promising)"]
+    rows = book_coins_now()
+    if rows:
+        L.append("Open buys from the last 3 days. 🏅 = a wallet with a proven record or one you watch, 🌱 = a promising start.")
+        L += [coin_row(i, c, now) for i, c in enumerate(rows, 1)]
+    else:
+        L.append("None of the saved wallets has an open buy from the last 3 days yet.")
+    paid = book_paid_off()
+    if paid:
+        L += ["", f"🏆 *Paid off lately* (the coin rose {SMART_GOOD_MULT:g}x+ from what a saved wallet paid, last 7 days):"]
+        for c in paid:
+            chain, ca = c["chain"], c["key"].split(":", 1)[1]
+            L.append(f"• ${md_escape(str(c['sym']))} · {CHAINS.get(chain, {'name': chain})['name']} · best {c['mx']:.1f}x · "
+                     f"{c['n']} wallet{'s' if c['n'] != 1 else ''} in it" + (" · ✅ hit the win mark" if c["won"] else "")
+                     + f"\n    `{ca}`")
+    L.append("\n/buyers <address> shows who is buying one coin · /smart shows the wallets · paste an address for a scorecard.")
     out = "\n".join(L)
     return out if len(out) <= 3800 else out[:3800].rsplit("\n", 1)[0]
 
@@ -4195,19 +5121,28 @@ def chart_status_line() -> str:
 # ----------------------------------------------------------------------------
 HELP_TEXT = (
     "🤖 *What you can tell me*\n\n"
+    "*Paste a coin's contract address* (up to 3 at a time, or a DexScreener link) and I'll give it a scorecard out of 10: wallets "
+    "with a record buying it, the bottom signs, the chart shape, liquidity and volume, red flags, and how each sign has paid so far. "
+    "It is a checklist, not a prediction. I follow every coin you ask about and later compare its score with what happened.\n\n"
+    "/coins - which coins the saved wallets are buying right now, and which paid off lately\n"
+    "/smart - the wallet book: every accumulating wallet I have saved, who is winning, who earned a place on your list\n"
+    "/alerts - which alerts are on; switch one with /alerts rerun off (names: smart, wallet, bottom, chart, rerun, narrative)\n"
+    "/data - sends you a fresh copy of my memory file (attach it when you ask Claude what worked)\n"
+    "/backup - sends my memory file now, plus your wallet list as lines to paste back. I also leave a 🗄 safety copy in this chat "
+    "before every update and once a week. To restore, just send me one of those files here: I only add what is missing and "
+    "never delete anything\n"
     "/watch `<wallet address>` `[name]` - add a wallet you trust. I'll say which of your wallets are still in each "
-    "coin I flag, add the coins they hold to my watch list, and tell you when one buys or dumps a coin.\n"
+    "coin I flag, add the coins they hold to my watch list, and tell you when one buys or dumps a coin "
+    "(paste several /watch lines in one message to add many at once).\n"
     "/unwatch `<name or address>` - stop watching it\n"
     "/wallets - your watched wallets (the ones marked 🧠 were found by the bot from results)\n"
     "/bottoms - every coin on Sparsity's bottom map, 3 of 3 down to 0 of 3 (I follow them all and look at who is buying)\n"
     "/patterns - coins whose chart shows a cup, cup & handle, bottom base or double bottom right now\n"
     "/buyers `<coin address>` - who has been buying a coin recently (accumulating wallets, bots set aside)\n"
-    "/smart - the wallet book: every accumulating wallet I have saved, who is winning, who earned a place on your list\n"
-    "/check `<coin address>` - look at any coin right now (for an Ethereum-style address I find the chain; "
+    "/check `<coin address>` - the same scorecard as pasting the address (for an Ethereum-style address I find the chain; "
     "or write it like base:0x...)\n"
     "/status - the status check-in, right now\n"
-    "/report - the learning report, right now\n\n"
-    "You can also just paste a coin's contract address and I'll check it.")
+    "/report - the learning report, right now")
 
 
 def find_chain_for(addr: str) -> str | None:
@@ -4215,7 +5150,317 @@ def find_chain_for(addr: str) -> str | None:
     return lookup_chain(addr)[0]
 
 
+# ----------------------------------------------------------------------------
+# v3.0 - PASTE A COIN ADDRESS, GET A SCORECARD. Every sign this bot knows how to look at, in one checklist: wallets with a
+# record buying it, the bottom signs, the chart shape, and the basics (liquidity, volume, age), with red flags. It is a
+# checklist, not a prediction: every coin you ask about is followed in silence and, a week later, its score is compared with
+# what really happened - so the track record under each scorecard is the bot's own, not a promise.
+# ----------------------------------------------------------------------------
+REF_CHAINED = re.compile(r"(?<![0-9A-Za-z])((?i:solana|sol|ethereum|eth|bsc|bnb|base|robinhood|hood))\s*:\s*"
+                         r"(0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})(?![0-9A-Za-z])")
+REF_EVM = re.compile(r"(?<![0-9A-Za-z])0x[0-9a-fA-F]{40}(?![0-9A-Za-z])")
+REF_SOL = re.compile(r"(?<![0-9A-Za-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![0-9A-Za-z])")
+REF_DEX = re.compile(r"dexscreener\.com/([a-z0-9\-]+)/([0-9A-Za-z]{20,70})", re.I)
+
+
+def pair_to_token(chain: str, pair_id: str) -> str | None:
+    """A DexScreener link ends in a trading pair, not in the coin: ask DexScreener which coin the pair trades."""
+    try:
+        data = get_with_retry(f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_id}", tries=2).json()
+    except (requests.RequestException, ValueError):
+        return None
+    pairs = data.get("pairs") if isinstance(data, dict) else None
+    for p in pairs or []:
+        a = (p.get("baseToken") or {}).get("address") if isinstance(p, dict) else None
+        if a:
+            return norm_addr(chain, str(a))
+    return None
+
+
+def extract_refs(text: str) -> list[str]:
+    """The coin addresses in a pasted message, in the order written, no repeats: 'base:0x...', a bare address, or a
+    DexScreener link (those become 'dex:<chain>:<pair>' and are turned into the coin later). At most CHECK_MAX_PER_MESSAGE."""
+    makers = (
+        (REF_DEX, lambda mt: f"dex:{norm_chain(mt.group(1))}:{mt.group(2)}" if norm_chain(mt.group(1)) else None),
+        (REF_CHAINED, lambda mt: (f"{norm_chain(mt.group(1))}:{norm_addr(norm_chain(mt.group(1)), mt.group(2))}"
+                                  if norm_chain(mt.group(1)) else None)),
+        (REF_EVM, lambda mt: mt.group(0).lower()),
+        (REF_SOL, lambda mt: mt.group(0)),
+    )
+    found: list[tuple[int, int, str]] = []
+    for rx, make in makers:                      # the more specific forms first: a longer match hides the shorter ones inside it
+        for mt in rx.finditer(text):
+            ref = make(mt)
+            a, b = mt.span()
+            if ref and not any(a < y and x < b for x, y, _ in found):
+                found.append((a, b, ref))
+    out: list[str] = []
+    for _, _, ref in sorted(found):
+        if ref not in out:
+            out.append(ref)
+    return out[:CHECK_MAX_PER_MESSAGE]
+
+
+def chart_for_check(key: str, chain: str, pair: dict, m: dict, now: float) -> dict | None:
+    """The coin's chart summary: the latest reading, or a fresh one when there is none (or it is old)."""
+    if not CHARTS:
+        return None
+    c = state["charts"].get(key)
+    fresh = bool(c and c.get("ok") is not None and c.get("t") and now - c["t"] < CHART_REFRESH_HOURS * 3600)
+    if not fresh and GECKO_NETWORK.get(chain) and pair.get("pairAddress") and gecko_backlog() < 45:
+        try:
+            read_chart(key, chain, pair, m, now)
+        except Exception:
+            log.exception("chart look-up for the scorecard failed")
+        c = state["charts"].get(key)
+    return c
+
+
+def buyers_for_check(key: str, chain: str, pair: dict, m: dict, now: float) -> dict | None:
+    """Who has been buying: the latest look when it is recent, otherwise look now (the wallets are saved in the wallet book)."""
+    cap = cap_of(key)
+    if cap and now - cap.get("t", 0) < 6 * 3600:
+        return cap
+    if BUYER_CAPTURE and GECKO_NETWORK.get(chain) and pair.get("pairAddress") and gecko_backlog() < 45:
+        holder = bottom_entry(key) or state["charts"].setdefault(
+            key, {"t": 0, "ok": None, "pat": "", "score": 0, "signs": 0,
+                  "sym": str(pair.get("baseToken", {}).get("symbol", "?"))[:14], "chain": chain})
+        try:
+            capture_buyers(key, chain, pair, m, holder, now)
+        except Exception:
+            log.exception("buyer look-up for the scorecard failed")
+        cap = cap_of(key)
+    return cap if cap and now - cap.get("t", 0) < 48 * 3600 else None
+
+
+def score_coin(m: dict, pair: dict, c: dict | None, b: dict | None, cap: dict | None, held: dict, scores: dict) -> dict:
+    """The scorecard maths (no network). Four groups worth 10 points in all: smart money (4), bottom signs (3), chart shape (2),
+    the basics (1). Red flags can cap the verdict whatever the points are."""
+    groups: list[tuple[str, float, float, list[str]]] = []
+    pts: dict[str, float] = {}
+    flags: list[tuple[int, str]] = []
+    missing: list[str] = []
+
+    # --- 1. smart money (up to 4)
+    p, lines = 0.0, []
+    acc = [r for r in ((cap or {}).get("acc") or []) if r]
+    strong = [r for r in acc if book_grade(r[0], scores) in ("watched", "proven")]
+    soft = [r for r in acc if book_grade(r[0], scores) == "promising"]
+    if cap is None:
+        lines.append("▫️ couldn't look at who is buying just now (the trade data was busy) - ask again in a minute")
+    else:
+        if strong:
+            p += 2.0
+            lines.append(f"✅ {len(strong)} wallet(s) with a good record are accumulating it: "
+                         + "; ".join(f"`{r[0]}` ({wallet_record_text(r[0], scores)}, bought {fmt_usd(r[1])})" for r in strong[:2]))
+        elif len(soft) >= 2:
+            p += 1.5
+            lines.append(f"✅ {len(soft)} wallets with a promising start are accumulating it: "
+                         + "; ".join(f"`{r[0]}` (bought {fmt_usd(r[1])})" for r in soft[:2]))
+        elif soft:
+            p += 1.0
+            lines.append(f"✅ 1 wallet with a promising start is accumulating it: `{soft[0][0]}` (bought {fmt_usd(soft[0][1])})")
+        else:
+            lines.append("❌ no wallet with a record is buying it")
+            missing.append("a wallet with a good record buying it")
+        nb, ns = int(cap.get("nb", 0)), int(cap.get("ns", 0))
+        flow = (f"{nb} wallets net-buying vs {ns} net-selling - bought {fmt_usd(cap.get('buy', 0))}, sold "
+                f"{fmt_usd(cap.get('sell', 0))} (latest {cap.get('n', 0)} trades, {fmt_span(cap.get('span', 0))})")
+        if len(acc) >= 2 and nb > ns:
+            p += 1.0
+            lines.append(f"✅ {len(acc)} wallets are accumulating it; {flow}")
+        elif ns > nb and cap.get("sell", 0) > cap.get("buy", 0):
+            flags.append((1, f"more wallets are selling than buying - {flow}"))
+        else:
+            lines.append(f"▫️ {flow}")
+    if held.get("in"):
+        p += 1.0
+        lines.append("✅ wallets you watch are in it: " + ", ".join(md_escape(n) for n, _, _ in held["in"][:3]))
+    elif held.get("total"):
+        lines.append(f"▫️ none of your {held['total']} watched wallet(s) hold it")
+    lines += accum_lines(pair)       # v3.4: what the wallets you watch added / sold lately (information only - no points)
+    pts["smart"] = min(p, 4.0)
+    groups.append(("🧠 Smart money", pts["smart"], 4.0, lines))
+
+    # --- 2. bottom signs (up to 3): Sparsity's three signs and the bot's own reading of the chart
+    sp = int(b["signs"]) if b and isinstance(b.get("signs"), int) else None
+    own = int(c.get("signs", 0)) if c and c.get("ok") else None
+    p, lines = 0.0, []
+    if sp is not None:
+        p = max(p, {3: 3.0, 2: 2.0, 1: 0.5}.get(sp, 0.0))
+        marks = " · ".join(f"{step} {'✅' if i < sp else '▫️'}" for i, step in enumerate(SPARSITY_STEPS))
+        low = (f" - {b['above_low']:.0f}% above its low of {fmt_usd(b['low'])}"
+               if b.get("low") and b.get("above_low") is not None else "")
+        lines.append(f"{'✅' if sp >= 2 else '▫️'} Sparsity's bottom map: *{sp} of 3* ({marks}){low}")
+    if own is not None:
+        p = max(p, {3: 2.5, 2: 1.5, 1: 0.5}.get(own, 0.0))
+        marks = " ".join(f"{'✅' if i < own else '▫️'}{step}" for i, step in enumerate(SPARSITY_STEPS))
+        lines.append(f"{'✅' if own >= 2 else '▫️'} my own reading of the chart: *{own} of 3* ({marks})")
+    if sp is not None and own is not None and min(sp, own) >= 2:
+        p = min(3.0, p + 0.5)
+    if sp is None and own is None:
+        lines.append("▫️ no bottom reading yet (not on Sparsity's map, and the chart is too short or not readable just now)")
+    if p < 2.0:
+        missing.append("bottom signs (sellers worn out → the low holding → demand coming back)")
+    pts["bottom"] = min(p, 3.0)
+    groups.append(("🧭 Bottom signs", pts["bottom"], 3.0, lines))
+
+    # --- 3. chart shape (up to 2)
+    p, lines = 0.0, []
+    if c and c.get("ok"):
+        if c.get("pat"):
+            sc_ = float(c.get("score", 0))
+            base = {"cup_handle": 2.0, "cup": 1.8}.get(c["pat"], 1.5)
+            p = base if sc_ >= 70 else base * 0.75 if sc_ >= 60 else base * 0.35 if sc_ >= 45 else 0.0
+            price = num(pair, "priceUsd")
+            cc = dict(c)
+            if price > 0:
+                cc["k"] = m["mc"] / price
+            lines.append(f"{'✅' if sc_ >= 60 else '▫️'} *{PATTERN_LABEL.get(c['pat'], c['pat'])}* · {md_escape(c.get('stage', ''))}"
+                         f" · shape score *{c.get('score', 0)}/100*")
+            sl = shape_line(cc)
+            if sl:
+                lines.append("   " + md_escape(sl))
+            if c.get("lvl") and cc.get("k"):
+                lines.append(f"   a move above *{lvl_text(cc, c['lvl'])}* would be the breakout; the shape is wrong under "
+                             f"{lvl_text(cc, c.get('stp'))}")
+        else:
+            lines.append("❌ no cup, base or double-bottom shape right now")
+        if p < 1.2:
+            missing.append("a cup, base or double-bottom shape on the chart")
+    else:
+        lines.append("▫️ chart not readable (too little trading history, or the chart service was busy)")
+    pts["chart"] = min(p, 2.0)
+    groups.append(("📈 Chart shape", pts["chart"], 2.0, lines))
+
+    # --- 4. the basics (up to 1) and the red flags
+    liq, mc = float(m.get("liq", 0) or 0), float(m.get("mc", 0) or 0)
+    ok_liq = liq >= 15_000 and m["liq_ratio"] >= 0.04
+    ok_vol = m["vol_ratio"] >= 0.15 and m["traders"] >= 200
+    ok_age = m["age_h"] >= 24
+    p = (0.5 if ok_liq else 0.0) + (0.25 if ok_vol else 0.0) + (0.25 if ok_age else 0.0)
+    lines = [f"{'✅' if ok_liq else '❌'} liquidity {fmt_usd(liq)} ({m['liq_ratio'] * 100:.1f}% of market cap)",
+             f"{'✅' if ok_vol else '▫️'} 24h volume {fmt_usd(m['vol24'])} ({m['vol_ratio'] * 100:.0f}% of market cap) · "
+             f"{m['traders']:,} trades · pair {fmt_age(m['age_h'])} old"]
+    pts["basics"] = p
+    groups.append(("🛡 The basics", p, 1.0, lines))
+    if liq < 5_000:
+        flags.append((2, f"liquidity is only {fmt_usd(liq)} - one sale can crash the price and you may not get out"))
+    elif m["liq_ratio"] < 0.02:
+        flags.append((1, f"liquidity is only {m['liq_ratio'] * 100:.1f}% of the market cap - the price is easy to push around"))
+    if 0 < m["age_h"] < 6:
+        flags.append((1, f"the pool is only {fmt_age(m['age_h'])} old - far too early to judge anything"))
+    h24 = num(pair, "priceChange", "h24")
+    if h24 >= 150:
+        flags.append((1, f"already up {h24:.0f}% in 24 hours - chasing a pump is the classic way to lose"))
+    if liq > 0 and m["vol24"] > liq * NARR_MAX_VOL_LIQ:
+        flags.append((1, f"24h volume is {m['vol24'] / liq:.0f}x the liquidity - often bots trading with themselves"))
+
+    total = round(sum(pts.values()), 1)
+    worst = max((s for s, _ in flags), default=0)
+    if worst >= 2:
+        icon, name = "⛔", "AVOID"
+    elif total >= 7:
+        icon, name = ("🟢", "STRONG SETUP") if worst == 0 else ("🟡", "PROMISING - mind the red flags")
+    elif total >= 5:
+        icon, name = ("🟡", "PROMISING") if worst == 0 else ("🟠", "MIXED - mind the red flags")
+    elif total >= 3:
+        icon, name = "🟠", "EARLY / MIXED"
+    else:
+        icon, name = "🔴", "WEAK"
+    return {"total": total, "pts": {k: round(v, 2) for k, v in pts.items()}, "groups": groups, "flags": flags,
+            "missing": missing, "icon": icon, "name": name}
+
+
+def sign_track_record() -> str:
+    """How each kind of sign has actually paid in this bot's own follow-ups (won = 2x before 0.5x)."""
+    parts = []
+    sb = closed_records("smartbuy")
+    if sb:
+        x = summarize(sb)
+        parts.append(f"smart-wallet alerts {x['w']}/{x['n']}")
+    both = [r for r in closed_records("bottom") + closed_records("bshadow") if (r.get("signs") or 0) >= 2]
+    if both:
+        x = summarize(both)
+        parts.append(f"bottom map with 2-3 signs {x['w']}/{x['n']}")
+    ch = closed_records("chart") + closed_records("cshadow")
+    if ch:
+        x = summarize(ch)
+        parts.append(f"chart shapes {x['w']}/{x['n']}")
+    rr = closed_records("call")
+    if rr:
+        x = summarize(rr)
+        parts.append(f"old re-run setups {x['w']}/{x['n']}")
+    hi = [r for r in closed_records("check") if r.get("score", 0) >= 7]
+    if hi:
+        x = summarize(hi)
+        parts.append(f"coins you asked about that scored 7+ {x['w']}/{x['n']}")
+    if not parts:
+        return "📊 No track record yet: the first results come in over the next days."
+    return ("📊 How these signs have paid so far in the bot's own follow-ups (won/followed; win = " + f"{WIN_MULTIPLE:g}x before "
+            f"{STOP_MULTIPLE:g}x): " + " · ".join(parts) + ". Small numbers - treat them as hints.")
+
+
+def follow_checked(key: str, chain: str, pair: dict, m: dict, sc: dict, now: float) -> str:
+    """Follow the coin you asked about in silence, so its score can be compared with what happens next."""
+    mine = next((r for r in open_records(key) if r["kind"] == "check"), None)
+    if mine:
+        s0 = mine.get("score")
+        return (f"📌 I'm already following it from {fmt_usd(mine['mc0'])} (asked {ago(now - mine['t0'])} ago"
+                + (f", it scored {s0:g} then" if isinstance(s0, (int, float)) else "")
+                + f") - now {mine.get('final', 1.0):.2f}x of that price, best {mine.get('best', 1.0):.2f}x.")
+    add_record("check", key, chain, pair, m, "", now,
+               extra={"th": CHECK_TRACK_HOURS, "score": sc["total"], "flags": len(sc["flags"]), "grp": sc["pts"]})
+    return (f"📌 I'll follow it quietly for {CHECK_TRACK_HOURS / 24:g} days from {fmt_usd(m['mc'])} (win = {WIN_MULTIPLE:g}x before "
+            f"{STOP_MULTIPLE:g}x) and add the result to the track record above.")
+
+
+def scorecard_text(chain: str, addr: str, pair: dict, m: dict, key: str, sc: dict, follow: str) -> str:
+    base = pair.get("baseToken", {})
+    sym = md_escape(str(base.get("symbol", "?")))
+    L = [f"🔍 *${sym}*  |  {CHAINS[chain]['name']}", f"`{addr}`", "",
+         f"{sc['icon']} *{sc['name']}* - {sc['total']:g} of 10   (a checklist of signs, not a prediction)", ""]
+    for title, got, top, lines in sc["groups"]:
+        L.append(f"*{title}*  {got:g}/{top:g}")
+        L += lines
+        L.append("")
+    if sc["flags"]:
+        L.append("*Red flags*")
+        L += [("⛔ " if sev >= 2 else "🚩 ") + t for sev, t in sc["flags"]]
+        L.append("")
+    if sc["missing"]:
+        L += ["*What would make the case stronger:* " + "; ".join(sc["missing"][:3]) + ".", ""]
+    peak_note = "estimated from its price history" if key in state["backfilled"] else "not looked up - treat with care"
+    L.append(f"💰 Market cap *{fmt_usd(m['mc'])}* · down *{m['retrace']:.0f}%* from its high of {fmt_usd(m['peak'])} ({peak_note})")
+    L.append(sign_track_record())
+    L.append(follow)
+    if chain == "robinhood":
+        L.append("⚠️ Robinhood Chain is brand new: many of its wallets are airdrop-farming bots, so wallet signals are weaker "
+                 "here, and DexScreener's numbers can jump around.")
+    L.append(f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
+             f"[Explorer]({link(chain, 'token', base.get('address', addr))})")
+    out = "\n".join(L)
+    return out if len(out) <= 3900 else out[:3900].rsplit("\n", 1)[0]
+
+
+def steady_text(chain: str, addr: str, pair: dict, m: dict) -> str:
+    """The reply for a coin that barely moves (stock token, gold, wrapped coin, stable): no scorecard, and why."""
+    base = pair.get("baseToken", {})
+    sym = md_escape(str(base.get("symbol", "?")))
+    return "\n".join([
+        f"🔍 *${sym}*  |  {CHAINS[chain]['name']}", f"`{addr}`", "",
+        "⚪ *NOT A RUNNER - it barely moves*", "",
+        f"Its price has stayed inside a narrow band for its whole life (the highest day and the lowest day are within about "
+        f"{(STEADY_BAND - 1) * 100:.0f}% of each other). That is how a stock token, gold, a wrapped coin or a stable coin behaves. "
+        "Dips, bottoms, cup shapes and \"smart money\" don't apply to it, and the odd prices its thin pool shows now and then are bad data, "
+        "not real moves - so I don't score it or follow it.", "",
+        f"💰 Market cap *{fmt_usd(m['mc'])}* · liquidity {fmt_usd(m['liq'])}",
+        f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
+        f"[Explorer]({link(chain, 'token', base.get('address', addr))})"])
+
+
 def cmd_check(ref: str) -> str:
+    """/check <coin address> (or just paste the address): the scorecard."""
     chain, addr, err = resolve_coin_ref(ref)
     if err:
         return err
@@ -4224,31 +5469,48 @@ def cmd_check(ref: str) -> str:
         return (f"I couldn't find a live trading pool for that address on {CHAINS[chain]['name']}. "
                 "If it is a wallet, add it with /watch instead.")
     pair, m, key = ctx["pair"], ctx["m"], ctx["key"]
-    passed, m, fails = evaluate(key, pair)
+    now = time.time()
+    if ensure_steady(key, chain, pair):
+        return steady_text(chain, addr, pair, m)
+    c = chart_for_check(key, chain, pair, m, now)
+    cap = buyers_for_check(key, chain, pair, m, now)
     held = watch_holders(chain, addr, num(pair, "priceUsd"))
-    sig = signals_for(m, len(held["in"]))
-    sym = md_escape(pair.get("baseToken", {}).get("symbol", "?"))
-    peak_note = "estimated from its price history" if key in state["backfilled"] else "not looked up - treat with care"
-    verdict = ("✅ It passes every rule right now - this is what a re-run setup looks like." if passed
-               else "✗ Not a re-run setup right now: " + "; ".join(fail_label(c) for c, _ in fails) + ".")
-    extra = ""
-    try:
-        extra += chart_check_text(key, chain, pair, m)
-        cap = cap_of(key)
-        if cap and cap.get("acc") and time.time() - cap.get("t", 0) < 72 * 3600:
-            extra += buyers_lines({"cap": cap}, key=key)
-    except Exception:
-        log.exception("chart / buyers part of /check failed")
-    return (
-        f"🔍 *${sym}*  |  {CHAINS[chain]['name']}\n`{addr}`\n\n"
-        f"💰 Market cap: *{fmt_usd(m['mc'])}*  |  📈 Past high: *{fmt_usd(m['peak'])}* ({peak_note})\n"
-        f"📉 Down *{m['retrace']:.0f}%* from the high (my dip range is {T['retrace_min']:.0f}-{T['retrace_max']:.0f}%)\n"
-        f"💧 Liquidity: {fmt_usd(m['liq'])} ({m['liq_ratio'] * 100:.1f}% of MC)  |  "
-        f"📊 24h volume: {fmt_usd(m['vol24'])} ({m['vol_ratio'] * 100:.0f}% of MC)\n"
-        f"👥 24h txns: {m['traders']:,}  |  ⏱ Pair age: {fmt_age(m['age_h'])}\n"
-        f"{verdict}\n{signals_text(sig)}{wallets_line(held)}{extra}"
-        f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
-        f"[Explorer]({link(chain, 'token', pair.get('baseToken', {}).get('address', addr))})")
+    sc = score_coin(m, pair, c, bottom_entry(key), cap, held, wallet_scores())
+    follow = follow_checked(key, chain, pair, m, sc, time.time())
+    return scorecard_text(chain, addr, pair, m, key, sc, follow)
+
+
+def cmd_check_many(refs: list[str], notify=None):
+    """One scorecard per coin address (at most CHECK_MAX_PER_MESSAGE). One reply, or a list of replies."""
+    refs = refs[:CHECK_MAX_PER_MESSAGE]
+    if notify:
+        try:
+            notify("🔎 Looking at " + ("it" if len(refs) == 1 else f"{len(refs)} coins")
+                   + " now: price, chart, who is buying and your wallets. The first read can take up to a minute.")
+        except Exception:
+            log.exception("could not send the 'looking' note")
+    out: list[str] = []
+    for ref in refs:
+        try:
+            out.append(cmd_check(ref)[:3900])
+        except Exception:
+            log.exception("scorecard failed for %s", str(ref)[:20])
+            out.append("Sorry - that coin hit a snag on my side. Try again in a minute.")
+    return out[0] if len(out) == 1 else out
+
+
+def scorecard_report_lines() -> list[str]:
+    """For the report: did the scores of the coins you asked about mean anything?"""
+    chk = closed_records("check")
+    if not chk:
+        return []
+    parts = []
+    for lab, lo, hi in (("7+ of 10", 7, 11), ("5 to 7", 5, 7), ("3 to 5", 3, 5), ("under 3", -1, 3)):
+        rs = [r for r in chk if lo <= r.get("score", 0) < hi]
+        if rs:
+            x = summarize(rs)
+            parts.append(f"{lab}: {x['w']}/{x['n']}")
+    return ["🔍 Coins you asked about, by scorecard (won/followed): " + " | ".join(parts)] if parts else []
 
 
 def cmd_watch(args: list[str]) -> str:
@@ -4303,14 +5565,141 @@ def cmd_wallets() -> str:
     return "\n".join(L)
 
 
-def handle_command(text: str) -> str | None:
-    """The reply for one chat message (None = nothing to say)."""
+def alerts_state_line() -> str:
+    on = [w for w, k, _ in ALERT_MENU if alert_on(k)]
+    off = [w for w, k, _ in ALERT_MENU if not alert_on(k)]
+    return ("🔔 Alerts on: " + (", ".join(on) if on else "none") + (" · off: " + ", ".join(off) if off else "")
+            + " (/alerts to change)")
+
+
+def cmd_alerts(args: list[str]) -> str:
+    """/alerts - which alerts are switched on; /alerts <name> on|off changes one; /alerts reset goes back to the standard."""
+    head = ""
+    if args and args[0].lower() in ("reset", "default", "defaults", "standard"):
+        state["tuning"].pop("alerts", None)
+        save_state()
+        args, head = [], "↩️ Back to the standard settings.\n\n"
+    if len(args) >= 2:
+        word, val = args[0].lower().strip(":,"), args[1].lower().strip(".,!")
+        kind = ALERT_WORDS.get(word)
+        if not kind or val not in ("on", "off", "yes", "no", "true", "false", "1", "0"):
+            return ("Send it like this: /alerts rerun off   (names: " + ", ".join(w for w, _, _ in ALERT_MENU)
+                    + "; then on or off). /alerts on its own shows the list.")
+        on = val in ("on", "yes", "true", "1")
+        set_alert(kind, on)
+        label = next(t for w, k, t in ALERT_MENU if k == kind).split(" - ")[0].split(" ", 1)[1]
+        note = ""
+        if kind == "rerun" and not on:
+            note = ("\nI still follow those setups quietly and score them (see /report), and a setup that wallets you trust "
+                    "are holding still reaches you as a wallet-backed alert.")
+        elif kind in ("bottom", "chart") and not on:
+            note = "\nI still follow those setups quietly and score them (see /report)."
+        head = f"{'🔔' if on else '🔕'} {label} alerts are now *{'ON' if on else 'OFF'}*.{note}\n\n"
+    elif len(args) == 1:
+        return "Send it like this: /alerts " + args[0] + " off   (or on)"
+    return head + "🔔 *Alerts*  (change one with /alerts <name> on  or  /alerts <name> off)\n\n" + "\n".join(
+        f"{'✅' if alert_on(k) else '❌'} `{w}` - {t}" for w, k, t in ALERT_MENU)
+
+
+def cmd_data() -> str:
+    """/data - send a fresh copy of the bot's memory file into the chat, to hand to Claude (or keep)."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return "I can't send files here: the Telegram settings are missing."
+    blob = b""
+    for _ in range(3):
+        try:
+            blob = json.dumps(state).encode()
+            break
+        except RuntimeError:        # the scan changed the memory while it was being copied: try again
+            time.sleep(0.2)
+    if not blob:
+        return "I couldn't copy my memory just now - try again in a minute."
+    name = "bot_data_" + time.strftime("%Y-%m-%d_%H%M", time.gmtime()) + ".json"
+    try:
+        tg_api("sendDocument", data={"chat_id": TELEGRAM_CHAT_ID, "caption": "📦 A copy of everything the bot has learned so far. "
+                                     "Save it and attach it when you ask Claude what worked."},
+               files={"document": (name, blob)})
+    except requests.RequestException as e:
+        return f"I couldn't send the file: {scrub(e)}"
+    return f"📦 Sent: {name} ({len(blob) / 1024:.0f} KB). Save it, then attach it to your chat with Claude."
+
+
+RESTORE_HINT = ("To restore my memory, send me the file right here in this chat (an attachment): the pinned `bot_memory.json`, "
+                "one of the 🗄 safety copies I leave, or a file from /backup or /data. I only ADD what is missing - wallets, "
+                "results, notes - and never delete or overwrite anything newer. Your /watch lines pasted in one message work too.")
+
+
+def cmd_backup():
+    """/backup (v3.4): the memory file now, plus the wallet list as lines you can paste back. A file sent back restores it."""
+    blob = memory_blob()
+    if not blob:
+        return "I couldn't copy my memory just now - try again in a minute."
+    sent = send_memory_copy(blob, "backup", "🗄 A copy of my memory made on request. Keep it. To restore, send this file back to me in this chat.")
+    out = [(f"🗄 Sent my memory file ({len(blob) / 1024:.0f} KB). To restore from it, send it back to me in this chat - I only add "
+            "what is missing and never delete anything.") if sent else "I couldn't send the file just now - try again in a minute."]
+    lines = []
+    for w, d in list(state["watch"].items()):
+        name = re.sub(r"[`\r\n]+", " ", str((d or {}).get("name") or "")).strip()
+        lines.append(f"/watch {w} {name}".strip())
+    if lines:
+        out.append(f"👛 Your {len(lines)} watched wallet(s) as lines. Tap a box to copy it, then paste it back to me in one "
+                   "message to add them again:")
+        for i in range(0, len(lines), MAX_PASTED_COMMANDS):
+            out.append("```\n" + "\n".join(lines[i:i + MAX_PASTED_COMMANDS]) + "\n```")
+    return out
+
+
+def restore_from_file(doc: dict) -> str:
+    """v3.4: the owner sent a file into the chat. If it is one of my memory files it is read in: whatever is missing is added,
+    nothing is removed, and newer data is never replaced by older data."""
+    global restore_pending
+    name = str(doc.get("file_name") or "that file")
+    if not name.lower().endswith(".json"):
+        return "That doesn't look like one of my memory files (they end in .json). " + RESTORE_HINT
+    if int(doc.get("file_size") or 0) > MAX_MEMORY_FILE_MB * 1024 * 1024:
+        return "That file is too big for me to read (Telegram lets me read files up to 20 MB). I changed nothing."
+    info = tg_api("getFile", json={"file_id": doc["file_id"]})
+    r = http.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}", timeout=60)
+    r.raise_for_status()
+    try:
+        loaded = r.json()
+    except ValueError:
+        loaded = None
+    if not isinstance(loaded, dict) or not any(isinstance(loaded.get(k), (dict, list)) for k in ("watch", "book", "wallets", "records")):
+        return f"I couldn't read {md_escape(name)} as one of my memory files, so I changed nothing."
+    if restore_pending:
+        retry_restore()          # my own pinned copy may be readable again by now - that one comes first
+    got = merge_state_live(loaded)
+    restore_pending = False      # I have a memory to work from now, so saving is safe again
+    state["tuning"]["ver"] = BOT_VERSION
+    save_state()
+    try:
+        backup_state_to_telegram(True)
+    except Exception as e:
+        log.warning("Backup after a restore from a file failed: %s", scrub(e))
+    return (f"✅ Restored from *{md_escape(name)}*. I only added what was missing and removed nothing.\n"
+            f"👛 {got['watch']} wallet(s) added to the watch list (now {len(state['watch'])})\n"
+            f"🧠 {got['book']} wallet(s) added to the wallet book (now {len(state['book'])})\n"
+            f"📊 {got['records']} followed calls / results added (now {len(state['records'])})")
+
+
+def handle_command(text: str, notify=None):
+    """The reply for one chat message: a text, a list of texts, or None (nothing to say). notify = a way to send a quick
+    'looking at it now' note before a slow answer."""
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if 1 < len(lines) <= MAX_PASTED_COMMANDS and all(ln.startswith("/") for ln in lines):
+        # v3.2: several commands pasted in one message (say, a block of /watch lines) - each line is its own command
+        out: list = []
+        for ln in lines:
+            r = handle_command(ln, notify)
+            out.extend(r if isinstance(r, list) else [r])
+        return [x for x in out if x]
     parts = text.strip().split()
     if not parts:
         return None
     if not parts[0].startswith("/"):
-        one = len(parts) == 1 and (wallet_kind(parts[0]) or (":" in parts[0] and parse_token_ref(parts[0])))
-        return cmd_check(parts[0]) if one else None   # a pasted coin address is treated like /check
+        refs = extract_refs(text) if len(text) <= 1000 else []     # a pasted coin address (or two or three) is scored
+        return cmd_check_many(refs, notify) if refs else None
     cmd, args = parts[0][1:].split("@", 1)[0].lower(), parts[1:]
     if cmd in ("start", "help"):
         return HELP_TEXT
@@ -4328,12 +5717,27 @@ def handle_command(text: str) -> str | None:
         return cmd_bottoms()
     if cmd == "smart":
         return cmd_smart()
+    if cmd == "coins":
+        return cmd_coins()
+    if cmd == "alerts":
+        return cmd_alerts(args)
+    if cmd == "data":
+        return cmd_data()
+    if cmd == "backup":
+        return cmd_backup()
+    if cmd == "restore":
+        return RESTORE_HINT
     if cmd in ("patterns", "charts"):
         return cmd_patterns()
     if cmd == "buyers":
         return cmd_buyers(args[0]) if args else "Send it like this: /buyers <coin contract address>"
     if cmd == "check":
-        return cmd_check(args[0]) if args else "Send it like this: /check <coin contract address>"
+        if not args:
+            return "Send it like this: /check <coin contract address>   (or just paste the address)"
+        refs = extract_refs(" ".join(args))
+        if not refs:
+            return cmd_check(args[0])        # says what is wrong with it - no 'looking at it now' note for a typo
+        return cmd_check_many(refs, notify)
     return "I don't know that command. Send /help to see what I understand."
 
 
@@ -4343,14 +5747,22 @@ def handle_update(u: dict):
         return    # only the owner can give commands
     text = (msg.get("text") or "").strip()
     if not text:
+        if isinstance(msg.get("document"), dict):      # v3.4: a file sent into the chat = a memory file to restore from
+            try:
+                note = restore_from_file(msg["document"])
+            except Exception:
+                log.exception("memory file could not be read")
+                note = "Sorry - I couldn't read that file, and I changed nothing. Try again in a minute."
+            send_telegram(note[:3900])
         return
     try:
-        reply = handle_command(text)
+        reply = handle_command(text, notify=send_telegram)
     except Exception:
         log.exception("chat command failed: %s", text.split()[0][:20])
         reply = "Sorry - that hit a snag on my side. Try again in a minute."
-    if reply:
-        send_telegram(reply[:3900])
+    for part in (reply if isinstance(reply, list) else [reply]):
+        if part:
+            send_telegram(part[:3900])
     if text.split()[0].split("@", 1)[0].lower() == "/report":
         try:
             extra = build_report_part2()
@@ -4450,7 +5862,12 @@ def backup_state_to_telegram(force: bool = False):
     changed = h != b.get("hash")
     if not force and not ((changed and since >= BACKUP_MIN_GAP) or since >= BACKUP_REFRESH_SECONDS):
         return
-    data, caption, old = json.dumps(state).encode(), backup_caption(_hb_seen), b.get("msg_id")
+    if b.get("hash") == "":     # the first save after an update (or a late restore): first see what the file in the chat has gained
+        merge_chat_file_before_first_save()
+        h = core_hash()
+    data, caption, old = memory_blob(), backup_caption(_hb_seen), b.get("msg_id")
+    if not data:
+        return              # (the scan kept changing the memory while it was being copied - nothing is sent, the next check tries again)
     if old:
         try:
             tg_api("editMessageMedia",
@@ -4478,31 +5895,196 @@ def backup_state_to_telegram(force: bool = False):
             pass  # old backup can't be deleted (e.g. older than 48h) - harmless
 
 
+# --- v3.4: more ways to never lose the wallets and results ------------------------------------------------------------------
+# 1) the pinned file (above) is the automatic copy; 2) before every update a dated safety copy of the OLD memory is left in
+# the chat, and one more every week (never edited, never deleted); 3) a memory file sent into the chat is read back in
+# (it only adds what is missing); 4) /backup sends the file and the wallet list on request; 5) if something else gets pinned
+# over the memory file, it is pinned again; 6) the built-in wallet list in this file.
+_pin_problem = {"other": False}     # at start-up something else (not my memory file) was pinned, so no memory file could be found
+_fresh_start = {"on": False}        # at start-up the chat held no memory file at all (nothing pinned): I begin with only the built-in wallets
+_restore_failing_since = 0.0        # since when the memory could not be read (0 = it can)
+_restore_warned_at = 0.0
+SAFETY_CAPTION_UPDATE = ("🗄 Safety copy: my memory exactly as it was BEFORE the update to v" + BOT_VERSION + ". I leave these here on "
+                         "purpose and never delete them. If anything ever goes wrong, send this file back to me in this chat and "
+                         "I'll restore from it.")
+SAFETY_CAPTION_WEEKLY = ("🗄 Weekly safety copy of my memory (wallets, results, everything). I never delete these. If I ever lose my "
+                         "memory, send the newest one back to me in this chat and I'll restore from it.")
+
+
+def memory_blob() -> bytes:
+    """The memory as a file's worth of bytes (b'' if the scan kept changing it while it was copied - just ask again later)."""
+    for _ in range(3):
+        try:
+            return json.dumps(state).encode()
+        except RuntimeError:        # the scan changed the memory while it was being copied: try again
+            time.sleep(0.2)
+    return b""
+
+
+def send_memory_copy(blob: bytes, label: str, caption: str) -> bool:
+    """Leave a dated copy of the memory in the chat. It is never edited and never deleted: it is the way back."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and blob):
+        return False
+    name = f"bot_memory_{label}_" + time.strftime("%Y-%m-%d", time.gmtime()) + ".json"
+    try:
+        tg_api("sendDocument", data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "disable_notification": "true"},
+               files={"document": (name, blob)})
+        return True
+    except requests.RequestException as e:
+        log.warning("Could not leave a safety copy of the memory in the chat: %s", scrub(e))
+        return False
+
+
 def restore_from_telegram() -> bool:
     chat = tg_api("getChat", json={"chat_id": TELEGRAM_CHAT_ID}) or {}
     pm = chat.get("pinned_message") or {}
     doc = pm.get("document")
     if not doc or not (pm.get("caption") or "").startswith(BACKUP_TAG):
+        _pin_problem["other"] = bool(pm)     # something else is pinned: my memory file may be further up in the chat
         return False
     info = tg_api("getFile", json={"file_id": doc["file_id"]})
-    r = http.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}", timeout=30)
+    r = http.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}", timeout=60)
     r.raise_for_status()
-    merge_state(r.json())
+    loaded = r.json()
+    old_ver = (loaded.get("tuning") or {}).get("ver") if isinstance(loaded, dict) else None
+    merge_state(loaded)
+    _pin_problem["other"] = False
     state["backup"].update(msg_id=pm["message_id"], ts=time.time(), hash=core_hash())
+    if old_ver != BOT_VERSION:
+        state["backup"]["hash"] = ""         # the file in the chat is from another version: save this memory over it right at start-up
+    state["tuning"]["ver"] = BOT_VERSION
+    if old_ver != BOT_VERSION and SNAPSHOT_DAYS > 0:
+        # an update: leave the memory exactly as the old version saved it, so there is always a way back
+        if send_memory_copy(r.content, "before_v" + BOT_VERSION, SAFETY_CAPTION_UPDATE):
+            state["backup"]["snap_t"] = time.time()
     return True
+
+
+_pre_save_merge = {"done": False}   # (once per start-up)
+
+
+def merge_chat_file_before_first_save():
+    """The first save after an update: the copy of the bot that this one replaced saves its memory once more as it stops, a minute or
+    two AFTER this one started. So before saving over the file in the chat, read it and add whatever it has gained that this memory
+    does not have (it only adds - nothing here is removed or replaced), so even what the old copy learned in its last minutes is kept.
+    Tried once per start-up. Any problem is skipped: the save then goes ahead exactly as before."""
+    if _pre_save_merge["done"]:
+        return
+    _pre_save_merge["done"] = True
+    b = state["backup"]
+    if not b.get("msg_id"):
+        return
+    try:
+        pm = (tg_api("getChat", json={"chat_id": TELEGRAM_CHAT_ID}) or {}).get("pinned_message") or {}
+        doc = pm.get("document")
+        if not doc or pm.get("message_id") != b["msg_id"] or not (pm.get("caption") or "").startswith(BACKUP_TAG):
+            return
+        info = tg_api("getFile", json={"file_id": doc["file_id"]})
+        r = http.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}", timeout=60)
+        r.raise_for_status()
+        loaded = r.json()
+        if isinstance(loaded, dict):
+            added = merge_state_live(loaded)
+            if any(added.values()):
+                log.info("Added what the previous copy saved while it was stopping: %s", added)
+    except Exception as e:
+        log.warning("Could not read the previous copy's last save (saving goes ahead): %s", scrub(e))
+
+
+def startup_backup():
+    """Save the memory now if it differs from what the pinned file holds (a new version number, new built-in wallets, or no file
+    yet). Used after a memory that could not be read at start-up is finally read (minutes later, so the old copy is long gone);
+    on a normal start the first regular backup does the same about 5 minutes after start-up."""
+    if state["backup"].get("hash") != core_hash():
+        backup_state_to_telegram(True)
+
+
+def weekly_copy():
+    """Leave a dated safety copy in the chat every SNAPSHOT_DAYS (the first one a period after a brand-new memory began)."""
+    if SNAPSHOT_DAYS <= 0 or restore_pending or not (TELEGRAM_BACKUP and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    b, now = state["backup"], time.time()
+    if not b.get("snap_t"):
+        b["snap_t"] = now
+        return
+    if now - b["snap_t"] >= SNAPSHOT_DAYS * 86400 and send_memory_copy(memory_blob(), "weekly", SAFETY_CAPTION_WEEKLY):
+        b["snap_t"] = now
+
+
+def repin_memory_file():
+    """The chat's pinned message is not my memory file any more (something else was pinned, or it was unpinned). The pin is how I
+    find my memory after an update, and Telegram shows me only the NEWEST pinned message. So: pin the file again; and if a newer
+    message is pinned too (so my file stays hidden behind it), send a fresh copy - the newest message in the chat - and pin that.
+    (If the file itself was deleted, a fresh one is sent and pinned.)"""
+    b, now = state["backup"], time.time()
+    mid = b.get("msg_id")
+    if not mid or now - b.get("repin_t", 0) < 6 * 3600:
+        return
+    b["repin_t"] = now
+    try:
+        tg_api("pinChatMessage", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": mid, "disable_notification": True})
+    except requests.RequestException as e:
+        body = getattr(getattr(e, "response", None), "text", "") or ""
+        if "not found" in body.lower():
+            log.info("The pinned memory file is gone from the chat - sending a fresh one")
+            b["msg_id"] = 0
+            backup_state_to_telegram(True)
+        else:
+            log.warning("Could not pin the memory file again: %s", scrub(body or e))
+        return
+    try:
+        seen = ((tg_api("getChat", json={"chat_id": TELEGRAM_CHAT_ID}) or {}).get("pinned_message") or {}).get("message_id")
+    except requests.RequestException:
+        seen = mid                            # (could not check: the next check, in 5 minutes, will tell)
+    hidden = seen is not None and seen != mid
+    if hidden:                                # a newer message is pinned too: my file still is not the one I would find
+        try:
+            b["msg_id"] = 0
+            backup_state_to_telegram(True)    # a fresh file = the newest message in the chat, pinned
+        except Exception as e:
+            b["msg_id"] = b.get("msg_id") or mid
+            log.warning("Could not send a fresh memory file: %s", scrub(e))
+            return
+        if b.get("msg_id") and b["msg_id"] != mid:
+            try:
+                tg_api("deleteMessage", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": mid})
+            except requests.RequestException:
+                pass                          # (Telegram only lets a message be removed for 48 hours: a stale copy stays, harmless)
+    if now - b.get("repin_note", 0) > 24 * 3600:
+        b["repin_note"] = now
+        send_telegram(
+            ("📌 Another message was pinned in this chat after my memory file, and Telegram only shows me the newest pinned message - "
+             "so I could not find my file. I sent a fresh copy of my memory and pinned it (your own pin stays pinned). "
+             "If you pin something new later, I will do this again."
+             if hidden else
+             "📌 Something else was pinned over my memory file, so I pinned the file again. Please leave it pinned - "
+             "it is how I get my wallets and results back after an update."))
 
 
 def retry_restore():
     """If the memory couldn't be read at start-up (Telegram hiccup), keep trying - and don't overwrite it."""
-    global restore_pending
+    global restore_pending, _restore_failing_since, _restore_warned_at
     if not restore_pending:
         return
+    now = time.time()
     try:
         if restore_from_telegram():
             log.info("Restored memory from Telegram backup on retry (%d tracked calls)", len(state["records"]))
         restore_pending = False
+        _restore_failing_since = 0.0
+        try:
+            seed_watch_wallets()          # (the built-in wallets were added to the empty memory at start-up; this fills any gap)
+            startup_backup()
+        except Exception as e:
+            log.warning("Backup after a late restore failed: %s", scrub(e))
     except Exception as e:
         log.warning("Memory restore still failing: %s", scrub(e))
+        _restore_failing_since = _restore_failing_since or now
+        if now - _restore_failing_since > 1800 and now - _restore_warned_at > 12 * 3600:
+            _restore_warned_at = now
+            send_telegram("⚠️ I can't read my saved memory right now. I am NOT saving anything new in the meantime, so the old "
+                          "copy cannot be overwritten. This usually fixes itself within minutes. If it is still stuck later, "
+                          "send me the newest `bot_memory` file here (the pinned one, or a safety copy) and I'll restore from it.")
 
 
 def heartbeat_check():
@@ -4513,7 +6095,8 @@ def heartbeat_check():
     pm = (tg_api("getChat", json={"chat_id": TELEGRAM_CHAT_ID}) or {}).get("pinned_message") or {}
     caption = pm.get("caption") or ""
     if not pm.get("document") or not caption.startswith(BACKUP_TAG):
-        return  # no memory file pinned yet (the first one appears after the first scan)
+        repin_memory_file()     # v3.4: if I already have a memory file in this chat, pin it again (else: none pinned yet - the first one appears after the first scan)
+        return
     now, b = time.time(), state["backup"]
     _hb_seen = parse_heartbeats(caption)
     b["msg_id"] = pm["message_id"]  # follow the file that is pinned right now
@@ -4741,6 +6324,8 @@ def ago(seconds: float) -> str:
         return f"{seconds}s"
     if seconds < 5400:
         return f"{round(seconds / 60)} min"
+    if seconds >= 2 * 86400:
+        return f"{seconds / 86400:.1f} days"       # (v3.4: calls are followed for days now - '252.0 h' is hard to read)
     return f"{seconds / 3600:.1f} h"
 
 
@@ -4780,7 +6365,7 @@ def build_checkin(with_wallets: bool = True) -> str:
         if bot_stats["gecko_busy"]:
             L.append(f"⚠️ The coin-list / price-history service (GeckoTerminal) was busy {bot_stats['gecko_busy']} "
                      "time(s) since I started. That only slows down finding coins and their past highs; I keep retrying.")
-        best = closest_coins(rows)
+        best = closest_coins(rows) if alert_on("rerun") else []
         if best:
             L += ["", "🎯 *Closest to qualifying right now* (newer coins first when two are equally close):"]
             for i, r in enumerate(best, 1):
@@ -4799,23 +6384,28 @@ def build_checkin(with_wallets: bool = True) -> str:
                 L.append(f"    `{addr}`")
             if any(r.get("sig") for r in best):
                 L.append("Clues: 🔥 volume picking up · 🟢 more buyers than sellers · ↗️ price turning up · 🆕 young coin")
-        elif s["pool"]:
+        elif s["pool"] and alert_on("rerun"):
             L += ["", "No coin in the pool is large enough to examine closely yet - discovery keeps adding more."]
-        if s["fails"]:
+        if s["fails"] and alert_on("rerun"):
             top = sorted(s["fails"].items(), key=lambda kv: -kv[1])[:5]
             L += ["", "📋 *Why coins were skipped (how many broke each rule):*",
                   "; ".join(f"{fail_label(c)} ×{n}" for c, n in top)]
     if SPARSITY_FEED:
         L += ["", sparsity_status_line()]
     L += [chart_status_line(), book_status_line()]
+    L += smart_coin_lines()
     sent = ", ".join(f"{n} {k}" for k, n in (("re-run", bot_stats["rerun"]), ("narrative", bot_stats["narrative"]),
                                               ("wallet-backed", bot_stats["walletdip"]), ("bottom", bot_stats["bottom"]),
                                               ("chart", bot_stats["chart"]), ("smart-wallet", bot_stats["smartbuy"]),
                                               ("whale", bot_stats["whale"])))
-    L += ["", f"⚙️ Rules in use: past high of at least {fmt_usd(MIN_PEAK_MC)}, now down {T['retrace_min']:.0f}-"
-              f"{T['retrace_max']:.0f}% from it, liquidity at least {T['liq'] * 100:.0f}% and 24h volume at least "
-              f"{T['vol'] * 100:.0f}% of market cap, {T['traders']:.0f}+ trades in 24h, pair at least "
-              f"{MIN_PAIR_AGE_HOURS}h old" + (f" and at most {MAX_COIN_AGE_DAYS:g} days old." if MAX_COIN_AGE_DAYS > 0 else "."),
+    rules_line = (f"⚙️ Rules in use: past high of at least {fmt_usd(MIN_PEAK_MC)}, now down {T['retrace_min']:.0f}-"
+                  f"{T['retrace_max']:.0f}% from it, liquidity at least {T['liq'] * 100:.0f}% and 24h volume at least "
+                  f"{T['vol'] * 100:.0f}% of market cap, {T['traders']:.0f}+ trades in 24h, pair at least "
+                  f"{MIN_PAIR_AGE_HOURS}h old" + (f" and at most {MAX_COIN_AGE_DAYS:g} days old." if MAX_COIN_AGE_DAYS > 0 else "."))
+    if not alert_on("rerun"):
+        rules_line = ("⚙️ Zipcoin re-run alerts are OFF: those setups are followed quietly and scored "
+                      "(/alerts rerun on brings the alert back).")
+    L += ["", alerts_state_line(), rules_line,
           f"📣 Alerts sent since this copy started: {sent}.",
           f"👀 Following now: {len(open_records(kind='call'))} calls, {len(open_records(kind='narrative'))} narrative, "
           f"{len(open_records(kind='wallet'))} wallet-backed, {len(open_records(kind='bottom'))} bottom, "
@@ -4853,6 +6443,10 @@ def housekeeping():
             heartbeat_check()
         except Exception as e:
             log.warning("heartbeat check failed: %s", scrub(e))
+        try:
+            weekly_copy()
+        except Exception as e:
+            log.warning("weekly safety copy failed: %s", scrub(e))
     maybe_checkin()
 
 
@@ -4903,23 +6497,27 @@ logging.getLogger("uvicorn.access").addFilter(_HideHealthVisits())
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(load_state)
+    # (The update is saved to the pinned file by the first backup, about 5 minutes after start-up: NOT at once, because the old copy
+    # that this one replaces is still running for a minute or two and its last save, when it stops, must not land on top of this one.)
+    show34 = not state["tuning"].get("note34")
     log.info("Bot v%s copy %s starting at %s", BOT_VERSION, INSTANCE_ID, my_host())
     log.info("Tracking %d tokens across %s", len(TOKENS), sorted({c for c, _ in TOKENS}))
     log.info("EVM whale wallets configured: %d", len(EVM_WHALES))
-    await asyncio.to_thread(
+    online_sent = await asyncio.to_thread(
         send_telegram,
         f"✅ Bot is online (v{BOT_VERSION}, copy {INSTANCE_ID}). "
         + ("Auto-discovery ON. " if AUTO_DISCOVER else "")
         + (f"Manually watching {len(TOKENS)} coin(s). " if TOKENS else "")
-        + f"Learning ON (self-tuning {'ON' if AUTO_TUNE else 'OFF'}), "
-        f"narrative radar {'ON' if NARRATIVE_ALERTS else 'OFF'}.\n"
+        + f"Learning ON (self-tuning {'ON' if AUTO_TUNE else 'OFF'}).\n"
+        + alerts_state_line() + "\n"
         + (f"😴 Stay-awake ON: it visits {md_escape(my_host())} every {KEEPALIVE_SECONDS // 60} min.\n"
            if PUBLIC_URL else
            "😴 Stay-awake OFF (no web address found) - on Render's free plan it will sleep when idle.\n")
         + (f"📋 First status check-in in about {FIRST_CHECKIN_MINUTES} min, then every {CHECKIN_HOURS:g}h.\n"
            if CHECKIN_HOURS > 0 else "")
-        + f"📉 Looking for coins {T['retrace_min']:.0f}-{T['retrace_max']:.0f}% below a past high of {fmt_usd(MIN_PEAK_MC)}+"
-        + (f", at most {MAX_COIN_AGE_DAYS:g} days old" if MAX_COIN_AGE_DAYS > 0 else "") + ".\n"
+        + (f"📉 Looking for coins {T['retrace_min']:.0f}-{T['retrace_max']:.0f}% below a past high of {fmt_usd(MIN_PEAK_MC)}+"
+           + (f", at most {MAX_COIN_AGE_DAYS:g} days old" if MAX_COIN_AGE_DAYS > 0 else "") + ".\n"
+           if alert_on("rerun") else "")
         + (f"🧭 Bottomed-coin list ON (Sparsity, checked every {SPARSITY_REFRESH_HOURS:g}h): I follow every coin on its map "
            f"(3 of 3 down to 0 of 3), alert at {BOTTOM_MIN_SIGNS} of 3 (or 2 of 3 with backing), and look at who is buying each one.\n"
            if SPARSITY_FEED else "")
@@ -4927,11 +6525,37 @@ async def lifespan(app: FastAPI):
            "and scored by results.\n" if CHARTS else "")
         + (f"🧹 Set aside {OLD_RESULTS_SET_ASIDE} old result(s) from earlier versions (they could be fooled by price glitches).\n"
            if OLD_RESULTS_SET_ASIDE else "")
+        + ("🆕 v3.1: coins that barely move (stock tokens, gold, wrapped coins) are now left out, and when many saved wallets "
+           "bought the same coin it counts as one piece of evidence, not many.\n" if not state["steady_seen"] else "")
+        + (f"🆕 I'm now following {len(STARTER_ADDED)} wallet(s) from the built-in list (they bought the DOPE or baton dips and have a good "
+           "30-day record; /wallets shows them, /unwatch removes one). Several /watch lines can be pasted in one message"
+           + (f", and I send at most {WATCH_MOVES_MAX_PER_DAY} 'wallet bought / sold' messages a day" if WATCH_MOVES_MAX_PER_DAY > 0 else "")
+           + (f" (no more than {WATCH_MOVES_PER_WALLET} from any one wallet)" if WATCH_MOVES_PER_WALLET > 0 and WATCH_MOVES_MAX_PER_DAY > 0
+              else f", and at most {WATCH_MOVES_PER_WALLET} 'wallet bought / sold' messages a day from any one wallet" if WATCH_MOVES_PER_WALLET > 0
+              else "")
+           + ".\n" if STARTER_ADDED else "")
+        + (f"🆕 v3.4: a wallet's buy is now followed for {span_text(WALLET_TRACK_HOURS)} and every other call for "
+           f"{span_text(TRACK_HOURS)} (it was 3 days: some coins take longer to cook). When several of your watched wallets keep "
+           "adding to a coin over days, even in small steps, I'll tell you. Your wallets and results are kept safe through every "
+           "update: "
+           + (f"I leave a dated safety copy of my memory in this chat before each update and every {SNAPSHOT_DAYS:g} days, "
+              if SNAPSHOT_DAYS > 0 else "")
+           + "any `bot_memory` file you send back here is restored, and /backup sends you the file and your wallet list.\n"
+           if show34 else "")
+        + ("⚠️ I couldn't find my memory file: something else is pinned in this chat instead of it. If I had wallets or results saved "
+           "here before, scroll up, find the newest `bot_memory` file and send it to me here (or pin it again) and I'll restore from it.\n"
+           if _pin_problem["other"] else "")
+        + ("🆕 Fresh start: I found no saved memory in this chat, so I'm starting with only the built-in wallets. If I had wallets or "
+           "results saved here before, scroll up, find the newest `bot_memory` file (any safety copy works too) and send it to me here - "
+           "I'll add everything back.\n"
+           if _fresh_start["on"] and not restore_pending else "")
         + (f"👛 Watching {len(state['watch'])} wallet(s). " if state["watch"] else "")
         + ("Send /help to see the chat commands (e.g. /watch to add a wallet, /check to look at a coin).\n"
            if COMMANDS else "")
-        + "Re-run alerts need a coin to pass ALL your filters; bottom, chart and smart-wallet alerts follow their own rules.",
+        + "Paste any coin address and I'll score it; /coins shows what the saved wallets are buying; /alerts switches alerts on and off.",
     )
+    if show34 and online_sent:
+        state["tuning"]["note34"] = True       # (the v3.4 note is only shown once)
     tasks = [asyncio.create_task(scanner_loop()), asyncio.create_task(keepalive_loop()),
              asyncio.create_task(wallet_loop()), asyncio.create_task(command_loop())]
     yield
