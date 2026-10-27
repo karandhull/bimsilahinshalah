@@ -102,7 +102,7 @@ GECKO_DEEP_PAGES = min(10, int(os.getenv("GECKO_DEEP_PAGES", "8")))  # one chain
 MAX_COIN_MC = 1_000_000_000                                  # coins above $1B never do a deep-dip re-run setup
 
 # --- Staying awake, status check-ins, double-copy detection --------------------
-BOT_VERSION = "3.5"
+BOT_VERSION = "3.8"
 # Render's free plan puts a service to sleep after 15 minutes without incoming web traffic, so the bot
 # visits its own web address every few minutes. Render fills in RENDER_EXTERNAL_URL by itself.
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
@@ -237,10 +237,19 @@ KOL_MIN_LIQ_USD = env_float("KOL_MIN_LIQ_USD", 3_000)
 # Named wallets. how sure: "certain" = the address matched the trader's Fomo profile exactly (same coins, same amounts, same times);
 # "likely" = a strong match but not perfect. kol = coins this wallet buys go on the dip-watch (the 'bonk guy').
 VIP_WALLETS = (
-    # (name, address, chain, how sure, kol, note)
+    # (name, address, chain, how sure, kol, note[, style])   (style = the wallet's default style until you set one with /vip style)
     ("cryptoklotz", "0x5a08728a6704d99468d8919ba0adc2e1d2733083", "robinhood", "certain", False, "Fomo trader, bought MOTION early"),
     ("0xdetweiler", "0x838a336d19ae121a0ca754ebbdd57282de656dfa", "robinhood", "certain", False, "Fomo trader, traded CONDUCTOR"),
     ("unipcs", "2heJbC32Tpfcb3nbUb5ER61K11FGZVfVGtVnDm6LDogF", "solana", "likely", True, "Fomo trader (the 'bonk guy'), traded PANGEA"),
+    # v3.7: 'Wood' (Fomo @notanicecat69, a Top 100 trader). His address was matched on-chain to the ABYSS buys shown on his Fomo profile. Picky by default
+    # (he trades few coins and with size), so a buy of his gets the loud ping on coins up to PICKY_MAX_MC.
+    ("notanicecat69", "0xb02208d1b27811480cf6171bccc2b7af9513cddb", "robinhood", "certain", False,
+     "Fomo trader 'Wood' (@notanicecat69, Top 100), bought ABYSS early", "selective"),
+    # v3.7: 'angery' (Fomo, 335 followers). His address was matched on-chain to the holdings on his Fomo profile: 12.8M CLAUS (Ethereum) and on
+    # Robinhood Chain 3.45M Artificial Inu and 511.3K Ramses (the amounts agree to 3 digits; the CLAUS buy cost about $3.9K at the launch).
+    # No default style: the bot judges him itself after a few days. A VIP wallet is only looked at on Robinhood Chain for now.
+    ("angery", "0x340e669fc0ccfa36b29a6cbdfcc919570643b7fc", "robinhood", "certain", False,
+     "Fomo trader 'angery', holds Artificial Inu and Ramses on Robinhood Chain, bought CLAUS at its launch"),
 )
 VIP_SWEEPS_ON = os.getenv("VIP_SWEEPS", "true").lower() != "false"          # look inside the VIP wallets (the nodes' free plans are used politely)
 HUNTER_SWEEP_SECONDS = max(120, int(env_float("HUNTER_SWEEP_SECONDS", 300)))  # bot-found wallets on Solana are looked at less often than the named ones
@@ -248,7 +257,69 @@ VIP_STALE_MIN = env_float("VIP_STALE_MIN", 90)               # a buy found later
 VIP_RETRY_SECONDS = 45                                       # a coin that could not be priced yet (new, or DexScreener busy) is tried again this often...
 VIP_RETRY_TRIES = 8                                          # ...this many times
 LOWCAP_RECAPTURE_HOURS = env_float("LOWCAP_RECAPTURE_HOURS", 3)  # who is buying a low-cap coin that saved wallets are in: looked at this often (other coins: once a day)
-QUOTE_SYMBOLS = {"USDC", "USDT", "USDG", "DAI", "WETH", "ETH", "WBTC", "CBBTC", "USDE", "USDS", "PYUSD", "FDUSD", "TUSD", "WSOL", "SOL", "WBNB", "BNB"}
+# --- v3.6: how picky a wallet is (its "style") ---------------------------------------------------------------------------------
+# Why: the owner noticed that big wallets that rarely trade win more often than micro-sprayers that buy everything. The bot's own wallet
+# book agrees (580 wallets, 12-27 Oct): wallets that bought 1-3 different coins were right ~88% of the time, 4-9 coins ~35%, 10+ coins ~17%.
+# So a VIP wallet is counted by HOW MANY DIFFERENT COINS it buys: picky wallets get a better ping, sprayers a quiet one.
+STYLE_ON = os.getenv("WALLET_STYLES", "true").lower() != "false"
+STYLE_MIN_BUY_USD = env_float("STYLE_MIN_BUY_USD", 150)        # a buy counts toward "how many coins" when it is at least this big
+STYLE_SPRAY_7D = int(env_float("STYLE_SPRAY_7D", 14))          # 14+ different coins in 7 days = a sprayer...
+STYLE_SPRAY_24H = int(env_float("STYLE_SPRAY_24H", 5))         # ...or 5+ in one day
+STYLE_PICKY_7D = int(env_float("STYLE_PICKY_7D", 5))           # picky = at most 5 coins in 7 days...
+STYLE_PICKY_24H = int(env_float("STYLE_PICKY_24H", 2))         # ...and at most 2 in one day...
+STYLE_PICKY_MIN_DAYS = env_float("STYLE_PICKY_MIN_DAYS", 3)    # ...and watched for at least this many days (a wallet seen for an hour looks picky by accident)
+PICKY_MAX_MC = env_float("PICKY_MAX_MC", 50_000_000)           # a picky wallet gets the loud ping on any coin up to this market cap (others: only under the low-cap line)
+PICKY_LOUD_MAX_PER_DAY = int(env_float("PICKY_LOUD_MAX_PER_DAY", 10))    # (its own limit: picky wallets do not use up the 20 loud pings a day of the others)
+SPRAY_MAX_PER_DAY = int(env_float("SPRAY_MAX_PER_DAY", 4))     # a sprayer's low-cap buys: silent messages, this many a day
+STYLE_KEEP_DAYS = 10                                           # buys are remembered this long (the style looks at the last 7 days)
+STYLE_MAX_ROWS = 80                                            # ...and at most this many per wallet
+STYLE_WORDS = {"selective": "selective", "picky": "selective", "whale": "selective", "sniper": "selective",
+               "spray": "spray", "sprayer": "spray", "micro": "spray", "microspray": "spray", "sprayed": "spray",
+               "normal": "normal", "auto": "auto", "default": "auto", "reset": "auto"}
+STYLE_LABEL = {"selective": "🎯 picky", "spray": "🔕 sprayer", "normal": "▫️ normal"}
+# --- v3.6: the accumulation radar (Robinhood Chain) ----------------------------------------------------------------------------
+# Finds coins that many wallets are buying AND KEEPING (not flipping) over the last day, by reading the coin's own transfer log: every
+# transfer is grouped into 'pool/router -> wallet' (a buy), 'wallet -> pool/router' (a sell) and 'wallet <-> wallet'. A wallet that bought
+# at least RADAR_MIN_BUY_USD, sold a quarter or less of it and still holds most of it is an accumulator. Pools and routers are found by
+# themselves (contracts that move the coin to/from 10+ different addresses), so nothing here depends on a list of known pools.
+RADAR_ON = os.getenv("RADAR", "true").lower() != "false"
+RADAR_HOURS = env_float("RADAR_HOURS", 24)                      # look-back window
+RADAR_BLOCKS_PER_SECOND = 9.8                                   # Robinhood Chain
+RADAR_LOOP_START_DELAY = 150                                    # seconds after start-up (the other loops go first)
+RADAR_ROUND_SECONDS = max(60, int(env_float("RADAR_ROUND_SECONDS", 120)))   # one round (a few coins) this often
+RADAR_COINS_PER_ROUND = max(1, int(env_float("RADAR_COINS_PER_ROUND", 3)))
+RADAR_READ_EVERY_MIN = env_float("RADAR_READ_EVERY_MIN", 60)    # each coin is read again after this long (coins that qualify: half as long)
+RADAR_LIST_HOURS = env_float("RADAR_LIST_HOURS", 3)             # the list of coins to read is rebuilt this often (GeckoTerminal pool pages)
+RADAR_LIST_PAGES = max(1, min(5, int(env_float("RADAR_LIST_PAGES", 3))))
+RADAR_MAX_COINS = int(env_float("RADAR_MAX_COINS", 70))
+RADAR_MIN_LIQ_USD = env_float("RADAR_MIN_LIQ_USD", 80_000)      # a coin with less liquidity than this cannot be bought in any size
+RADAR_MIN_MC = env_float("RADAR_MIN_MC", 150_000)
+RADAR_MAX_MC = env_float("RADAR_MAX_MC", 500_000_000)
+RADAR_MIN_AGE_H = env_float("RADAR_MIN_AGE_H", 48)              # launch-day coins are pumps and wash trades, not accumulation
+RADAR_MAX_CALLS = int(env_float("RADAR_MAX_CALLS", 14))         # node requests for one coin; a busier coin is skipped (and says so)
+RADAR_MIN_BUY_USD = env_float("RADAR_MIN_BUY_USD", 300)         # a wallet counts as an accumulator from this much bought...
+RADAR_MAX_SOLD = 0.25                                           # ...selling at most this share of it...
+RADAR_MIN_HELD = 0.6                                            # ...and still holding at least this share of what it bought...
+RADAR_MAX_BUYS = 40                                             # ...in at most this many buys (a bot that trades all day is not accumulating)
+RADAR_HUB_FANOUT = 10                                           # an address that moves the coin to/from this many different addresses is a pool / router / exchange
+RADAR_MIN_ACC = int(env_float("RADAR_MIN_ACC", 25))             # alert: at least this many accumulators...
+RADAR_MIN_NET_USD = env_float("RADAR_MIN_NET_USD", 20_000)      # ...who together bought (net of sells) at least this much...
+RADAR_MIN_SHARE_MC = 0.0015                                     # ...which is at least 0.15% of the market cap (or of the liquidity x 2, when the market cap is not known)
+RADAR_MAX_TOP1 = env_float("RADAR_MAX_TOP1", 0.35)              # ...with no single wallet more than 35% of it (one big wallet is a different story)
+RADAR_MIN_RECENT = int(env_float("RADAR_MIN_RECENT", 8))        # ...at least this many of them still buying in the last 6 hours
+RADAR_SMALL_MIN_ACC = int(env_float("RADAR_SMALL_MIN_ACC", 10))        # (the /radar list also shows 'smaller but steady' coins: at least this many wallets...
+RADAR_SMALL_MIN_SHARE = env_float("RADAR_SMALL_MIN_SHARE", 0.005)      # ...who bought at least 0.5% of the coin's market cap, no single wallet over the 35%...
+RADAR_SMALL_MIN_RECENT = int(env_float("RADAR_SMALL_MIN_RECENT", 3))   # ...and at least this many still buying in the last 6 hours - listed, never alerted)
+RADAR_MAX_RUN = env_float("RADAR_MAX_RUN", 25)                  # ...and the price not up more than 25% in 24h (this is for buying BEFORE a run)...
+RADAR_MIN_DROP = env_float("RADAR_MIN_DROP", -40)               # ...nor down more than 40% (a falling knife is not accumulation)
+RADAR_MAX_PER_DAY = int(env_float("RADAR_MAX_PER_DAY", 3))      # alerts per 24h
+RADAR_COOLDOWN_DAYS = env_float("RADAR_COOLDOWN_DAYS", 3)       # the same coin is not announced again for this long
+RADAR_TRACK_HOURS = env_float("RADAR_TRACK_HOURS", 168)         # a radar alert is followed this long...
+RADAR_WIN_X, RADAR_STOP_X = 1.5, 0.7                            # ...win = +50% before -30% (these coins are bigger than the low caps, where 2x before 0.5x is the yardstick)
+RADAR_KEEP_HOURS = 30                                           # a reading older than this is not shown any more
+RADAR_BASKET_COINS = 6                                          # a wallet accumulating this many coins at once is a basket buyer (counted at half weight)
+RADAR_TOP_KEEP = 15                                             # the biggest accumulators of each coin are remembered (for the basket check and the 'known wallets' line)
+QUOTE_SYMBOLS ={"USDC", "USDT", "USDG", "DAI", "WETH", "ETH", "WBTC", "CBBTC", "USDE", "USDS", "PYUSD", "FDUSD", "TUSD", "WSOL", "SOL", "WBNB", "BNB"}
 
 # --- v2.8: bottomed coins (Sparsity) and finding smart money by results ------------------------------------------------
 SPARSITY_FEED = os.getenv("SPARSITY_FEED", "true").lower() != "false"           # read Sparsity Research's public "bottoming" page
@@ -310,12 +381,13 @@ SMART_BUY_ALERTS = os.getenv("SMART_BUY_ALERTS", "true").lower() != "false"
 RERUN_ALERTS = os.getenv("RERUN_ALERTS", "false").lower() == "true"     # the "ZIPCOIN RE-RUN SETUP" message: off since v3.0 (such setups are still followed in silence)
 ALERT_DEFAULT = {"rerun": RERUN_ALERTS, "narrative": NARRATIVE_ALERTS, "walletdip": WATCH_DIP_ALERTS,
                  "bottom": BOTTOM_ALERTS, "chart": CHART_ALERTS, "smartbuy": SMART_BUY_ALERTS,
-                 "vip": VIP_ON, "lowcap": LOWCAP_ALERTS, "kol": KOL_ALERTS}
+                 "vip": VIP_ON, "lowcap": LOWCAP_ALERTS, "kol": KOL_ALERTS, "radar": RADAR_ON}
 ALERT_MENU = (    # what /alerts lists, in this order: (word you type, internal name, what it is)
-    ("vip", "vip", "🚨 VIP low-cap ping - a named wallet (cryptoklotz, 0xdetweiler, unipcs, wallets the bot found) buys a low-cap coin: loud, with repeats"),
+    ("vip", "vip", "🚨 VIP low-cap ping - a named wallet (cryptoklotz, 0xdetweiler, unipcs, notanicecat69, angery, wallets the bot found) buys a low-cap coin: loud, with repeats. A picky wallet (few coins, big buys) is loud on bigger coins too; a sprayer gets a silent message (/vip style)"),
+    ("radar", "radar", "📡 Accumulation radar - a coin on Robinhood Chain that many wallets keep buying and holding (/radar lists them)"),
     ("lowcap", "lowcap", "🎯 Low-cap crowd - 3+ saved wallets bought a coin under your low-cap line (/lowcap changes it)"),
     ("kol", "kol", "📉 Dip-watch - a coin unipcs bought or shilled is down 60-80% from its high"),
-    ("smart", "smartbuy", "🧠 Smart-wallet buying - wallets with a good record are accumulating a coin, or several wallets you watch keep adding to one over days"),
+    ("smart", "smartbuy", "🧠 Smart-wallet buying - wallets with a good record (2+ stars) or wallets you watch are accumulating a coin, or several of them keep adding to one over days"),
     ("wallet", "walletdip", "👛 Wallet-backed dip - a dipped coin that wallets YOU watch are holding"),
     ("bottom", "bottom", "🧭 Bottom signal - coins on Sparsity's bottom map"),
     ("chart", "chart", "📈 Chart setup - cup & handle, base, double bottom"),
@@ -323,6 +395,7 @@ ALERT_MENU = (    # what /alerts lists, in this order: (word you type, internal 
     ("narrative", "narrative", "📰 Narrative watch - themed coins (AI, stocks, animals...) waking up"),
 )
 ALERT_WORDS = {"vip": "vip", "vips": "vip", "ping": "vip", "loud": "vip",
+               "radar": "radar", "accum": "radar", "accumulation": "radar", "accumulating": "radar", "accumulate": "radar",
                "lowcap": "lowcap", "low-cap": "lowcap", "low": "lowcap", "crowd": "lowcap",
                "kol": "kol", "dipwatch": "kol", "dip-watch": "kol", "shill": "kol", "unipcs": "kol",
                "smart": "smartbuy", "smartbuy": "smartbuy", "smartwallet": "smartbuy", "smart-wallet": "smartbuy",
@@ -345,6 +418,63 @@ STEADY_PROBES_PER_SCAN = 1                                                      
 #    together. A coin that this many saved wallets (or fewer) bought counts fully for each of them; a bigger crowd counts less.
 CROWD_FULL_WEIGHT = max(1, int(env_float("CROWD_FULL_WEIGHT", 3)))
 PROMISING_MIN_WEIGHT = env_float("PROMISING_MIN_WEIGHT", 0.6)                   # "promising" = at least this much good evidence (one good buy on a coin few of the saved wallets bought)
+
+# --- v3.7: a 1-3 star rating for every wallet, from how its finished buys ENDED --------------------------------------------
+# A followed buy ends one of three ways: the coin doubled before it halved (a hit), it halved before it doubled (a miss), or it did
+# neither in the 7 days (flat). A hit only has to beat a miss 1 time in 3 to break even (win +100%, miss -50%), so the lines sit
+# on that: of the buys that ended CLEARLY (hit or miss), the share that were hits, pulled towards an "average wallet" (STAR_PRIOR,
+# counting as STAR_PRIOR_WEIGHT buys) so a few lucky buys cannot earn many stars. For a wallet with ~20 clear results this reads as
+# about 70% hits = 3 stars, 60% = 2.5, 50% = 2, 40% = 1.5, 25% = 1, less = half a star; with fewer results it asks for more.
+STAR_PRIOR = env_float("STAR_PRIOR", 0.22)
+STAR_PRIOR_WEIGHT = env_float("STAR_PRIOR_WEIGHT", 8)
+STAR_STEPS = ((0.55, 3.0), (0.47, 2.5), (0.40, 2.0), (0.33, 1.5), (0.22, 1.0))   # (pulled-in hit share needed, stars); below the last line = 0.5
+STAR_MIN_BUYS = 3                                                               # fewer finished buys than this: "not rated yet"
+STAR_MIN_CLEAR = 2                                                              # ...or fewer than this many that ended in a hit or a miss
+STAR_CAPS = ((5, 2.0), (10, 2.5))                                               # under 5 finished buys: 2 stars at most; under 10: 2.5 at most
+STAR_GOOD = env_float("STAR_GOOD", 2.0)                                         # "a good record" = this many stars or more (also what 'proven' needs)
+STAR_COOL_BUYS = int(env_float("STAR_COOL_BUYS", 8))                            # a wallet the bot put on your list by itself cools off after this many finished buys...
+STAR_COOL_CLEAR = int(env_float("STAR_COOL_CLEAR", 6))                          # ...at least this many of them clear (a hit or a miss)...
+STAR_COOL_BELOW = env_float("STAR_COOL_BELOW", 1.5)                             # ...with fewer stars than this (wallets you add yourself are never cooled)
+
+# --- v3.8: only FRESH buys, patient follow-ups, the coins you send, wallets that keep losing -----------------------------------
+# Why (the owner, 27 Oct): four "low-cap crowd" pings were about OLD coins (one 10 months old) whose wallets had bought long ago, while the coin was
+# low. The bot stamped a wallet's buy with the time it LOOKED, not with the time the wallet really bought, so an old buy looked new. And a week
+# is too short for some coins (bigger ones especially). In the owner's own data (844 followed calls) wallet-driven calls on coins under 14 days old
+# doubled about 3 times in 10, on older coins fewer than 1 in 10.
+LOWCAP_FRESH_HOURS = env_float("LOWCAP_FRESH_HOURS", 24)          # a wallet counts in a crowd only if its LATEST buy of the coin is younger than this
+LOWCAP_MAX_AGE_DAYS = env_float("LOWCAP_MAX_AGE_DAYS", 14)        # the crowd alert skips coins whose pool is older than this (0 = no limit; /lowcap age 30 changes it)
+LOWCAP_MAX_DOWN = env_float("LOWCAP_MAX_DOWN", 0.25)              # ...and coins where the wallets are down more than this (25%) on what they paid
+SMARTBUY_MAX_AGE_DAYS = env_float("SMARTBUY_MAX_AGE_DAYS", 30)    # the smart-wallet alert skips coins older than this (0 = no limit)
+SMARTBUY_FRESH_HOURS = env_float("SMARTBUY_FRESH_HOURS", 36)      # ...and wallets whose latest buy is older than this
+LSHADOW_MAX = 60                                                  # crowds turned down (too old, stale, already up...) that are followed quietly at once
+# Patient follow-ups: a call (or a wallet's buy, or a coin you sent) that is still ALIVE when its window ends gets another week, up to a limit that
+# depends on the size of the coin; it ends early when the coin breaks down.
+EXTEND_ON = os.getenv("EXTEND_FOLLOWUPS", "true").lower() != "false"
+EXTEND_STEP_HOURS = env_float("EXTEND_STEP_HOURS", 168)           # one extension = one more week
+EXTEND_DAYS = ((1_000_000, env_float("EXTEND_DAYS_SMALL", 21)),   # (call market cap up to, longest total follow-up in days)
+               (10_000_000, env_float("EXTEND_DAYS_MID", 30)),
+               (float("inf"), env_float("EXTEND_DAYS_BIG", 45)))
+EXTEND_LINK_DAYS = env_float("EXTEND_LINK_DAYS", 60)              # a coin you sent me is followed up to this long
+EXTEND_ALIVE = env_float("EXTEND_ALIVE", 0.7)                     # alive = at least this share of the call price when the window ends...
+EXTEND_BREAK = env_float("EXTEND_BREAK", 0.9)                     # ...and while extended: broken = under this share of the lowest point of the first window
+EXTEND_MAX_OPEN = int(env_float("EXTEND_MAX_OPEN", 250))          # extended follow-ups open at once (past this, a window just ends as before)
+SLOW_LANE_EVERY = max(1, int(env_float("SLOW_LANE_EVERY", 5)))    # extended follow-ups are priced every Nth scan (every 5 minutes) to keep the scans light
+# The coins you send: the market cap you sent each one at is remembered; when it reaches LINK_LOOK_X times that, I look at its wallets.
+LINK_ON = os.getenv("LINK_MEMORY", "true").lower() != "false"
+LINK_LOOK_X = max(1.2, env_float("LINK_LOOK_X", 2.0))
+LINK_KEEP_DAYS = env_float("LINK_KEEP_DAYS", 90)
+LINK_MAX = int(env_float("LINK_MAX", 300))
+LINK_EARLY_X = env_float("LINK_EARLY_X", 1.3)                     # a wallet that paid up to this multiple of the price you sent a coin at is "early"
+LINK_WALLETS_KEPT = 6                                             # early wallets remembered per coin
+# Wallets: a hit the wallet already had when I first saw its buy (it bought low, long before) counts less than a hit I could have followed.
+EARLY_WIN_WEIGHT = env_float("EARLY_WIN_WEIGHT", 0.35)
+EARLY_FORWARD_LR = env_float("EARLY_FORWARD_LR", 1.5)             # the coin was already up this much on the wallet's price when I first saw the buy = "early"
+EARLY_QUICK_SECONDS = 1800                                        # (older buys without that note: a win within 30 minutes of being saved = "early")
+MUTE_ON = os.getenv("MUTE_LOSERS", "true").lower() != "false"
+MUTE_MIN_BUYS = int(env_float("MUTE_MIN_BUYS", 5))                # a wallet is "cold" after this many finished buys...
+MUTE_MIN_CLEAR = int(env_float("MUTE_MIN_CLEAR", 4))              # ...at least this many of them clear (a hit or a miss)...
+MUTE_BELOW = env_float("MUTE_BELOW", 1.0)                         # ...with fewer stars than this (= half a star). A cold wallet no longer counts toward any alert (its buys are still followed).
+DEMOTE_DAYS = env_float("DEMOTE_DAYS", 14)                        # a wallet the bot took off your list for losing cannot come back by itself for this long
 
 DEFAULT_THEMES = {
     "stocks": "stonk,stonks,stock,stocks,nasdaq,nyse,nvda,nvidia,tsla,tesla,mstr,spy,aapl,msft,amzn,"
@@ -583,9 +713,9 @@ _state_lock = threading.Lock()
 state = {"peaks": {}, "cooldowns": {}, "discovered": {}, "dismissed": {}, "backfilled": {},
          "bf_fails": {}, "shadow_cd": {}, "meta": {}, "whale_buys": {},
          "records": [], "tuning": {}, "backup": {}, "wallets": {}, "watch": {}, "supply": {}, "bottoms": {},
-         "charts": {}, "book": {}, "steady": {}, "steady_seen": {}, "accum": {}, "kol": {}}
+         "charts": {}, "book": {}, "steady": {}, "steady_seen": {}, "accum": {}, "kol": {}, "radar": {}, "links": {}}
 DICT_BUCKETS = ("peaks", "cooldowns", "discovered", "dismissed", "backfilled", "bf_fails",
-                "shadow_cd", "meta", "whale_buys", "supply", "bottoms", "charts", "steady", "steady_seen", "kol")
+                "shadow_cd", "meta", "whale_buys", "supply", "bottoms", "charts", "steady", "steady_seen", "kol", "links")
 OLD_RESULTS_SET_ASIDE = 0   # how many results from older versions were set aside when the memory was loaded
 
 
@@ -683,6 +813,109 @@ def sanitize_new_memory():
             del cur[w]
     elif cur is not None:
         state["tuning"].pop("vip_cur", None)
+    # v3.6: a wallet's style word, the log of its buys, and the radar's readings
+    for w, info in list(state["watch"].items()):
+        if isinstance(info, dict):
+            if info.get("style") not in (None, "selective", "spray", "normal"):
+                info.pop("style", None)
+            if "vip_t" in info and (not isinstance(info["vip_t"], (int, float)) or isinstance(info["vip_t"], bool)):
+                info.pop("vip_t", None)
+    buys = state["tuning"].get("vip_buys")
+    if isinstance(buys, dict):
+        for w in list(buys):
+            rows = buys[w]
+            buys[w] = [[r[0], r[1], r[2]] for r in (rows if isinstance(rows, list) else [])
+                       if isinstance(r, (list, tuple)) and len(r) == 3 and isinstance(r[1], str)
+                       and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (r[0], r[2]))][-STYLE_MAX_ROWS:]
+            if not isinstance(w, str) or not buys[w]:
+                del buys[w]
+    elif buys is not None:
+        state["tuning"].pop("vip_buys", None)
+    since = state["tuning"].get("vip_buys_since")
+    if since is not None and (not isinstance(since, (int, float)) or isinstance(since, bool)):
+        state["tuning"].pop("vip_buys_since", None)
+    rad = state["radar"]
+    if not isinstance(rad, dict):
+        state["radar"] = rad = {}
+    coins = rad.get("coins")
+    if not isinstance(coins, dict):
+        rad["coins"] = coins = {}
+    for k in list(coins):
+        e = coins[k]
+        if not isinstance(k, str) or ":" not in k or not isinstance(e, dict):
+            del coins[k]
+            continue
+        e["sym"] = str(e.get("sym") or "?")[:14]
+        for f in ("t", "seen", "acc", "usd", "mc", "liq", "vol", "top1", "top3", "n6", "n1", "net6", "dca", "ch", "age", "since", "ok2", "okt",
+                  "first", "skip", "px", "last_h"):
+            if not isinstance(e.get(f), (int, float)) or isinstance(e.get(f), bool):
+                e[f] = 0
+        e["why"] = str(e.get("why") or "")[:80]
+        rows = e.get("top")
+        e["top"] = [[r[0], r[1], r[2]] for r in (rows if isinstance(rows, list) else [])
+                    if isinstance(r, (list, tuple)) and len(r) == 3 and isinstance(r[0], str)
+                    and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (r[1], r[2]))][:RADAR_TOP_KEEP]
+    for f in ("last_list", "last_round"):
+        if not isinstance(rad.get(f), (int, float)) or isinstance(rad.get(f), bool):
+            rad[f] = 0
+    if len(coins) > RADAR_MAX_COINS * 3:                         # (a damaged or very old file: only the newest readings are kept)
+        for k in sorted(coins, key=lambda k_: coins[k_].get("seen", 0))[:len(coins) - RADAR_MAX_COINS * 3]:
+            del coins[k]
+    # v3.8: the real buy times on a wallet's buys, the extra-time notes on buys and calls, the coins you sent, the wallets taken off the list
+    for w, d in list(state["book"].items()):
+        for p in d.get("picks", []):
+            for f in ("bt", "bf", "lr0", "mn", "lo1", "ext"):
+                if f in p and (not isinstance(p[f], (int, float)) or isinstance(p[f], bool) or not math.isfinite(p[f])):
+                    p.pop(f, None)
+            p.pop("slow", None)                    # (a flag a first draft of v3.8 used: the extra-time mark is 'ext' now)
+            if "why" in p and not isinstance(p["why"], str):
+                p.pop("why", None)
+        if "found" in d and not isinstance(d["found"], str):
+            d.pop("found", None)
+    for r in state["records"]:
+        if not isinstance(r, dict):
+            continue
+        for f in ("ext", "lo1"):
+            if f in r and (not isinstance(r[f], (int, float)) or isinstance(r[f], bool) or not math.isfinite(r[f])):
+                r.pop(f, None)
+        if "why" in r and not isinstance(r["why"], str):
+            r.pop("why", None)
+    links = state["links"]
+    if not isinstance(links, dict):
+        state["links"] = links = {}
+    for k in list(links):
+        e = links[k]
+        if (not isinstance(k, str) or ":" not in k or k.split(":", 1)[0] not in CHAINS or not isinstance(e, dict)
+                or not (isinstance(e.get("mc0"), (int, float)) and not isinstance(e.get("mc0"), bool) and e["mc0"] > 0)):
+            del links[k]
+            continue
+        e["sym"] = str(e.get("sym") or "?")[:14]
+        e["chain"] = k.split(":", 1)[0]
+        for f in ("t0", "tl", "tr", "p0", "n", "last", "max_mc", "min_mc", "ms", "look", "lo1", "z"):
+            if not isinstance(e.get(f), (int, float)) or isinstance(e.get(f), bool) or not math.isfinite(e.get(f)):
+                e.pop(f, None) if f in ("lo1", "z") else e.__setitem__(f, 0)
+        if e["t0"] <= 0:
+            e["t0"] = time.time()
+        e["tl"] = e["tl"] or e["t0"]
+        e["last"] = e["last"] or e["mc0"]
+        e["max_mc"] = e["max_mc"] or e["mc0"]
+        e["min_mc"] = e["min_mc"] or e["mc0"]
+        e["n"] = int(e["n"]) or 1
+        if e.get("st") not in ("open", "stop", "ended"):
+            e["st"] = "open"
+        e["pa"] = str(e.get("pa") or "")[:80]
+        for f in ("w0", "found"):
+            rows = e.get(f)
+            e[f] = [[r[0], r[1], r[2]] for r in (rows if isinstance(rows, list) else [])
+                    if isinstance(r, (list, tuple)) and len(r) == 3 and isinstance(r[0], str)
+                    and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in r[1:])][:LINK_WALLETS_KEPT]
+    for name in ("demoted", "warned"):
+        v = state["tuning"].get(name)
+        if isinstance(v, dict):
+            for w in [w for w, t in v.items() if not isinstance(w, str) or not isinstance(t, (int, float)) or isinstance(t, bool)]:
+                del v[w]
+        elif v is not None:
+            state["tuning"].pop(name, None)
 
 
 def valid_record(r) -> bool:
@@ -705,6 +938,8 @@ def merge_state(loaded: dict):
     state["watch"].update(loaded.get("watch") or {})
     state["book"].update({w: d for w, d in (loaded.get("book") or {}).items() if isinstance(d, dict)})   # (wallet addresses: no key migration)
     state["accum"].update({w: d for w, d in (loaded.get("accum") or {}).items() if isinstance(d, dict)})
+    if isinstance(loaded.get("radar"), dict):                   # v3.6: the accumulation radar's last readings
+        state["radar"].update(loaded["radar"])
     for k, v in loaded.items():     # v3.4: notes this version does not know (a newer version's, after a roll-back) travel along untouched
         if isinstance(k, str) and k not in state:
             state[k] = v
@@ -716,6 +951,7 @@ def merge_state(loaded: dict):
             state["records"].append(r)
     quarantine_old_results()
     state["tuning"].update(loaded.get("tuning") or {})
+    sanitize_new_memory()                                       # v3.6: (again, now that the saved settings - the buy notes among them - are in)
     gone = set(state["tuning"].get("watch_removed") or [])      # v3.2: a wallet you removed with /unwatch must not come back
     for k in [k for k in state["watch"] if k in gone]:          # from the built-in list when the memory is read in late
         del state["watch"][k]
@@ -763,7 +999,7 @@ def merge_state_live(loaded: dict) -> dict:
             continue
         mine = state["watch"].get(w)
         if mine is None:
-            if w in removed:
+            if w in removed or recently_demoted(w):          # (v3.8: a wallet the bot took off the list for losing does not come back from an older file either)
                 continue
             state["watch"][w] = dict(d)
             out["watch"] += 1
@@ -803,6 +1039,10 @@ def merge_state_live(loaded: dict) -> dict:
     for w, d in (loaded.get("accum") or {}).items():
         if isinstance(w, str) and isinstance(d, dict):
             state["accum"].setdefault(w, d)
+    if isinstance(loaded.get("radar"), dict):                            # v3.6: the radar's readings: only what is missing
+        for k, v in loaded["radar"].items():
+            if isinstance(k, str):
+                state["radar"].setdefault(k, v)
     lt = loaded.get("tuning") if isinstance(loaded.get("tuning"), dict) else {}
     for k, v in lt.items():                                              # settings: only those not set here
         if k not in state["tuning"]:
@@ -871,9 +1111,13 @@ def load_state():
     except Exception:
         log.exception("WATCH_WALLETS could not be read - ignored")
     try:
-        seed_vip_wallets()          # v3.5: the named wallets (cryptoklotz, 0xdetweiler, unipcs)
+        seed_vip_wallets()          # v3.5: the named wallets (cryptoklotz, 0xdetweiler, unipcs; v3.7: notanicecat69, angery)
     except Exception:
         log.exception("the VIP wallets could not be set up - ignored")
+    try:
+        style_start()               # v3.6: the day the bot starts counting which coins each VIP wallet buys
+    except Exception:
+        log.exception("the wallet-style start day could not be set - ignored")
     state["tuning"]["ver"] = BOT_VERSION     # v3.4: which version last saved this memory (an update leaves a safety copy first)
 
 
@@ -909,13 +1153,16 @@ def scrub(e) -> str:
     return re.sub(r"(?i)\b(api[-_]?key|key|token)=[^&\s'\")]+", r"\1=***", t)
 
 
-def send_telegram(text: str) -> bool:
+def send_telegram(text: str, silent: bool = False) -> bool:
+    """silent=True (v3.6): the message arrives without a sound or a buzz (Telegram's 'disable_notification') - used for a sprayer's buys."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text,
                "parse_mode": "Markdown", "disable_web_page_preview": True}
+    if silent:
+        payload["disable_notification"] = True
     try:
         r = http.post(url, json=payload, timeout=15)
         if r.status_code == 400:  # markdown parse problem -> resend plain
@@ -926,6 +1173,52 @@ def send_telegram(text: str) -> bool:
     except requests.RequestException as e:
         log.error("Telegram send failed: %s", scrub(e))
         return False
+
+
+def chunk_lines(lines: list[str], limit: int = 3800) -> list[str]:
+    """v3.8: lines of text cut into messages of at most `limit` characters, only ever between lines (a long list - the watched wallets - used
+    to be cut in the middle of a line, and its last wallets were never shown)."""
+    parts, cur = [], ""
+    for line in lines:
+        if len(line) > limit:
+            line = line[:limit - 1] + "…"
+        if cur and len(cur) + len(line) + 1 > limit:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def send_telegram_long(text: str, limit: int = 3800) -> bool:
+    """A message that may be longer than Telegram allows (the start-up message can be, with several notes in it) is cut at line ends
+    into parts that fit. True only if every part was sent."""
+    if len(text) <= limit:
+        return send_telegram(text)
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:                     # (one huge line: cut it at a space)
+            cut = line.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(line[:cut])
+            line = line[cut:].lstrip()
+        if cur and len(cur) + len(line) + 1 > limit:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    ok = True
+    for p in parts:
+        if p.strip():
+            ok = send_telegram(p) and ok
+    return ok
 
 
 # ----------------------------------------------------------------------------
@@ -965,6 +1258,15 @@ def num(d, *path, default=0.0) -> float:
         return float(d) if d is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def fnum(x, default=0.0) -> float:
+    """A number from a single value (a damaged memory file can hold anything there): the default when it is not a usable number."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
 
 
 def best_live_pair(pairs: list[dict]):
@@ -1123,7 +1425,7 @@ def build_rerun_message(chain: str, pair: dict, m: dict, extra: str = "", title:
         f"📊 24h Volume: {fmt_usd(m['vol24'])} ({m['vol24']/m['mc']*100:.0f}% of MC)\n"
         f"👥 24h Txns (buys+sells): {m['traders']:,}\n"
         f"⏱ Pair age: {fmt_age(m['age_h'])}\n"
-        f"📌 Tracking this call for {span_text(track_hours or TRACK_HOURS)} (win = {WIN_MULTIPLE:g}x)\n"
+        f"📌 Tracking this call for {follow_text(track_hours or TRACK_HOURS, m['mc'])} (win = {WIN_MULTIPLE:g}x)\n"
         + extra + "\n"
         f"`{addr}`\n\n"
         f"[DexScreener](https://dexscreener.com/{chain}/{pair_addr}) | "
@@ -1131,15 +1433,19 @@ def build_rerun_message(chain: str, pair: dict, m: dict, extra: str = "", title:
     )
 
 
+_slow_round = {"n": 0}      # v3.8: counts the scans; the slow lane (follow-ups on extra time) is priced when it is a multiple of SLOW_LANE_EVERY
+
+
 def watch_list() -> list[tuple[str, str]]:
     """Manual TOKEN_LIST plus everything auto-discovered."""
     seen, out = set(), []
-    tracked = list(dict.fromkeys(r["key"] for r in state["records"] if r["status"] == "open"))
+    tracked = list(dict.fromkeys(r["key"] for r in state["records"] if r["status"] == "open" and not r.get("ext")))
     bottomed = [k for k, b in list(state["bottoms"].items()) if bottom_active(b)]
     picked = sorted(open_pick_keys())             # coins a wallet in the wallet book bought: followed until the result is in
+    slow = sorted(slow_keys()) if _slow_round["n"] % SLOW_LANE_EVERY == 0 else []     # v3.8: follow-ups on extra time: every Nth scan only
     for chain, addr in (list(TOKENS) + [tuple(k.split(":", 1)) for k in list(state["discovered"])]
                         + [tuple(k.split(":", 1)) for k in tracked] + [tuple(k.split(":", 1)) for k in bottomed]
-                        + [tuple(k.split(":", 1)) for k in picked]):
+                        + [tuple(k.split(":", 1)) for k in picked] + [tuple(k.split(":", 1)) for k in slow]):
         if (chain, addr) not in seen:
             seen.add((chain, addr))
             out.append((chain, addr))
@@ -1513,6 +1819,7 @@ def chain_note(chain: str) -> str:
 def scan_once():
     global last_scan
     watch = watch_list()
+    _slow_round["n"] += 1
     if not watch:
         log.info("Nothing to scan yet - waiting for discovery to find coins")
         return
@@ -1525,6 +1832,7 @@ def scan_once():
     chart_cands: list = []         # coins whose chart may be read / whose buyers may be looked at once the pass is done
     accum_cands: list = []         # v3.4: coins that several of your watched wallets keep adding to (looked at once the pass is done)
     lowcap_cands: list = []        # v3.5: coins that several saved wallets bought (checked for the low-cap crowd alert once the pass is done)
+    link_cands: list = []          # v3.8: coins you sent that just reached LINK_LOOK_X times the market cap you sent them at (their wallets are looked at once the pass is done)
     try:
         accum_keys = accum_candidates(now)
     except Exception:
@@ -1568,8 +1876,16 @@ def scan_once():
                 if not pair:  # dead / migrated / drained
                     if _book_idx.get(key):
                         book_track(key, None, None, now)
+                    if key in state["links"]:
+                        try:
+                            link_track(key, 0.0, None, None, now, link_cands)
+                        except Exception:
+                            log.exception("link tracking error")
                     if open_records(key):
-                        track(key, 0.0, now)  # liquidity gone -> counts as a rug once it has lasted a few minutes
+                        try:
+                            track(key, 0.0, now)  # liquidity gone -> counts as a rug once it has lasted a few minutes
+                        except Exception:
+                            log.exception("tracking error for %s", key)
                     elif not is_manual and not bottom_entry(key):
                         _missing[key] += 1
                         if _missing[key] >= 2:  # gone on two scans in a row: not just a one-off hiccup
@@ -1578,7 +1894,7 @@ def scan_once():
                     continue
                 _missing.pop(key, None)
                 mc = pair_mc(key, pair)
-                note_mc(key, mc, num(pair, "liquidity", "usd"))     # v3.5: market caps shown next to coins in the chat come from here
+                note_mc(key, mc, num(pair, "liquidity", "usd"), age_days_of(pair))     # v3.5: market caps shown next to coins in the chat come from here
                 sym = pair["baseToken"].get("symbol", "?")
                 # v3.1: a coin that barely moves (stock token, gold, wrapped coin, stable) is not a runner. Coins that matter
                 # (followed, bought by a saved wallet, on Sparsity's map, or big enough to read) get one look at their daily
@@ -1592,7 +1908,15 @@ def scan_once():
                     if not is_manual:
                         dismiss(key)
                     continue
-                track(key, mc, now, pair, pairs_here)  # update outcomes of earlier calls on this coin
+                try:
+                    track(key, mc, now, pair, pairs_here)  # update outcomes of earlier calls on this coin
+                except Exception:
+                    log.exception("tracking error for %s", key)       # (v3.8: one odd coin must never stop the whole scan)
+                if key in state["links"]:
+                    try:
+                        link_track(key, mc, pair, pairs_here, now, link_cands)       # v3.8: ...and the coins you sent
+                    except Exception:
+                        log.exception("link tracking error")
                 if _book_idx.get(key):
                     book_track(key, pair, pairs_here, now)   # ...and of the buys of wallets in the wallet book
                     if len(_book_idx[key]) >= LOWCAP_MIN_WALLETS and mc > 0:
@@ -1708,6 +2032,10 @@ def scan_once():
         lowcap_pass(lowcap_cands, now)        # v3.5: several saved wallets bought the same low-cap coin
     except Exception:
         log.exception("low-cap crowd pass error")
+    try:
+        link_pass(link_cands, now)            # v3.8: a coin you sent reached 2x: who was in early?
+    except Exception:
+        log.exception("link pass error")
     last_scan = {"t": time.time(), "checked": checked, "pool": len(watch), "rows": rows,
                  "fails": dict(fail_counts), "errors": errors}
     try:
@@ -1760,12 +2088,18 @@ async def scanner_loop():
 # ----------------------------------------------------------------------------
 # LEARNING: follow every call, run experiments, score wallets and themes, report, optionally self-tune
 # ----------------------------------------------------------------------------
-ALERT_KINDS = ("call", "narrative", "wallet", "bottom", "chart", "smartbuy", "vip", "lowcap", "kol")   # records that were sent to you as alerts (the rest are silent experiments)
+ALERT_KINDS = ("call", "narrative", "wallet", "bottom", "chart", "smartbuy", "vip", "lowcap", "kol", "radar")   # records that were sent to you as alerts (the rest are silent experiments)
 
 
 def open_records(key: str | None = None, kind: str | None = None) -> list[dict]:
     return [r for r in state["records"] if r["status"] == "open"
             and (key is None or r["key"] == key) and (kind is None or r["kind"] == kind)]
+
+
+def fresh_open(kind: str) -> list[dict]:
+    """Open follow-ups of this kind that are still in their first window (v3.8: the ones that were given extra time do not use up the
+    room for new experiments)."""
+    return [r for r in state["records"] if r["status"] == "open" and r["kind"] == kind and not r.get("ext")]
 
 
 def closed_records(kind: str) -> list[dict]:
@@ -1815,7 +2149,7 @@ def maybe_add_shadow(key: str, chain: str, pair: dict, m: dict, code: str, now: 
     """Follow a coin that was blocked by one (or several) rules, to learn whether those rules are right."""
     if open_records(key) or now - state["shadow_cd"].get(key, 0) < SHADOW_COOLDOWN:
         return
-    if len(open_records(kind="shadow")) >= MAX_SHADOWS_OPEN:
+    if len(fresh_open("shadow")) >= MAX_SHADOWS_OPEN:
         return
     if not clear_to_alert(key, chain, pair):
         return                        # v3.1: a steady asset (or not checked yet): not worth an experiment
@@ -1842,14 +2176,67 @@ def read_mc(r: dict, mc: float, pair: dict | None, pairs: list[dict] | None) -> 
     return r["mc0"] * px / p0 if px > 0 else None
 
 
+def extend_cap_hours(mc0: float, kind: str = "call") -> float:
+    """v3.8: the longest a follow-up may be extended, in hours - by the size of the coin when it was called (bigger coins need longer to
+    double): up to $1M 21 days, up to $10M 30 days, bigger 45 days; a coin you sent me (kind 'check') up to EXTEND_LINK_DAYS."""
+    if kind == "check":
+        return EXTEND_LINK_DAYS * 24
+    for limit, days in EXTEND_DAYS:
+        if mc0 < limit:
+            return days * 24
+    return EXTEND_DAYS[-1][1] * 24
+
+
+def follow_text(hours: float, mc: float = 0.0, kind: str = "call") -> str:
+    """'7 days, and longer while it holds up (up to 21 days)' - how long a call is followed."""
+    base = span_text(hours)
+    cap = extend_cap_hours(mc or 0.0, kind)
+    if not EXTEND_ON or cap <= hours + 1:
+        return base
+    return f"{base}, and longer while it holds up (up to {cap / 24:g} days)"
+
+
+def extended_open() -> int:
+    """How many follow-ups (calls, wallet buys) are open on extra time right now."""
+    n = sum(1 for r in state["records"] if r["status"] == "open" and r.get("ext"))
+    for d in state["book"].values():
+        n += sum(1 for p in d.get("picks", []) if isinstance(p, dict) and p.get("st") == "o" and p.get("ext"))
+    return n
+
+
+def extend_followup(r: dict, cur: float, now: float) -> bool:
+    """v3.8: a follow-up's window has ended and the coin is still ALIVE (at least EXTEND_ALIVE x the call price): instead of closing it
+    'flat' it gets another EXTEND_STEP_HOURS, up to the limit for a coin of that size (extend_cap_hours). While extended it is priced less
+    often (the slow lane) and it ends early if the coin breaks below the lowest point of its first window (see track). True = extended."""
+    if not EXTEND_ON or r.get("void") or r.get("kind") == "whale" or cur <= 0 or r.get("mc0", 0) <= 0:
+        return False
+    th = float(r.get("th") or TRACK_HOURS)
+    cap = extend_cap_hours(r["mc0"], r.get("kind", "call"))
+    if th >= cap - 1:
+        return False
+    if cur < EXTEND_ALIVE * r["mc0"]:
+        return False
+    if not r.get("ext") and extended_open() >= EXTEND_MAX_OPEN:
+        return False
+    r["th"] = min(th + EXTEND_STEP_HOURS, cap)
+    r["ext"] = int(r.get("ext") or 0) + 1        # (ext = how many times it was given another week; above 0 = it is on extra time = priced in the slow lane)
+    if not r.get("lo1"):
+        r["lo1"] = r.get("min_mc") or cur       # the lowest point of the first window: breaking under it ends the follow-up
+    log.info("%s %s still alive at %.2fx after %s: followed %s more (until day %.0f of at most %.0f)", r.get("kind"), r.get("key"),
+             cur / r["mc0"], ago(now - r["t0"]), span_text(EXTEND_STEP_HOURS), r["th"] / 24, cap / 24)
+    return True
+
+
 def track(key: str, mc: float, now: float, pair: dict | None = None, pairs: list[dict] | None = None):
     """Update every open record on this coin; close it on win / stop / expiry. pair=None means no live pool.
-    A stop or a win only counts when TWO readings in a row agree, so one odd reading can't end a call."""
+    A stop or a win only counts when TWO readings in a row agree, so one odd reading can't end a call.
+    v3.8: a call that is still alive when its window ends is followed on (extend_followup) until it wins, is stopped, runs out of
+    extra time, or breaks below the lowest point of its first window (then it ends as 'flat', with the reason noted)."""
     for r in open_records(key):
         cur = read_mc(r, mc, pair, pairs)
         hours = float(r.get("th") or TRACK_HOURS)      # bottom calls are followed longer than re-runs
         if cur is None:  # nothing usable this time - only the clock can end the call
-            if now - r["t0"] >= hours * 3600:
+            if now - r["t0"] >= hours * 3600 and not extend_followup(r, float(r.get("last", r["mc0"])), now):
                 close_record(r, "expired", r.get("last", r["mc0"]), now)
             continue
         prev = r.get("last", cur)
@@ -1864,16 +2251,23 @@ def track(key: str, mc: float, now: float, pair: dict | None = None, pairs: list
             r["min_mc"] = min(r["min_mc"], hi)   # ...and a new low once two in a row are at or under it
         r["best"] = round(r["max_mc"] / r["mc0"], 3)
         r["final"] = round(cur / r["mc0"], 3)
+        # (v3.6: a radar alert or a picky wallet's buy of a bigger coin carries its own, gentler win / stop marks: 'wx' and 'sx')
+        win_x = float(r["wx"]) if isinstance(r.get("wx"), (int, float)) and r["wx"] > 1 else WIN_MULTIPLE
+        stop_x = float(r["sx"]) if isinstance(r.get("sx"), (int, float)) and 0 < r["sx"] < 1 else STOP_MULTIPLE
         # "no live pool" must last a few minutes before it counts as a rug (a data outage looks the same)
-        if hi <= STOP_MULTIPLE * r["mc0"] and (cur > 0 or now - r["z"] >= RUG_CONFIRM_SECONDS):
+        if hi <= stop_x * r["mc0"] and (cur > 0 or now - r["z"] >= RUG_CONFIRM_SECONDS):
             log.info("STOP %s: reading %s (%.2fx) twice in a row; pool %s", key, fmt_usd(cur),
                      cur / r["mc0"], r.get("pa") or "?")
             close_record(r, "stop", cur, now)
-        elif r["max_mc"] >= WIN_MULTIPLE * r["mc0"]:
+        elif r["max_mc"] >= win_x * r["mc0"]:
             close_record(r, "win", cur, now)
-        elif now - r["t0"] >= hours * 3600:
+        elif r.get("lo1") and cur > 0 and hi <= EXTEND_BREAK * r["lo1"]:
+            r["why"] = "broke"                   # v3.8: on extra time and now under the lowest point of its first window, two readings in a row
             close_record(r, "expired", cur, now)
-        elif cur <= STOP_MULTIPLE * r["mc0"]:
+        elif now - r["t0"] >= hours * 3600:
+            if not extend_followup(r, cur, now):
+                close_record(r, "expired", cur, now)
+        elif cur <= stop_x * r["mc0"]:
             log.info("%s: one reading of %s (%.2fx of the call) - waiting for a second one to agree",
                      key, fmt_usd(cur), cur / r["mc0"])
 
@@ -1889,11 +2283,17 @@ def close_record(r: dict, outcome: str, mc: float, now: float):
     if r["kind"] not in ALERT_KINDS or r.get("quiet"):
         return  # experiments (and setups followed in silence) close silently
     tag = {"narrative": "NARRATIVE ", "wallet": "WALLET-BACKED ", "bottom": "BOTTOM ", "chart": "CHART ",
-           "smartbuy": "SMART-WALLET ", "vip": "VIP LOW-CAP ", "lowcap": "LOW-CAP CROWD ", "kol": "DIP-WATCH "}.get(r["kind"], "")
+           "smartbuy": "SMART-WALLET ", "vip": "VIP LOW-CAP ", "lowcap": "LOW-CAP CROWD ", "kol": "DIP-WATCH ",
+           "radar": "ACCUMULATION "}.get(r["kind"], "")
+    broke = outcome == "expired" and r.get("why") == "broke"
     head = {"win": f"🎯 *{tag}CALL HIT*", "stop": f"🛑 *{tag}CALL STOPPED OUT*",
-            "expired": f"⏱ *{tag}CALL EXPIRED*"}[outcome]
+            "expired": f"🪫 *{tag}CALL ENDED*" if broke else f"⏱ *{tag}CALL EXPIRED*"}[outcome]
     fast = ("\n⚡ That was very fast - look at the chart: it is either a rug or bad price data."
             if outcome == "stop" and now - r["t0"] < 900 else "")
+    if broke:                                       # v3.8
+        fast = "\n📉 It fell under the lowest point of its first week, so I stopped following it."
+    elif outcome == "win" and now - r["t0"] > TRACK_HOURS * 3600 * 1.05:
+        fast = f"\n⏳ It needed more than {span_text(TRACK_HOURS)} - this is why I now keep following a call that is still alive."
     send_telegram(
         f"{head}: ${md_escape(r['sym'])} | {CHAINS[r['chain']]['name']}\n"
         f"Called at {fmt_usd(r['mc0'])} → now {fmt_usd(mc)} (*{r['final']:.2f}x*, best {r['best']:.2f}x) "
@@ -2124,8 +2524,8 @@ def build_report(sugg: list[tuple], applied: list[tuple[str, str]]) -> str:
     L += ["", f"Following now: {len(open_records(kind='call'))} calls, {len(open_records(kind='narrative'))} "
               f"narrative, {len(open_records(kind='wallet'))} wallet-backed, {len(open_records(kind='bottom'))} bottom, "
               f"{len(open_records(kind='chart'))} chart, {len(open_records(kind='smartbuy'))} smart-wallet, "
-              f"{len(open_records(kind='shadow')) + len(open_records(kind='bshadow')) + len(open_records(kind='cshadow'))} "
-              f"experiments, {len(open_records(kind='whale'))} wallet buys"]
+              f"{sum(len(open_records(kind=k_)) for k_ in ('shadow', 'bshadow', 'cshadow', 'lshadow'))} "
+              f"experiments, {len(open_records(kind='whale'))} wallet buys" + (f" ({extended_open()} of all these on extra time)" if extended_open() else "")]
 
     done = {p for p, _ in applied}
     pending = [x for x in sugg if x[0] not in done]
@@ -2147,7 +2547,7 @@ def build_report_part2() -> str:
     if not L:
         return ""
     L += ["", f"(Charts are read for coins of {fmt_usd(CHART_MIN_MC)}+; a wallet buy is followed from the price the wallet paid.)"]
-    return "\n".join(["📊 *CHARTS & WALLETS*", ""] + L)[:3900]
+    return "\n".join(["📊 *CHARTS & WALLETS*", ""] + L)[:7500]       # (v3.8: longer than one message is possible now - it is sent in parts, cut at line ends)
 
 
 def learning_cycle():
@@ -2165,12 +2565,22 @@ def learning_cycle():
             try:
                 extra = build_report_part2()
                 if extra:
-                    send_telegram(extra)
+                    send_telegram_long(extra)
             except Exception:
                 log.exception("second part of the report failed")
     # housekeeping: forget old finished records, stale wallet buys and unused descriptions
     cutoff = now - 45 * 86400
-    state["records"] = [r for r in state["records"] if r["status"] == "open" or (r["t1"] or 0) > cutoff][-1500:]
+    recs = [r for r in state["records"] if r["status"] == "open" or (r["t1"] or 0) > cutoff]
+    drop = len(recs) - 1500
+    if drop > 0:                      # (v3.8: a follow-up still open on extra time is never the one that goes - the oldest FINISHED results go first)
+        keep_recs = []
+        for r in recs:
+            if drop > 0 and r["status"] != "open":
+                drop -= 1
+                continue
+            keep_recs.append(r)
+        recs = keep_recs
+    state["records"] = recs
     for k in [k for k, t in state["shadow_cd"].items() if now - t > SHADOW_COOLDOWN]:
         state["shadow_cd"].pop(k, None)
     for k in list(state["whale_buys"]):
@@ -2196,6 +2606,10 @@ def learning_cycle():
         promote_smart_wallets()
     except Exception:
         log.exception("smart-wallet promotion error")
+    try:
+        wallet_checkup(now)
+    except Exception:
+        log.exception("wallet check-up error")
 
 
 # ----------------------------------------------------------------------------
@@ -2237,7 +2651,7 @@ def maybe_narrative(key: str, chain: str, pair: dict, now: float, m: dict | None
         f"📊 24h volume: {fmt_usd(m['vol24'])} (*{m['vol_ratio']:.1f}x* its market cap)\n"
         f"👥 24h txns: {m['traders']:,}  |  📈 24h price: {h24:+.0f}%\n"
         + (f"👛 Tracked wallets that bought in the last 24h: {sw}\n" if sw else "")
-        + f"\n⚠️ Early-stage theme play, NOT a re-run setup - higher risk. Tracked for {span_text(TRACK_HOURS)}.\n"
+        + f"\n⚠️ Early-stage theme play, NOT a re-run setup - higher risk. Tracked for {follow_text(TRACK_HOURS, m['mc'])}.\n"
         + chain_note(chain) + "\n"
         f"`{addr}`\n\n"
         f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
@@ -2370,6 +2784,9 @@ def remove_watch(key: str):
     cur = state["tuning"].get("vip_cur")
     if isinstance(cur, dict):
         cur.pop(key, None)              # v3.5: ...and the place where the last look at a VIP wallet stopped
+    buys = state["tuning"].get("vip_buys")
+    if isinstance(buys, dict):
+        buys.pop(key, None)             # v3.6: ...and the log of the coins it bought (its style)
     _snaps.pop(key, None)
     for k in [k for k in list(_hold_cache) if k[0] == key]:
         _hold_cache.pop(k, None)
@@ -2895,7 +3312,7 @@ def build_slow_accum_message(chain: str, pair: dict, m: dict, rows: list, held: 
     body += wallets_line(held)
     body += ("ℹ️ This is the slow build-up over days, which one 'wallet bought' message can miss. "
              "Wallets also sell later, so it is a clue, not a guarantee.\n")
-    body += (f"📌 Tracking this for {span_text(WALLET_TRACK_HOURS)} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x).\n\n"
+    body += (f"📌 Tracking this for {follow_text(WALLET_TRACK_HOURS, m['mc'])} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x).\n\n"
              f"`{addr}`\n\n"
              f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
              f"[Explorer]({link(chain, 'token', addr)})")
@@ -2991,15 +3408,18 @@ def wallet_backed_rerun(key: str, chain: str, pair: dict, m: dict, held: dict, s
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"     # ERC-20 Transfer(address,address,uint256)
 RH_QUOTES = {WRAPPED_NATIVE["robinhood"]} | EVM_STABLES["robinhood"]                       # WETH and USDG on Robinhood Chain: money, not coins
 FOMO_ROUTERS = {"0x0005ea38eb0a69d1253508ebdbdb9ea8cb26b5ef", "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"}   # contracts the Fomo app trades through
-_mc_live: dict[str, tuple[float, float, float]] = {}      # coin key -> (when, market cap, liquidity) at the latest look at its pool
+_mc_live: dict[str, tuple[float, float, float, float]] = {}      # coin key -> (when, market cap, liquidity, age of the pool in days; 0 = not known) at the latest look at its pool
 _vip_rt: dict = {"reminders": [], "retry": [], "look": {}, "err": {}, "skip": {}, "code": {}, "last": {}, "bf": {}, "started": 0.0}
 
 
-def note_mc(key: str, mc: float, liq: float = 0.0):
-    """Remember a coin's market cap as just seen (so lists in the chat can show it without asking again)."""
+def note_mc(key: str, mc: float, liq: float = 0.0, age_d: float = 0.0):
+    """Remember a coin's market cap as just seen (so lists in the chat can show it without asking again). v3.8: and how old its pool is."""
     if not isinstance(key, str) or not (isinstance(mc, (int, float)) and mc > 0):
         return
-    _mc_live[key] = (time.time(), float(mc), float(liq or 0.0))
+    old = _mc_live.get(key)
+    if not age_d and old and len(old) > 3:
+        age_d = old[3] + (time.time() - old[0]) / 86400      # (no age this time: the last one, moved on by the time that has passed)
+    _mc_live[key] = (time.time(), float(mc), float(liq or 0.0), float(age_d or 0.0))
     if len(_mc_live) > 4000:
         for k in sorted(_mc_live, key=lambda k_: _mc_live[k_][0])[:500]:
             _mc_live.pop(k, None)
@@ -3092,7 +3512,9 @@ def seed_vip_wallets():
     gone = set(state["tuning"].get("watch_removed") or [])
     off = state["tuning"].get("vip_off")
     gone |= set(off) if isinstance(off, list) else set()          # taken off the VIP list with /vip remove
-    for name, addr, chain, sure, kol, note in VIP_WALLETS:
+    for row in VIP_WALLETS:
+        name, addr, chain, sure, kol, note = row[:6]
+        style = row[6] if len(row) > 6 else None
         kind = wallet_kind(addr)
         if not kind:
             continue
@@ -3103,6 +3525,9 @@ def seed_vip_wallets():
         if not info.get("name"):
             info["name"] = name
         info.update(vip=True, tier="vip", chain=chain, kol=bool(kol), sure=sure, note=note)
+        if style in ("selective", "spray", "normal") and "style" not in info and not info.get("style_seeded"):
+            info["style"] = style              # (v3.7) a default style, given once: a style you set yourself - or reset to 'auto' - is never overwritten
+            info["style_seeded"] = True
 
 
 def vip_items(kind: str | None = None) -> list[tuple[str, dict]]:
@@ -3134,18 +3559,117 @@ def vip_status_text(w: str, d: dict | None = None) -> str:
     return f"couldn't look inside it {ago(time.time() - t)} ago ({text}) - I keep trying"
 
 
-def vip_log_event(w: str, sym: str, usd: float, mc: float, low: bool, key: str):
+def vip_log_event(w: str, sym: str, usd: float, mc: float, low: bool, key: str, style: str = ""):
     """The last few buys seen (shown by /vip)."""
     rows = state["tuning"].get("vip_log")
     if not isinstance(rows, list):
         rows = state["tuning"]["vip_log"] = []
     rows.append({"t": round(time.time()), "w": w, "s": str(sym)[:12], "usd": round(usd), "mc": round(mc), "low": bool(low), "k": key})
+    if style in ("selective", "spray"):
+        rows[-1]["st"] = style
     del rows[:-40]
 
 
 def vip_last_buy(w: str) -> dict | None:
     rows = [r for r in (state["tuning"].get("vip_log") or []) if isinstance(r, dict) and r.get("w") == w]
     return rows[-1] if rows else None
+
+
+# --- v3.6: how picky is this wallet? (its "style") ---
+def style_start(now: float | None = None):
+    """The day this version started writing down which coins each VIP wallet buys. A wallet is only called picky after it has been
+    counted for STYLE_PICKY_MIN_DAYS - 'it bought nothing' means nothing before that."""
+    if not isinstance(state["tuning"].get("vip_buys_since"), (int, float)) or isinstance(state["tuning"].get("vip_buys_since"), bool):
+        state["tuning"]["vip_buys_since"] = round(now or time.time())
+
+
+def style_rows(w: str) -> list:
+    buys = state["tuning"].get("vip_buys")
+    rows = buys.get(w) if isinstance(buys, dict) else None
+    return rows if isinstance(rows, list) else []
+
+
+def style_note_buy(w: str, key: str, usd: float, now: float):
+    """Write down that this wallet bought this coin: one row per coin [last buy time, coin, biggest buy in dollars]. The style is judged on these."""
+    style_start(now)
+    buys = state["tuning"].get("vip_buys")
+    if not isinstance(buys, dict):
+        buys = state["tuning"]["vip_buys"] = {}
+    rows = buys.get(w)
+    if not isinstance(rows, list):
+        rows = buys[w] = []
+    cut = now - STYLE_KEEP_DAYS * 86400
+    rows[:] = [r for r in rows if r[0] >= cut]
+    for r in rows:
+        if r[1] == key:
+            r[0], r[2] = round(now), max(r[2], round(usd))
+            return
+    rows.append([round(now), key, round(usd)])
+    del rows[:-STYLE_MAX_ROWS]
+
+
+def style_forget_buy(w: str, key: str):
+    """Take a coin out of the count (it turned out to be a stock token, a wrapped coin or a stable: not a coin pick)."""
+    rows = style_rows(w)
+    rows[:] = [r for r in rows if r[1] != key]
+
+
+def style_counts(w: str, now: float) -> tuple[int, int]:
+    """(different coins bought in the last 7 days, in the last 24 hours) - counting buys of at least STYLE_MIN_BUY_USD."""
+    rows = [r for r in style_rows(w) if r[2] >= STYLE_MIN_BUY_USD]
+    return (len({r[1] for r in rows if now - r[0] <= 7 * 86400}), len({r[1] for r in rows if now - r[0] <= 86400}))
+
+
+def style_days(w: str, info: dict, now: float) -> float:
+    """How many days this wallet's buys have been counted."""
+    t0 = state["tuning"].get("vip_buys_since")
+    t0 = float(t0) if isinstance(t0, (int, float)) and not isinstance(t0, bool) else now
+    mine = info.get("vip_t") or info.get("t") or now
+    mine = float(mine) if isinstance(mine, (int, float)) and not isinstance(mine, bool) else now
+    return max(0.0, (now - max(t0, mine)) / 86400)
+
+
+def vip_style(w: str, info: dict | None = None, now: float | None = None) -> tuple[str, str]:
+    """(style, why) of a VIP wallet. 'selective' = a picky wallet: few different coins, so each buy means more; 'spray' = buys a lot of
+    different coins, so each buy means less; 'normal' = neither (or too early to say).
+    A word you gave it (/vip style <name> picky|spray|normal) always wins; otherwise the bot judges by the coins the wallet bought lately -
+    and a wallet whose followed buys mostly failed is never picky."""
+    now = now or time.time()
+    info = info if isinstance(info, dict) else (state["watch"].get(w) or {})
+    manual = info.get("style")
+    if manual in ("selective", "spray", "normal"):
+        return manual, "you set it"
+    if not STYLE_ON or info.get("kol"):
+        return "normal", ""
+    n7, n1 = style_counts(w, now)
+    if n7 >= STYLE_SPRAY_7D:
+        return "spray", f"{n7} different coins in 7 days"
+    if n1 >= STYLE_SPRAY_24H:
+        return "spray", f"{n1} different coins in one day"
+    try:
+        sc = wallet_scores().get(w)
+    except Exception:
+        sc = None
+    if sc and sc.get("n", 0) >= 8 and sc.get("good", 0) / sc["n"] <= 0.2:
+        return "spray", f"only {sc['good']} of its {sc['n']} followed buys turned out good"
+    days = style_days(w, info, now)
+    if days >= STYLE_PICKY_MIN_DAYS and n7 <= STYLE_PICKY_7D and n1 <= STYLE_PICKY_24H and _vip_rt["err"].get(w, 0) < 3:
+        span = "the last 7 days" if days >= 7 else f"the {days:.0f} days I have watched it"
+        return "selective", f"only {n7} different coin{'' if n7 == 1 else 's'} in {span}"
+    return "normal", ""
+
+
+def style_icon(style: str) -> str:
+    return STYLE_LABEL.get(style, "")
+
+
+def style_tag(w: str, info: dict, now: float) -> str:
+    """The short style note shown after a VIP wallet's name in the lists."""
+    st, why = vip_style(w, info, now)
+    if st == "normal":
+        n7, _ = style_counts(w, now)
+        return f" · ▫️ normal ({n7} coin{'' if n7 == 1 else 's'} in 7 days)" if n7 else ""
+    return f" · {style_icon(st)}" + (f" ({md_escape(why)})" if why else "")
 
 
 # --- a VIP wallet bought a coin ---
@@ -3180,7 +3704,7 @@ def vip_why_line(info: dict) -> str:
            "likely": "a probable match for his Fomo profile, about 90% sure",
            "found": "found by the bot from results",
            "added by you": "added by you"}.get(sure, "")
-    bits = [x for x in (note, f"({how})" if how else "") if x]
+    bits = [x for x in (note, f"({how})" if how and how != note else "") if x]
     return ("🏷 " + md_escape(" ".join(bits)) + "\n") if bits else ""
 
 
@@ -3192,7 +3716,7 @@ def vip_when(bought_at: float, now: float) -> str:
 
 
 def build_vip_message(w: str, info: dict, chain: str, pair: dict, mc: float, usd: float, bought_at: float, now: float,
-                      low: bool, loud: bool, late: bool) -> str:
+                      low: bool, loud: bool, late: bool, style: str = "normal", why: str = "") -> str:
     base = pair.get("baseToken", {})
     addr, sym = base.get("address", ""), md_escape(str(base.get("symbol", "?")))
     name = md_escape(wallet_label(w))
@@ -3200,7 +3724,14 @@ def build_vip_message(w: str, info: dict, chain: str, pair: dict, mc: float, usd
     created = num(pair, "pairCreatedAt")
     age_h = (now * 1000 - created) / 3_600_000 if created else 0.0
     wchain = info.get("chain") if info.get("chain") in CHAINS else ("solana" if info.get("kind") == "solana" else "ethereum")
-    if low:
+    picky, spray = style == "selective", style == "spray"
+    hot = low or (picky and 0 < mc <= PICKY_MAX_MC)             # a coin this wallet's buy is announced loudly for
+    if picky and hot:
+        head = (("🚨🚨 *PICKY WALLET BUY: LOW-CAP COIN* 🚨🚨" if loud else "🚨 *PICKY WALLET BUY: LOW-CAP COIN*") if low else
+                ("🚨🚨 *PICKY WALLET BUY* 🚨🚨" if loud else "🚨 *PICKY WALLET BUY*"))
+    elif spray:
+        head = "🔕 *Sprayer buy: low-cap coin* (quiet)" if low else "🔕 *Sprayer buy* (quiet)"
+    elif low:
         head = "🚨🚨 *VIP BUY: LOW-CAP COIN* 🚨🚨" if loud else "🚨 *VIP BUY: LOW-CAP COIN*"
     else:
         head = "👤 *VIP BUY*"
@@ -3208,10 +3739,23 @@ def build_vip_message(w: str, info: dict, chain: str, pair: dict, mc: float, usd
     if late:
         L.append(f"🕓 Found late: it was {vip_when(bought_at, now)}.")
     L.append(f"👤 *{name}* bought *${sym}*  |  {CHAINS[chain]['name']}")
+    if picky:
+        rec = wallet_record_text(w)
+        L.append(f"🎯 A *picky wallet* ({md_escape(why or 'it buys few coins')}). A buy from it means more than one from a wallet that buys everything."
+                 + (f"\n📒 Its record with me: {rec}" if rec and "no finished buys yet" not in rec else ""))
+    elif spray:
+        L.append(f"🔕 A *sprayer* ({md_escape(why or 'it buys a lot of different coins')}). A weak clue on its own - that is why this is quiet.")
     L.append(f"💵 about *{fmt_usd(usd)}* · {vip_when(bought_at, now)}")
     if mc > 0:
-        L.append(f"💰 Market cap *{fmt_usd(mc)}*" + (f"  (under your {fmt_usd(lowcap_limit())} low-cap line)" if low else
-                                                      f"  (above your {fmt_usd(lowcap_limit())} low-cap line, so no loud ping)"))
+        if low:
+            cap_note = f"  (under your {fmt_usd(lowcap_limit())} low-cap line)"
+        elif picky and hot:
+            cap_note = f"  (above your {fmt_usd(lowcap_limit())} low-cap line, but a picky wallet gets the loud ping up to {fmt_usd(PICKY_MAX_MC)})"
+        elif picky:
+            cap_note = f"  (above {fmt_usd(PICKY_MAX_MC)}, so no loud ping even for a picky wallet)"
+        else:
+            cap_note = f"  (above your {fmt_usd(lowcap_limit())} low-cap line, so no loud ping)"
+        L.append(f"💰 Market cap *{fmt_usd(mc)}*" + cap_note)
     else:
         L.append("💰 Market cap: not known yet (a very new coin?)")
     L.append(f"💧 liquidity {fmt_usd(liq)} · 📊 24h volume {fmt_usd(vol)}" + (f" · ⏱ pool {fmt_age(age_h)} old" if age_h > 0 else ""))
@@ -3220,9 +3764,12 @@ def build_vip_message(w: str, info: dict, chain: str, pair: dict, mc: float, usd
         L.append("📈 price " + " · ".join(f"{num(ch, x):+.0f}% {lab}" for x, lab in (("h1", "1h"), ("h6", "6h"), ("h24", "24h")) if ch.get(x) is not None))
     body = "\n".join(L) + "\n" + vip_why_line(info)
     body += chain_note(chain)
-    if low:
-        body += (f"📌 I follow this for {span_text(WALLET_TRACK_HOURS)} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). A wallet's buy is a clue, "
+    if low and not spray:
+        body += (f"📌 I follow this for {follow_text(WALLET_TRACK_HOURS, mc or 0.0)} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). A wallet's buy is a clue, "
                  "not a guarantee - low-cap coins can also drop fast or be hard to sell.\n")
+    elif picky and hot:
+        body += (f"📌 I follow this for {follow_text(WALLET_TRACK_HOURS, mc or 0.0)} (win = +{(RADAR_WIN_X - 1) * 100:.0f}% before -{(1 - RADAR_STOP_X) * 100:.0f}%, "
+                 "a fairer yardstick for a bigger coin). A wallet's buy is a clue, not a guarantee.\n")
     body += (f"\n`{addr}`\n\n[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
              f"[Wallet]({link(wchain, 'addr', w)}) | [Token]({link(chain, 'token', addr)})")
     return body
@@ -3271,12 +3818,26 @@ def vip_buy_event(w: str, chain: str, token: str, amount: float, usd_hint: float
     mc = pair_mc(key, pair) or num(pair, "fdv")
     note_mc(key, mc, liq)
     usd = usd_hint if usd_hint and usd_hint > 0 else amount * px
+    if usd >= STYLE_MIN_BUY_USD:
+        style_note_buy(w, key, usd, now)                      # v3.6: how many DIFFERENT coins a wallet buys decides its style
     kol = bool(info.get("kol"))
     min_usd = vip_min_usd()
     if usd < (min(min_usd, KOL_MIN_BUY_USD) if kol else min_usd) or liq < (min(VIP_MIN_LIQ_USD, KOL_MIN_LIQ_USD) if kol else VIP_MIN_LIQ_USD):
         skip[(w, key)] = now
         log.info("VIP %s bought %s but it is too small to matter (%s, liquidity %s)", short(w), key, fmt_usd(usd), fmt_usd(liq))
         return False
+    low = mc <= 0 or mc <= lowcap_limit()
+    if not low and gecko_backlog() <= 8:                      # v3.6: a stock token / wrapped coin / stable is not a coin pick (a loud low-cap ping is never held up for this)
+        try:
+            steady = ensure_steady(key, chain, pair)
+        except Exception:
+            steady = None
+            log.exception("could not check whether %s is a steady asset", key)
+        if steady:
+            skip[(w, key)] = now
+            style_forget_buy(w, key)                          # (it does not count as one of the coins this wallet picks)
+            log.info("VIP %s bought %s, a steady asset (stock token, wrapped coin or stable) - not announced", short(w), key)
+            return False
     if kol and usd >= KOL_MIN_BUY_USD and liq >= KOL_MIN_LIQ_USD and mc > 0:
         try:
             kol_add(key, chain, pair, wallet_label(w), mc, now, how="bought", usd=usd)      # the dip-watch (unipcs)
@@ -3285,34 +3846,53 @@ def vip_buy_event(w: str, chain: str, token: str, amount: float, usd_hint: float
     if usd < min_usd or liq < VIP_MIN_LIQ_USD:
         last[lk] = now                                        # (only the dip-watch cared about this one)
         return True
-    low = mc <= 0 or mc <= lowcap_limit()
     late = bool(bought_at) and now - bought_at > VIP_STALE_MIN * 60
+    style, why = vip_style(w, info, now)                      # v3.6: picky wallets get a better ping, sprayers a quiet one
+    picky, spray = style == "selective", style == "spray"
+    hot = low or (picky and 0 < mc <= PICKY_MAX_MC)           # coins this wallet's buy is announced loudly for
     loud_day, plain_day = day_count("vip_ts", now), day_count("vip_pts", now)
-    loud = low and not late and len(loud_day) < VIP_LOUD_MAX_PER_DAY
-    reminders = vip_pings() if loud else 0
+    picky_day, spray_day = day_count("vip_sts", now), day_count("vip_sps", now)
+    if picky:
+        loud = hot and not late and len(picky_day) < PICKY_LOUD_MAX_PER_DAY
+        reminders = min(len(VIP_REMIND_AFTER), vip_pings() + 1) if loud and vip_pings() > 0 else 0     # (one more repeat than the others)
+        stamps = picky_day
+        announce = hot or len(plain_day) < VIP_PLAIN_MAX_PER_DAY
+    elif spray:
+        loud, reminders, stamps = False, 0, spray_day
+        announce = low and len(spray_day) < SPRAY_MAX_PER_DAY        # a sprayer's bigger-coin buys are only written down
+    else:
+        loud = low and not late and len(loud_day) < VIP_LOUD_MAX_PER_DAY
+        reminders = vip_pings() if loud else 0
+        stamps = loud_day if low else plain_day
+        announce = low or len(plain_day) < VIP_PLAIN_MAX_PER_DAY
+    if picky and not hot:
+        stamps = plain_day
     sent = True
     if alert_on("vip"):
-        if low or len(plain_day) < VIP_PLAIN_MAX_PER_DAY:
-            sent = send_telegram(build_vip_message(w, info, chain, pair, mc, usd, bought_at, now, low, loud, late))
+        if announce:
+            sent = send_telegram(build_vip_message(w, info, chain, pair, mc, usd, bought_at, now, low, loud, late, style, why), silent=spray)
             if sent:
-                (loud_day if low else plain_day).append(now)
+                stamps.append(now)
         if not sent:
             vip_retry_later(ev, now, "Telegram did not take the message")
             return False
-        bot_stats["vip"] += 1 if low else 0
+        bot_stats["vip"] += 1 if (hot and announce and not spray) else 0
     last[lk] = now
     if low:
         state["cooldowns"]["vip:" + key] = now
-    vip_log_event(w, sym, usd, mc, low, key)
-    log.info("VIP BUY: %s bought %s (%s, market cap %s, %s)", wallet_label(w), key, fmt_usd(usd), fmt_usd(mc), "LOW-CAP" if low else "not low-cap")
+    vip_log_event(w, sym, usd, mc, low, key, style)
+    log.info("VIP BUY: %s bought %s (%s, market cap %s, %s, %s)", wallet_label(w), key, fmt_usd(usd), fmt_usd(mc),
+             "LOW-CAP" if low else "not low-cap", {"selective": "picky wallet", "spray": "sprayer"}.get(style, "normal wallet"))
     if reminders > 0 and alert_on("vip"):
         _vip_rt["reminders"].append({"w": w, "key": key, "chain": chain, "token": token, "sym": sym, "mc0": mc, "px0": px,
                                      "t0": now, "n": 0, "total": reminders})
     m = compute_metrics(key, pair)
-    if low and m:
-        add_record("vip", key, chain, pair, m, "", now,
-                   extra={"wallet": w, "who": wallet_label(w)[:30], "th": WALLET_TRACK_HOURS, "usd": round(usd),
-                          "sig": signals_for(m), "quiet": not alert_on("vip")})
+    if m and (low or (picky and hot)):
+        extra = {"wallet": w, "who": wallet_label(w)[:30], "th": WALLET_TRACK_HOURS, "usd": round(usd),
+                 "sig": signals_for(m), "quiet": (not alert_on("vip")) or spray or not announce, "style": style}
+        if not low:                                           # a bigger coin a picky wallet bought: judged by a fairer yardstick than 2x
+            extra.update(wx=RADAR_WIN_X, sx=RADAR_STOP_X, big=True)
+        add_record("vip", key, chain, pair, m, "", now, extra=extra)
     try:        # the same buy is scored like any other watched wallet's, and two watched wallets in one coin make a cluster
         handle_whale_swap({"chain": chain, "wallet": w, "side": "BUY", "token": token, "symbol": sym, "usd": usd,
                            "signature": f"vip:{w}:{tx or key}", "src": "watch"}, quiet=True)
@@ -3385,7 +3965,7 @@ def build_kol_message(key: str, chain: str, pair: dict, e: dict, mc: float, peak
     if isinstance(ch, dict) and any(ch.get(x) is not None for x in ("h1", "h6", "h24")):
         L.append("📈 price " + " · ".join(f"{num(ch, x):+.0f}% {lab}" for x, lab in (("h1", "1h"), ("h6", "6h"), ("h24", "24h")) if ch.get(x) is not None))
     body = "\n".join(L) + "\n" + chain_note(chain)
-    body += (f"📌 I follow it for {span_text(KOL_TRACK_HOURS)} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). A coin that fell this far can keep "
+    body += (f"📌 I follow it for {follow_text(KOL_TRACK_HOURS, mc)} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). A coin that fell this far can keep "
              "falling or be dead - this is a chance to look, not a promise.\n\n"
              f"`{addr}`\n\n[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | [Token]({link(chain, 'token', addr)})")
     return body
@@ -3643,7 +4223,7 @@ def hunter_stats() -> dict[str, dict]:
                 continue
             if p["st"] == "w":
                 wins += 1
-                wsum += crowd_weight(crowd.get(p["k"], 1))        # a coin a whole crowd bought counts less (they win or lose together)
+                wsum += crowd_weight(crowd.get(p["k"], 1)) * (EARLY_WIN_WEIGHT if is_early(p) else 1.0)   # a coin a whole crowd bought counts less (they win or lose together); so does a hit that was already in the bag when I saw the buy (v3.8)
                 coins.append(str(p.get("s", "?")))
             else:
                 stops += 1
@@ -3663,6 +4243,7 @@ def hunters_pass() -> int:
     have = sum(1 for _, d in vip_items() if d.get("tier") == "hunter")
     found = 0
     ranked = sorted(hunter_stats().items(), key=lambda kv: (-kv[1]["wsum"], -kv[1]["wins"]))
+    scores = wallet_scores() if ranked else {}
     for w, s in ranked:
         if have + found >= HUNTER_MAX or found >= 3:
             break
@@ -3672,8 +4253,10 @@ def hunters_pass() -> int:
             continue
         kind = wallet_kind(w)
         key = w.lower() if kind == "evm" else w
-        if not kind or key in removed or key in EVM_WHALES or (kind == "solana") != (s["chain"] == "solana"):
+        if not kind or key in removed or key in EVM_WHALES or (kind == "solana") != (s["chain"] == "solana") or recently_demoted(key):
             continue
+        if MUTE_ON and cold_record(w, scores):
+            continue                         # v3.8: a few low-cap wins do not outweigh a record that keeps losing overall
         cur = state["watch"].get(key)
         if isinstance(cur, dict) and cur.get("vip"):
             continue
@@ -3696,42 +4279,110 @@ def hunters_pass() -> int:
 
 
 # --- the low-cap crowd alert: several saved wallets bought the same coin while it is still small ---
-def lowcap_crowd(key: str, now: float) -> list[tuple[str, dict]]:
-    """The saved wallets whose recent buy of this coin is still being followed: [(wallet, buy)]."""
+def lowcap_crowd(key: str, now: float, scores: dict | None = None, old_way: bool = False, cold_ok: bool = False) -> list[tuple[str, dict]]:
+    """The saved wallets that are in this coin right now: [(wallet, buy)].
+    v3.8: a wallet counts only if its LATEST buy of the coin really happened within the last LOWCAP_FRESH_HOURS ('bt' = the trade's own
+    time; a buy saved by an older version has no such time and does not count) and it has not gone cold (a record that keeps losing).
+    old_way=True gives the crowd the way versions up to 3.7 counted it (any buy I saved in the last 36 hours) - only used to tell
+    which crowds the new rules turned down."""
     out = []
+    fresh = lowcap_fresh_hours() * 3600
+    sc = [scores]                                  # (worked out only if a wallet's buy is fresh enough to matter)
+
+    def cold(w: str) -> bool:
+        if cold_ok or not MUTE_ON:
+            return False
+        if sc[0] is None:
+            sc[0] = wallet_scores()
+        return wallet_cold(w, sc[0])
+
     for w in list(_book_idx.get(key, [])):
         d = state["book"].get(w)
         for p in (d or {}).get("picks", []):
-            if isinstance(p, dict) and p.get("k") == key and p.get("st") == "o" and now - num(p, "t") <= LOWCAP_HOURS * 3600:
+            if not (isinstance(p, dict) and p.get("k") == key and p.get("st") == "o"):
+                continue
+            if old_way:
+                ok = now - num(p, "t") <= 36 * 3600
+            else:
+                bt = num(p, "bt")
+                ok = bt > 0 and now - bt <= fresh and not cold(w)
+            if ok:
                 out.append((w, p))
                 break
     return out
 
 
-def lowcap_ready(key: str, mc: float, liq: float, now: float) -> dict | None:
-    """Does this coin qualify for the low-cap crowd alert right now? -> {"rows", "total", "run"} or None."""
+def lowcap_age_cap() -> float:
+    """The oldest coin (days) the crowd alert will talk about: LOWCAP_MAX_AGE_DAYS, or what /lowcap age set (0 = no limit)."""
+    return _tune_num("lowcap_age", LOWCAP_MAX_AGE_DAYS)
+
+
+def lowcap_fresh_hours() -> float:
+    return max(1.0, _tune_num("lowcap_fresh", LOWCAP_FRESH_HOURS))
+
+
+def lowcap_ready(key: str, mc: float, liq: float, now: float, scores: dict | None = None, age_days: float | None = None,
+                 why: list | None = None) -> dict | None:
+    """Does this coin qualify for the low-cap crowd alert right now? -> {"rows", "total", "run"} or None.
+    v3.8: the buys must be FRESH (see lowcap_crowd), the coin not older than lowcap_age_cap() days, and the wallets not far up (LOWCAP_MAX_RUN)
+    or far down (LOWCAP_MAX_DOWN) on what they paid. When a crowd that the old rules would have pinged is turned down, the reason ('stale',
+    'cold', 'old', 'up', 'down') is appended to 'why' - those crowds are followed quietly (lshadow) to see whether the rule was right."""
     if not alert_on("lowcap") or mc <= 0 or mc > lowcap_limit() or key in state["steady"]:
         return None
     cd = state["cooldowns"]
     if (now - cd.get("lc:" + key, 0) < 3 * 86400 or now - cd.get("vip:" + key, 0) < 12 * 3600
             or now - cd.get("sb:" + key, 0) < 12 * 3600 or liq < LOWCAP_MIN_LIQ_USD):
         return None
-    rows = lowcap_crowd(key, now)
+    if len(lowcap_crowd(key, now, old_way=True)) < LOWCAP_MIN_WALLETS:
+        return None                                   # not a crowd at all, by any way of counting
+
+    def no(reason: str):
+        if why is not None:
+            why.append(reason)
+        return None
+
+    if scores is None:
+        scores = wallet_scores()
+    rows = lowcap_crowd(key, now, scores=scores)
     if len(rows) < LOWCAP_MIN_WALLETS:
-        return None
+        return no("cold" if len(lowcap_crowd(key, now, scores=scores, cold_ok=True)) >= LOWCAP_MIN_WALLETS else "stale")
+    cap = lowcap_age_cap()
+    if cap > 0 and age_days and age_days > cap:
+        return no("old")
     total = sum(num(p, "usd") for _, p in rows)
-    run = median([num(p, "lr", default=1.0) or 1.0 for _, p in rows]) - 1
-    if total < LOWCAP_MIN_USD or run > LOWCAP_MAX_RUN:
+    if total < LOWCAP_MIN_USD:
         return None
+    run = median([num(p, "lr", default=1.0) or 1.0 for _, p in rows]) - 1
+    if run > LOWCAP_MAX_RUN:
+        return no("up")
+    if run < -LOWCAP_MAX_DOWN:
+        return no("down")
     return {"rows": rows, "total": total, "run": run}
 
 
-def lowcap_alert_coming(key: str, now: float) -> bool:
+def lowcap_alert_coming(key: str, now: float, scores: dict | None = None) -> bool:
     """Is a low-cap crowd alert about to go out for this coin? Then that alert already shows who is buying."""
     hit = _mc_live.get(key)
     if not hit or now - hit[0] > 900 or len(day_count("lc_ts", now)) >= LOWCAP_MAX_PER_DAY:
         return False
-    return lowcap_ready(key, hit[1], hit[2], now) is not None
+    return lowcap_ready(key, hit[1], hit[2], now, scores, (hit[3] if len(hit) > 3 else 0.0) or None) is not None
+
+
+def maybe_add_lshadow(key: str, chain: str, pair: dict, reason: str, now: float):
+    """v3.8: a crowd the new rules turned down (a coin that is too old, buys that are not fresh, wallets gone cold, a coin already up or
+    down) is followed in silence, so the report can show whether the rule was right (the turned-down crowds that go on to double would
+    show it was too strict)."""
+    if open_records(key) or now - state["shadow_cd"].get("l:" + key, 0) < SHADOW_COOLDOWN:
+        return
+    if len(fresh_open("lshadow")) >= LSHADOW_MAX:
+        return
+    if not clear_to_alert(key, chain, pair):
+        return
+    m = compute_metrics(key, pair)
+    if not m:
+        return
+    state["shadow_cd"]["l:" + key] = now
+    add_record("lshadow", key, chain, pair, m, reason, now, extra={"th": BOOK_TRACK_HOURS})
 
 
 def build_lowcap_message(chain: str, pair: dict, m: dict, ready: dict, scores: dict, held: dict, now: float) -> str:
@@ -3741,12 +4392,15 @@ def build_lowcap_message(chain: str, pair: dict, m: dict, ready: dict, scores: d
     rows = sorted(ready["rows"], key=lambda r: (-{"watched": 3, "proven": 2, "promising": 1}.get(book_grade(r[0], scores), 0), -num(r[1], "usd")))
     px = num(pair, "priceUsd")
     L = [f"*🎯 LOW-CAP CROWD: ${sym}*  |  {CHAINS[chain]['name']}", "",
-         f"{len(rows)} saved wallets bought it (together about {fmt_usd(ready['total'])}) while it was still small:"]
+         f"{len(rows)} saved wallets bought it within the last {span_text(lowcap_fresh_hours())} (together about {fmt_usd(ready['total'])}) "
+         "while it is still small:"]
     for w, p in rows[:4]:
         paid = num(p, "px")
         vs = f", now {px / paid - 1:+.0%} on that price" if paid > 0 and px > 0 and 0.2 <= px / paid <= 5 else ""
+        bt = num(p, "bt")
+        when = f" (last buy {since_text(max(0.0, now - bt))} ago)" if bt > 0 else ""
         more = also_buying(None, w, key)
-        L.append(f"• `{w}`  {wallet_record_text(w, scores)}\n   bought about {fmt_usd(num(p, 'usd'))}{vs}"
+        L.append(f"• `{w}`  {wallet_record_text(w, scores)}\n   bought about {fmt_usd(num(p, 'usd'))}{when}{vs}"
                  + (" · also holding " + ", ".join(more[:3]) if more else ""))
     if len(rows) > 4:
         L.append(f"   ...and {len(rows) - 4} more")
@@ -3754,7 +4408,7 @@ def build_lowcap_message(chain: str, pair: dict, m: dict, ready: dict, scores: d
           f"💧 liquidity {fmt_usd(m['liq'])} ({m['liq_ratio'] * 100:.1f}% of MC) · 📊 24h volume {fmt_usd(m['vol24'])} "
           f"({m['vol_ratio'] * 100:.0f}% of MC) · 👥 {m['traders']:,} txns · ⏱ {fmt_age(m['age_h'])}"]
     body = "\n".join(L) + "\n" + wallets_line(held) + chain_note(chain)
-    body += (f"📌 I follow it for {span_text(BOOK_TRACK_HOURS)} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). Wallets that buy the same coin "
+    body += (f"📌 I follow it for {follow_text(BOOK_TRACK_HOURS, m['mc'])} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). Wallets that buy the same coin "
              "can all be wrong together - a crowd is one clue, not several.\n\n"
              f"`{addr}`\n\n[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | [Token]({link(chain, 'token', addr)})")
     return body
@@ -3765,23 +4419,30 @@ def lowcap_pass(cands: list, now: float):
     if not alert_on("lowcap") or not cands:
         return
     stamps = day_count("lc_ts", now)
-    scores = None
+    scores = wallet_scores()
     for key, chain, pair, mc in cands:
         if len(stamps) >= LOWCAP_MAX_PER_DAY:
             break
-        ready = lowcap_ready(key, mc, num(pair, "liquidity", "usd"), now)
-        if not ready or not confirmed_twice("lc", key, mc, now) or not clear_to_alert(key, chain, pair):
+        why: list[str] = []
+        ready = lowcap_ready(key, mc, num(pair, "liquidity", "usd"), now, scores, age_days_of(pair) or None, why)
+        if not ready:
+            if why:
+                try:
+                    maybe_add_lshadow(key, chain, pair, why[0], now)        # v3.8: turned down - but still followed, quietly
+                except Exception:
+                    log.exception("quiet follow of a turned-down crowd failed")
+            continue
+        if not confirmed_twice("lc", key, mc, now) or not clear_to_alert(key, chain, pair):
             continue
         m = compute_metrics(key, pair)
         if not m:
             continue
-        if scores is None:
-            scores = wallet_scores()
         held = watch_holders(chain, key.split(":", 1)[1], num(pair, "priceUsd"), max_age=1800)
         if not send_telegram(build_lowcap_message(chain, pair, m, ready, scores, held, now)):
             continue
         state["cooldowns"]["lc:" + key] = now
         stamps.append(now)
+        drop_quiet_follow(key, now)
         add_record("lowcap", key, chain, pair, m, "", now,
                    extra={"th": BOOK_TRACK_HOURS, "sig": signals_for(m, len(held["in"])), "n": len(ready["rows"]), "usd": round(ready["total"])})
         bot_stats["lowcap"] += 1
@@ -3807,12 +4468,18 @@ def parse_money(text: str) -> float | None:
 def vip_add(rest: list[str]) -> str:
     addr = next((a for a in rest if wallet_kind(a)), None)
     if not addr:
-        return ("Send it like this: /vip add <wallet address> <a name you choose>\n"
-                "Put the word kol at the end to also put every coin it buys on the dip-watch.")
+        return ("Send it like this: /vip add <wallet address> <a name you choose> [kol] [picky|spray|normal]\n"
+                "• kol at the end: every coin it buys also goes on the dip-watch.\n"
+                "• picky: a wallet that rarely trades (you get the loud ping on bigger coins too) · spray: a wallet that buys everything (quiet messages) · "
+                "no word: I judge it myself from how many different coins it buys.")
     words = [a for a in rest if a != addr]
-    kol = bool(words) and words[-1].lower() == "kol"
-    if kol:
-        words = words[:-1]
+    kol, style = False, None
+    while words and (words[-1].lower() == "kol" or (len(words) > 1 and words[-1].lower() in STYLE_WORDS)):    # (the words may come in either order)
+        wd = words.pop().lower()
+        if wd == "kol":
+            kol = True
+        else:
+            style = STYLE_WORDS[wd]
     kind = wallet_kind(addr)
     new = (addr.lower() if kind == "evm" else addr) not in state["watch"]
     key = add_watch(addr, " ".join(words).strip())
@@ -3820,6 +4487,12 @@ def vip_add(rest: list[str]) -> str:
     kol = kol or bool(info.get("kol"))                 # (adding it again without the word kol does not switch the dip-watch off)
     info.update(vip=True, tier="vip", chain="solana" if kind == "solana" else "robinhood", kol=kol, sure="added by you")
     info.setdefault("note", "added by you")
+    info.setdefault("vip_t", time.time())
+    if style == "auto":
+        info.pop("style", None)
+    elif style:
+        info["style"] = style
+    style_start()
     off = state["tuning"].get("vip_off")
     if isinstance(off, list) and key in off:
         off.remove(key)
@@ -3828,9 +4501,57 @@ def vip_add(rest: list[str]) -> str:
     else:
         how = ("I read its coin transfers on Robinhood Chain every ~90 seconds. (For a VIP wallet I only look at Robinhood Chain; "
                "if this one trades on another chain, use /watch for that.)")
+    cur = info.get("style")
+    if cur == "selective":
+        st = (f"\n🎯 Style: *picky* (you set it) - when it buys, you get the loud message on any coin up to {fmt_usd(PICKY_MAX_MC)} market cap, "
+              "with one extra repeat.")
+    elif cur == "spray":
+        st = (f"\n🔕 Style: *sprayer* (you set it) - its buys of coins under {fmt_usd(lowcap_limit())} arrive as a silent message "
+              f"(at most {SPRAY_MAX_PER_DAY} a day); its other buys are only written down.")
+    elif cur == "normal":
+        st = "\n▫️ Style: normal (you set it) - the same message for every low-cap buy."
+    else:
+        st = ("\n🎯 Style: I judge it myself from how many different coins it buys (a picky wallet gets a better ping, a sprayer a quiet one). "
+              "That needs a few days; tell me now with /vip style " + md_escape(wallet_label(key)) + " picky|spray|normal.")
     return (f"🚨 *{md_escape(wallet_label(key))}* is {'now' if new else 'already'} on the VIP list (`{short(key)}`). {how}\n"
             f"When it buys a coin under {fmt_usd(lowcap_limit())} market cap you get the loud message."
-            + (" Coins it buys also go on the dip-watch." if kol else ""))
+            + (" Coins it buys also go on the dip-watch." if kol else "") + st)
+
+
+def vip_set_style(rest: list[str]) -> str:
+    """/vip style <name> picky|spray|normal|auto - or just /vip style to see how the styles work and what each wallet is right now."""
+    now = time.time()
+    word = rest[-1].lower() if rest else ""
+    if rest and word in STYLE_WORDS and len(rest) >= 2:
+        key = find_watch(" ".join(rest[:-1]))
+        if not key or not (state["watch"].get(key) or {}).get("vip"):
+            return "I don't have a VIP wallet like that. Send /vip to see the list."
+        info = state["watch"][key]
+        style = STYLE_WORDS[word]
+        if style == "auto":
+            info.pop("style", None)
+        else:
+            info["style"] = style
+        save_state()
+        cur, why = vip_style(key, info, now)
+        return (f"✅ *{md_escape(wallet_label(key))}* is now {'judged by me again' if style == 'auto' else 'set to ' + style_icon(cur)}"
+                + (f" (right now I would call it {style_icon(cur)}" + (f": {md_escape(why)}" if why else "") + ")" if style == "auto" else "") + ".")
+    L = ["🎯 *Wallet styles* - how many DIFFERENT coins a wallet buys decides how I ping you (big wallets that rarely trade tend to be right more often than ones that buy everything):",
+         f"• 🎯 *picky* - {STYLE_PICKY_7D} coins or fewer in 7 days (and {STYLE_PICKY_24H} a day at most), after {STYLE_PICKY_MIN_DAYS:g} days of watching it: "
+         f"loud message on any coin up to {fmt_usd(PICKY_MAX_MC)} market cap, one extra repeat, and it does not share the daily limit of the others",
+         "• ▫️ *normal* - the loud message for coins under your low-cap line, a short one for bigger coins",
+         f"• 🔕 *sprayer* - {STYLE_SPRAY_7D}+ coins in 7 days or {STYLE_SPRAY_24H}+ in one day: a silent message for low-cap buys only "
+         f"(at most {SPRAY_MAX_PER_DAY} a day), no repeats"]
+    items = vip_items()
+    if items:
+        L.append("\nRight now:")
+        for w, d in items:
+            st, why = vip_style(w, d, now)
+            n7, n1 = style_counts(w, now)
+            L.append(f"• {md_escape(wallet_label(w))} - {style_icon(st)}" + (f" ({md_escape(why)})" if why else "") + f" · {n7} coin{'' if n7 == 1 else 's'} in 7 days, {n1} today")
+    L.append("\nSet one yourself: /vip style <name> picky|spray|normal|auto  (auto = I judge it)")
+    out = "\n".join(L)
+    return out if len(out) <= 3800 else out[:3800].rsplit("\n", 1)[0]
 
 
 def vip_remove(rest: list[str]) -> str:
@@ -3839,8 +4560,11 @@ def vip_remove(rest: list[str]) -> str:
         return "I don't have a VIP wallet like that. Send /vip to see the list."
     info = state["watch"][key]
     label = wallet_label(key)
-    for f in ("vip", "tier", "kol", "sure", "note", "chain"):
+    for f in ("vip", "tier", "kol", "sure", "note", "chain", "style", "style_seeded", "vip_t"):
         info.pop(f, None)
+    buys = state["tuning"].get("vip_buys")
+    if isinstance(buys, dict):
+        buys.pop(key, None)
     off = state["tuning"].get("vip_off")
     if not isinstance(off, list):
         off = state["tuning"]["vip_off"] = []
@@ -3857,6 +4581,8 @@ def cmd_vip(args: list[str]) -> str:
         return vip_add(args[1:])
     if sub in ("remove", "rm", "delete", "del", "off"):
         return vip_remove(args[1:])
+    if sub in ("style", "styles", "type", "types"):
+        return vip_set_style(args[1:])
     if sub in ("min", "minimum") or sub in ("ping", "pings", "repeat", "repeats"):
         if len(args) < 2:
             return "Send it like this: /vip min 300   (ignore buys under $300)   or   /vip ping 3   (repeat each loud message 3 times, 0-4)"
@@ -3889,18 +4615,48 @@ def cmd_vip(args: list[str]) -> str:
         lb = (f"\n   last buy seen: ${md_escape(str(last.get('s', '?')))} {fmt_usd(last.get('usd', 0))} at market cap {fmt_usd(last.get('mc', 0))}, "
               f"{ago(now - last.get('t', now))} ago" if last else "\n   no buy seen since I started looking")
         L.append(f"\n{i}. *{md_escape(wallet_label(w))}* · {CHAINS[chain]['name']} · [{short(w)}]({link(chain, 'addr', w)})"
-                 + (f" · {tag}" if tag else "") + (" · 📉 dip-watch on" if d.get("kol") else "")
+                 + (f" · {tag}" if tag else "") + (" · 📉 dip-watch on" if d.get("kol") else "") + style_tag(w, d, now)
                  + f"\n   {vip_status_text(w, d)}{lb}")
-    L.append("\n/vip add <address> <name> [kol] · /vip remove <name> · /vip min 300 · /vip ping 3 · /lowcap 500k · /alerts vip off")
+    L.append("\n/vip add <address> <name> [kol] [picky|spray] · /vip style <name> picky|spray|normal|auto · /vip remove <name> · /vip min 300 · /vip ping 3 · /lowcap 500k · /alerts vip off")
     out = "\n".join(L)
     return out if len(out) <= 3800 else out[:3800].rsplit("\n", 1)[0]
 
 
 def cmd_lowcap(args: list[str]) -> str:
     if args and args[0].lower() in ("reset", "default", "standard"):
-        state["tuning"].pop("lowcap_mc", None)
+        for name in ("lowcap_mc", "lowcap_age", "lowcap_fresh", "smartbuy_age", "smartbuy_fresh"):
+            state["tuning"].pop(name, None)
         save_state()
-        return f"↩️ A low cap is back to {fmt_usd(LOWCAP_MC)} market cap or less."
+        return (f"↩️ A low cap is back to {fmt_usd(LOWCAP_MC)} market cap or less, a coin counts as young up to {LOWCAP_MAX_AGE_DAYS:g} days old, "
+                f"and a buy counts as fresh for {LOWCAP_FRESH_HOURS:g} hours.")
+    if args and args[0].lower() in ("age", "old", "young"):
+        if len(args) < 2:
+            return (f"A coin older than {lowcap_age_cap():g} days gets no low-cap crowd alert (the crowd is followed quietly instead). "
+                    "Change it with /lowcap age 30 (days, 2 to 365).")
+        try:
+            v = float(args[1].lower().rstrip("d"))
+        except ValueError:
+            return "Send a number of days from 2 to 365, like /lowcap age 14"
+        if not 2 <= v <= 365:
+            return "Send a number of days from 2 to 365, like /lowcap age 14"
+        state["tuning"]["lowcap_age"] = v
+        save_state()
+        return (f"✅ The low-cap crowd alert now only fires for coins up to {v:g} days old. Older coins are still followed quietly, "
+                "so /lowcap shows whether they would have paid.")
+    if args and args[0].lower() in ("fresh", "freshness", "recent"):
+        if len(args) < 2:
+            return (f"A wallet's buy counts as fresh for {lowcap_fresh_hours():g} hours. Change it with /lowcap fresh 12 "
+                    "(hours, 1 to 168).")
+        try:
+            v = float(args[1].lower().rstrip("h"))
+        except ValueError:
+            return "Send a number of hours from 1 to 168, like /lowcap fresh 24"
+        if not 1 <= v <= 168:
+            return "Send a number of hours from 1 to 168, like /lowcap fresh 24"
+        state["tuning"]["lowcap_fresh"] = v
+        save_state()
+        return (f"✅ The low-cap crowd alert now only counts buys made in the last {v:g} hours. A crowd that bought earlier is "
+                "followed quietly instead.")
     if args:
         v = parse_money(args[0])
         if v is None or not 50_000 <= v <= 100_000_000:
@@ -3910,8 +4666,10 @@ def cmd_lowcap(args: list[str]) -> str:
         return f"✅ A low cap is now {fmt_usd(v)} market cap or less. Loud VIP pings and the low-cap crowd alert use this line."
     return (f"🎯 A *low cap* is a market cap of {fmt_usd(lowcap_limit())} or less.\n"
             "• A VIP wallet buying one = the loud message (/vip)\n"
-            f"• {LOWCAP_MIN_WALLETS}+ saved wallets buying one = the low-cap crowd alert (/alerts lowcap off switches it)\n"
-            "Change the line with /lowcap 500k (or /lowcap reset).")
+            f"• {LOWCAP_MIN_WALLETS}+ saved wallets that each bought it in the last {lowcap_fresh_hours():g} hours, on a coin up to "
+            f"{lowcap_age_cap():g} days old, that has not already run up = the low-cap crowd alert (/alerts lowcap off switches it)\n"
+            "Change the line with /lowcap 500k, the coin age with /lowcap age 30, the freshness of the buys with /lowcap fresh 12 "
+            "(or /lowcap reset).")
 
 
 def cmd_kol(args: list[str]) -> str:
@@ -4008,6 +4766,11 @@ def vip_status_lines() -> list[str]:
         bad = [w for w, _ in items if _vip_rt["err"].get(w, 0) >= 3]
         if bad:
             L.append(f"⚠️ I couldn't look inside {len(bad)} VIP wallet(s) lately: {md_escape(vip_status_text(bad[0]))}")
+        if STYLE_ON:
+            sty = Counter(vip_style(w, d, now)[0] for w, d in items)
+            if sty.get("selective") or sty.get("spray"):
+                L.append(f"🎯 Wallet styles: {sty.get('selective', 0)} picky (louder pings), {sty.get('spray', 0)} sprayer{'' if sty.get('spray', 0) == 1 else 's'} "
+                         f"(quiet pings), {sty.get('normal', 0)} normal - /vip style")
         if state["kol"]:
             inz = sum(1 for e in state["kol"].values() if KOL_DIP_MIN <= e.get("dd", 0) <= KOL_DIP_MAX)
             L.append(f"📉 Dip-watch: {len(state['kol'])} coin{'' if len(state['kol']) == 1 else 's'} (alert at {KOL_DIP_MIN:g}-{KOL_DIP_MAX:g}% down"
@@ -4025,6 +4788,57 @@ def vip_startup_note() -> str:
             f"you hear when one is down {KOL_DIP_MIN:g}-{KOL_DIP_MAX:g}% from its high (/kol; /shill adds one by hand). A new alert tells you when "
             f"{LOWCAP_MIN_WALLETS}+ saved wallets buy the same low-cap coin. Bottom and chart alerts are OFF now (only about 2 in 40 of each paid off; "
             "/alerts bottom on or /alerts chart on brings them back, and I still follow them quietly).\n")
+
+
+def startup_note36() -> str:
+    """The v3.6 start-up note (shown once)."""
+    return ("🆕 v3.6: two new things.\n"
+            f"🎯 Wallet styles: I count how many different coins each VIP wallet buys. A *picky* wallet (only a few coins, like a whale that "
+            f"rarely trades) gets the loud ping even on a bigger coin, up to {fmt_usd(PICKY_MAX_MC)} market cap, with its record shown. "
+            f"A *sprayer* (buys lots of coins) gets a quiet message with no sound, {SPRAY_MAX_PER_DAY} a day at most. I judge each wallet "
+            f"myself after {STYLE_PICKY_MIN_DAYS:g} days of watching it, or you tell me: `/vip add <address> <name> picky` "
+            "or `/vip style <name> picky|spray|normal|auto`.\n"
+            + (f"📡 Accumulation radar: every couple of minutes I read who is buying a few Robinhood Chain coins. When many different wallets "
+               f"keep buying one, hold it, and the price has not run away, you get an ACCUMULATION message (/radar shows the list, "
+               "/alerts radar off silences it). It is a clue, not a promise: I follow each one for "
+               f"{span_text(RADAR_TRACK_HOURS)} and /lowcap shows how they did.\n" if RADAR_ON else ""))
+
+
+def startup_note37() -> str:
+    """The v3.7 start-up note (shown once)."""
+    return ("🆕 v3.7: wallets now get *stars*, out of 3. "
+            "I follow every buy a wallet makes: a *hit* = the coin doubled before it halved, a *miss* = it halved first, flat = neither. "
+            "The stars come from how many of the clear results were hits: about 7 in 10 = ⭐⭐⭐, 6 in 10 = ⭐⭐½, 5 in 10 = ⭐⭐, "
+            "4 in 10 = ⭐½, 2-3 in 10 = ⭐, less = ½⭐. A wallet with few results is held back (nobody gets 3 stars before "
+            f"{STAR_CAPS[1][0]} finished buys) and 1 hit in 3 already breaks even, so the lines sit lower than 'most of the time'. "
+            "/stars shows the scale and every wallet on your list.\n"
+            "The old 'N of M good' counted a coin that touched 1.5x and then halved as good, which was too generous, so it is gone: "
+            "you now see how many buys doubled, halved and went flat. "
+            "👀 now means 'on your watch list' (it used to be ⭐). A wallet I added to your list myself whose results slip is marked 🧊 "
+            "cooling off: it stays, but it no longer counts as a good record. Wallets you add yourself are never cooled. "
+            "The smart-money points in /check now follow the stars too.\n"
+            "Also built in as VIP wallets, so you don't need to paste anything: 'Wood' (Fomo @notanicecat69, Top 100, picky) and 'angery' (Fomo). "
+            "I can look inside a VIP wallet on Robinhood Chain for now, so I see angery's Robinhood buys but not his Ethereum ones (like CLAUS).\n")
+
+
+def startup_note38() -> str:
+    """The v3.8 start-up note (shown once)."""
+    days = " / ".join(f"{d:g}" for _, d in EXTEND_DAYS)
+    return ("🆕 v3.8: fewer and fresher pings, and more patience.\n"
+            f"🕒 *Old coins and old buys no longer ping you.* Before, the low-cap crowd alert used the time I happened to look at a wallet, so a buy made "
+            f"weeks ago looked new. Now it uses the time the wallet REALLY bought. A crowd only counts buys from the last {span_text(lowcap_fresh_hours())}, "
+            f"on a coin up to {lowcap_age_cap():g} days old, that is not already up more than {LOWCAP_MAX_RUN:.0%} (or down {LOWCAP_MAX_DOWN:.0%}) from "
+            "the price the wallets paid. A crowd I turn down is followed quietly, and the report shows whether I was right to skip it. "
+            f"The smart-wallet alert checks the coin's age too ({SMARTBUY_MAX_AGE_DAYS:g} days; a wallet you named gets through).\n"
+            f"⏳ *More than 7 days.* A call that is still alive when its week ends (at least {EXTEND_ALIVE:.0%} of its price) is now followed on, another "
+            f"week at a time - up to {days} days, longer for a bigger coin - and it ends early if it falls under the lowest point of its first week. "
+            "A late winner is counted as a winner, and the report shows how many came after day 7.\n"
+            f"📌 *Coins you send me.* I remember the market cap you sent each one at (/links). Send it again and I tell you how it did since. "
+            f"When it reaches {LINK_LOOK_X:g}x I look at which wallets were in early, learn from them, and message you.\n"
+            "🧊 *Wallets that keep losing stop counting.* One I added myself comes off your list (it can earn its way back after "
+            f"{DEMOTE_DAYS:g} days); one you added stays and I only warn you. A win that was mostly done before I saw the buy counts for less in the stars.\n"
+            "Expect fewer low-cap pings than before. Every limit here is a first guess that your results will tune "
+            "(/lowcap age, /lowcap fresh).\n")
 
 
 def lowcap_book_numbers() -> dict:
@@ -4057,6 +4871,75 @@ def lowcap_book_numbers() -> dict:
     return {"n": res["n"], "w": res["w"], "s": res["s"], "o": res["o"], "f": res["f"], "hits": sorted(hits.items(), key=lambda kv: -kv[1])[:6]}
 
 
+LSHADOW_LABEL = {"stale": "bought over a day ago", "cold": "wallets with a losing record", "old": "old coin", "up": "already up a lot",
+                 "down": "already down", "sb-old": "smart-wallet buy on an old coin"}
+
+
+def lshadow_report_lines() -> list[str]:
+    """v3.8: the crowds the low-cap alert turned down (old coin, stale buys, ...) are followed quietly: did the turned-down ones pay?"""
+    out: list[str] = []
+    try:
+        done, still = closed_records("lshadow"), len(open_records(kind="lshadow"))
+        if not done and not still:
+            return out
+        by: dict[str, list[dict]] = {}
+        for r in done:
+            by.setdefault(r.get("failed") or "?", []).append(r)
+        parts = []
+        for code, lab in LSHADOW_LABEL.items():
+            if by.get(code):
+                y = summarize(by[code])
+                parts.append(f"{lab} {y['w']}/{y['n']}")
+        y = summarize(done) if done else None
+        out.append("🚫 Crowds I turned down and followed quietly (doubled / finished): "
+                   + (" | ".join(parts) if parts else "none finished yet")
+                   + (f" → together {y['w']} of {y['n']} doubled" if y and y["n"] else "") + f" · {still} still open")
+        al = closed_records("lowcap")
+        if al and y and y["n"]:
+            z = summarize(al)
+            out.append(f"   For comparison the low-cap crowd alerts you did get: {z['w']} of {z['n']} doubled "
+                       "(if the turned-down crowds do as well, my rules are too strict - tell me).")
+    except Exception:
+        log.exception("turned-down crowds report failed")
+    return out
+
+
+def patience_report_lines() -> list[str]:
+    """v3.8: what the extra time did. A follow-up that is still alive when its first week ends is followed on instead of being filed as flat."""
+    out: list[str] = []
+    try:
+        kinds = set(ALERT_KINDS) | {"shadow", "bshadow", "cshadow", "lshadow", "check"}
+        ext = [r for r in state["records"] if r.get("kind") in kinds and r.get("ext") and not r.get("void")]
+        if not ext:
+            return out
+        done = [r for r in ext if r["status"] != "open"]
+        wins = [r for r in done if r["status"] == "win"]
+        stops = [r for r in done if r["status"] == "stop"]
+        broke = [r for r in done if r["status"] == "expired" and r.get("why") == "broke"]
+        timed = [r for r in done if r["status"] == "expired" and r.get("why") != "broke"]
+        days = [(r["t1"] - r["t0"]) / 86400 for r in wins if r.get("t1")]
+        out.append(f"⏳ Extra time: {len(ext)} follow-ups were still alive when their first {span_text(TRACK_HOURS)} ended and were followed on "
+                   f"(before, they were filed as flat). So far {len(wins)} went on to double"
+                   + (f" (typically around day {median(days):.0f})" if days else "")
+                   + f", {len(stops)} halved, {len(broke)} fell under their first-week low and were dropped, {len(timed)} ran out of time, "
+                   f"{len(ext) - len(done)} are still open.")
+        tiers = []
+        for lab, lo, hi in (("under $1M", 0, 1e6), ("$1M to $10M", 1e6, 1e7), ("over $10M", 1e7, float("inf"))):
+            rs = [r for r in done if lo <= r.get("mc0", 0) < hi]
+            if rs:
+                tiers.append(f"{lab}: {sum(1 for r in rs if r['status'] == 'win')}/{len(rs)}")
+        if tiers:
+            out.append("   Doubled on the extra time, by size of the coin when called: " + " | ".join(tiers)
+                       + " (bigger coins are meant to need longer - this shows whether that is true).")
+        every = [r for r in state["records"] if r.get("kind") in kinds and r["status"] == "win" and not r.get("void") and r.get("t1")]
+        late = [r for r in every if r["t1"] - r["t0"] > TRACK_HOURS * 3600 * 1.05]
+        if every and late:
+            out.append(f"   Of all {len(every)} doubles I have seen, {len(late)} came after day {TRACK_HOURS / 24:g} - a plain 7-day window would have filed them as flat.")
+    except Exception:
+        log.exception("extra-time report failed")
+    return out
+
+
 def lowcap_report_lines() -> list[str]:
     out: list[str] = []
     try:
@@ -4068,17 +4951,719 @@ def lowcap_report_lines() -> list[str]:
                        + f", {x['o'] + x['f']} still undecided.")
         if x["hits"]:
             out.append("   Low-cap coins that doubled for saved wallets: " + ", ".join(f"${md_escape(s)} ({n})" for s, n in x["hits"]))
-        for kind, label in (("vip", "VIP low-cap pings"), ("lowcap", "Low-cap crowd alerts"), ("kol", "Dip-watch alerts")):
+        for kind, label in (("vip", "VIP low-cap pings"), ("lowcap", "Low-cap crowd alerts"), ("kol", "Dip-watch alerts"),
+                            ("radar", "Accumulation radar alerts")):
             rs = closed_records(kind)
+            if kind == "vip":
+                rs = [r for r in rs if not r.get("big")]            # (a picky wallet's buy of a bigger coin has its own yardstick, below)
             if rs:
                 y = summarize(rs)
                 out.append(f"🚨 {label} finished: *{y['n']}*  ✅ {y['w']} wins | 🛑 {y['s']} stopped | ⏱ {y['e']} flat → win rate *{y['wr']:.0%}*, "
-                           f"average best move *{y['avg_best']:.2f}x*  (open now: {len(open_records(kind=kind))})")
+                           f"average best move *{y['avg_best']:.2f}x*  (open now: {len(open_records(kind=kind))})"
+                           + (f"  [win = +{(RADAR_WIN_X - 1) * 100:.0f}% before -{(1 - RADAR_STOP_X) * 100:.0f}%]" if kind == "radar" else ""))
             elif open_records(kind=kind):
                 out.append(f"🚨 {label}: {len(open_records(kind=kind))} being followed, none finished yet.")
+        low_vip = [r for r in closed_records("vip") if not r.get("big")]
+        by_style = {st: [r for r in low_vip if (r.get("style") or "normal") == st] for st in ("selective", "normal", "spray")}
+        if by_style["selective"] or by_style["spray"]:
+            parts = []
+            for st, lab in (("selective", "🎯 picky wallets"), ("normal", "▫️ normal"), ("spray", "🔕 sprayers")):
+                if by_style[st]:
+                    y = summarize(by_style[st])
+                    parts.append(f"{lab} {y['w']} of {y['n']} won ({y['wr']:.0%})")
+            out.append("🎯 VIP low-cap pings by wallet style: " + " · ".join(parts))
+        big = [r for r in closed_records("vip") if r.get("big")]
+        if big:
+            y = summarize(big)
+            out.append(f"🎯 Picky wallets on bigger coins (win = +{(RADAR_WIN_X - 1) * 100:.0f}% before -{(1 - RADAR_STOP_X) * 100:.0f}%): "
+                       f"{y['w']} of {y['n']} won, average best move {y['avg_best']:.2f}x")
     except Exception:
         log.exception("low-cap report lines failed")
+    return out + lshadow_report_lines() + patience_report_lines()
+
+
+# ----------------------------------------------------------------------------
+# v3.6 - THE ACCUMULATION RADAR (Robinhood Chain): coins that many wallets keep buying and holding.
+# Read-only: it only reads the chain's public transfer log (the same free node as the VIP wallets). Nothing is ever signed or sent.
+# For each coin it takes every transfer of the last day and sorts them: pool/router -> wallet = a buy, wallet -> pool/router = a sell,
+# wallet <-> wallet = a move. Pools and routers are not listed anywhere: an address that moves the coin to/from 10+ different addresses
+# and is a contract is a hub. A wallet that bought, sold little and still holds most of it is an 'accumulator'.
+# ----------------------------------------------------------------------------
+ZERO_ADDR = "0x" + "0" * 40
+DEAD_ADDR = "0x000000000000000000000000000000000000dead"
+RADAR_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951"      # the Uniswap v4 PoolManager on Robinhood Chain: the coins of every v4 pool sit in it
+RADAR_SEED_HUBS = {RADAR_POOL_MANAGER, ZERO_ADDR, DEAD_ADDR} | set(FOMO_ROUTERS)
+_radar_rt: dict = {"cands": [], "cand_t": 0.0, "latest": (0.0, 0), "last_err": "", "force": False, "ticks": 0}
+
+
+def radar_coins() -> dict:
+    """The radar's readings {coin key: reading} - the place is made if it is missing (a fresh start has no saved memory to bring it)."""
+    rad = state["radar"]
+    if not isinstance(rad, dict):
+        rad = state["radar"] = {}
+    coins = rad.get("coins")
+    if not isinstance(coins, dict):
+        coins = rad["coins"] = {}
+    return coins
+
+
+class RadarTooMany(Exception):
+    """The node has more transfers than it returns in one answer (or the block range is too wide): ask for a smaller range."""
+
+
+class RadarBusy(Exception):
+    """This coin has too many transfers to read politely (it would take more node requests than RADAR_MAX_CALLS)."""
+
+
+def radar_rpc(url: str, method: str, params: list, timeout: float = 30.0):
+    """Like rpc_call, but (1) 'too many results' is not counted as the node being down (the range is simply cut in two and asked again) and
+    (2) its failures are counted apart from the VIP wallets' (the radar must never make the VIP looks wait)."""
+    fk = url + "#radar"
+    n, t = _rpc_fail.get(fk, (0, 0.0))
+    if n >= 3 and time.time() - t < 120:
+        raise RuntimeError("node link is busy - skipped for a moment")
+    try:
+        r = http.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=timeout)
+        r.raise_for_status()
+        d = r.json()
+    except (requests.RequestException, ValueError):
+        _rpc_fail[fk] = (n + 1, time.time())
+        raise
+    err = d.get("error") if isinstance(d, dict) else None
+    if err:
+        msg = str(err.get("message") if isinstance(err, dict) else err)
+        low_msg = msg.lower()
+        if any(x in low_msg for x in ("exceeds limit", "too many results", "result size", "block range", "range too large", "range is too large",
+                                      "maximum block range", "query returned more than")):
+            _rpc_fail.pop(fk, None)                                # (the node answered; the question was just too big)
+            raise RadarTooMany(msg[:100])
+        _rpc_fail[fk] = (n + 1, time.time())
+        raise ValueError("node answered with an error: " + msg[:100])
+    if not isinstance(d, dict) or "result" not in d:
+        _rpc_fail[fk] = (n + 1, time.time())
+        raise ValueError("node answered with something unexpected")
+    _rpc_fail.pop(fk, None)
+    return d["result"]
+
+
+def radar_get_logs(url: str, token: str, a: int, b: int, left: list) -> list[tuple]:
+    """Every Transfer of one coin in blocks a..b -> [(block, from, to, raw amount)]. A range with too many results is cut in two and read
+    again; left[0] = how many node requests this coin may still use (RadarBusy when they run out)."""
+    out: list[tuple] = []
+    stack = [(a, b)]
+    while stack:
+        lo, hi = stack.pop()
+        if left[0] <= 0:
+            raise RadarBusy("more node requests than allowed")
+        left[0] -= 1
+        try:
+            logs = radar_rpc(url, "eth_getLogs", [{"fromBlock": hex(lo), "toBlock": hex(hi), "address": token, "topics": [TRANSFER_TOPIC]}], timeout=45)
+        except RadarTooMany:
+            if hi - lo < 100:
+                raise RadarBusy("too many transfers in a tiny range")
+            mid = (lo + hi) // 2
+            stack.append((mid + 1, hi))
+            stack.append((lo, mid))
+            continue
+        for lg in logs or []:
+            try:
+                t = lg.get("topics") or []
+                data = lg.get("data") or ""
+                if len(t) != 3 or len(data) < 3:
+                    continue                                       # (not a plain coin transfer - an NFT, say)
+                out.append((int(lg["blockNumber"], 16), "0x" + str(t[1])[-40:].lower(), "0x" + str(t[2])[-40:].lower(), int(data, 16)))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+        if stack:
+            time.sleep(0.25)
     return out
+
+
+def radar_prefetch_codes(url: str, addrs: list[str]):
+    """Which of these addresses are contracts? One batched request per 30 addresses (remembered in the same cache the VIP wallets use);
+    anything the batch does not answer is asked for one by one later."""
+    cache = _vip_rt["code"]
+    need = [a for a in dict.fromkeys(addrs) if a not in cache and a not in FOMO_ROUTERS]
+    for i in range(0, len(need), 30):
+        chunk = need[i:i + 30]
+        try:
+            r = http.post(url, json=[{"jsonrpc": "2.0", "id": j, "method": "eth_getCode", "params": [a, "latest"]} for j, a in enumerate(chunk)], timeout=30)
+            r.raise_for_status()
+            d = r.json()
+        except (requests.RequestException, ValueError):
+            continue
+        if not isinstance(d, list):
+            continue
+        for item in d:
+            if isinstance(item, dict) and isinstance(item.get("id"), int) and 0 <= item["id"] < len(chunk) and isinstance(item.get("result"), str):
+                if len(cache) > 5000:
+                    cache.clear()
+                cache[chunk[item["id"]]] = len(item["result"]) > 2
+        time.sleep(0.2)
+
+
+def radar_analyze(logs: list[tuple], dec: int, px: float, token: str, is_contract, prefetch=None) -> dict:
+    """The transfers of one coin -> per-wallet numbers. logs = [(block, from, to, raw amount)]; px = the coin's price in dollars.
+    Returns {"rows": [...], "hubs": set, "special": set}. Each row: a (address), buy / sell (coins), nb / ns (how many), xin / xout (coins moved
+    between wallets), first / last (block of the first / last buy), buy_usd, sell_usd, held_usd (what it holds more of than a day ago)."""
+    scale = 10.0 ** dec
+    flows: dict[tuple, list] = {}
+    for blk, frm, to, raw in logs:
+        if frm == to:
+            continue
+        f = flows.get((frm, to))
+        if f is None:
+            flows[(frm, to)] = [raw / scale, 1, blk, blk]
+        else:
+            f[0] += raw / scale
+            f[1] += 1
+            f[2], f[3] = min(f[2], blk), max(f[3], blk)
+    nb: dict[str, set] = {}
+    for frm, to in flows:
+        nb.setdefault(frm, set()).add(to)
+        nb.setdefault(to, set()).add(frm)
+    hubs = set(RADAR_SEED_HUBS) | {token.lower()}
+    special: set = set()                                           # busy addresses that are not contracts (a distributor, an exchange)
+    cands = sorted(((a, len(s)) for a, s in nb.items() if len(s) >= RADAR_HUB_FANOUT and a not in hubs), key=lambda x: -x[1])[:20]
+    if prefetch and cands:
+        prefetch([a for a, _ in cands])
+    for a, _ in cands:
+        (hubs if is_contract(a) else special).add(a)
+    W: dict[str, dict] = {}
+
+    def get(a):
+        w = W.get(a)
+        if w is None:
+            w = W[a] = {"a": a, "buy": 0.0, "sell": 0.0, "nb": 0, "ns": 0, "xin": 0.0, "xout": 0.0, "first": 10 ** 12, "last": 0}
+        return w
+    for (frm, to), (v, n, first, last) in flows.items():
+        fh, th = frm in hubs, to in hubs
+        if fh and not th:
+            if to in special:
+                continue
+            w = get(to)
+            w["buy"] += v
+            w["nb"] += n
+            w["first"], w["last"] = min(w["first"], first), max(w["last"], last)
+        elif th and not fh:
+            if frm in special:
+                continue
+            w = get(frm)
+            w["sell"] += v
+            w["ns"] += n
+        elif not fh and not th:
+            if to not in special:
+                get(to)["xin"] += v
+            if frm not in special:
+                get(frm)["xout"] += v
+    rows = []
+    for w in W.values():
+        w["buy_usd"], w["sell_usd"] = w["buy"] * px, w["sell"] * px
+        w["held_usd"] = (w["buy"] + w["xin"] - w["sell"] - w["xout"]) * px
+        rows.append(w)
+    return {"rows": rows, "hubs": hubs, "special": special}
+
+
+def radar_is_accumulator(r: dict) -> bool:
+    return (r["buy_usd"] >= RADAR_MIN_BUY_USD and r["sell_usd"] <= RADAR_MAX_SOLD * r["buy_usd"]
+            and r["held_usd"] >= RADAR_MIN_HELD * r["buy_usd"] and r["nb"] <= RADAR_MAX_BUYS)
+
+
+def radar_summarize(acc: list[dict], latest: int) -> dict:
+    """The accumulators of one coin -> the numbers the radar judges: how many, how much, how spread out, how recent, how patient."""
+    ranked = sorted(acc, key=lambda r: -(r["buy_usd"] - r["sell_usd"]))
+    nets = [r["buy_usd"] - r["sell_usd"] for r in ranked]
+    total = sum(nets)
+    b6, b1 = 6 * 3600 * RADAR_BLOCKS_PER_SECOND, 3600 * RADAR_BLOCKS_PER_SECOND
+    recent = [r for r in acc if latest - r["last"] <= b6]
+    return {"acc": len(acc), "usd": total,
+            "top1": (nets[0] / total) if nets and total > 0 else 0.0, "top3": (sum(nets[:3]) / total) if nets and total > 0 else 0.0,
+            "n6": len(recent), "n1": sum(1 for r in acc if latest - r["last"] <= b1), "net6": sum(r["buy_usd"] - r["sell_usd"] for r in recent),
+            "dca": sum(1 for r in acc if r["nb"] >= 3),
+            "last_h": min(((latest - r["last"]) / RADAR_BLOCKS_PER_SECOND / 3600 for r in acc), default=0.0),
+            "top": [[r["a"], round(r["buy_usd"] - r["sell_usd"]), r["nb"]] for r in ranked[:RADAR_TOP_KEEP]]}
+
+
+def radar_latest(url: str) -> int:
+    t, blk = _radar_rt["latest"]
+    if blk and time.time() - t < 20:
+        return blk
+    blk = int(radar_rpc(url, "eth_blockNumber", [], timeout=15), 16)
+    _radar_rt["latest"] = (time.time(), blk)
+    return blk
+
+
+def radar_scan_coin(url: str, token: str, px: float, latest: int, budget: int | None = None) -> dict:
+    """Read one coin's transfers for the last RADAR_HOURS and find its accumulators -> radar_summarize() numbers (+ logs, hubs, calls)."""
+    token = token.lower()
+    budget = budget or RADAR_MAX_CALLS
+    dec = evm_token_decimals(url, "robinhood", token)
+    left = [budget]
+    logs = radar_get_logs(url, token, max(0, latest - int(RADAR_HOURS * 3600 * RADAR_BLOCKS_PER_SECOND)), latest, left)
+
+    def is_c(a):
+        try:
+            return evm_is_contract(url, a)
+        except Exception:
+            return True                                            # cannot tell: a busy address is far more likely a contract
+    res = radar_analyze(logs, dec, px, token, is_c, lambda addrs: radar_prefetch_codes(url, addrs))
+    acc = [r for r in res["rows"] if radar_is_accumulator(r)]
+    acc.sort(key=lambda r: -(r["buy_usd"] - r["sell_usd"]))
+    radar_prefetch_codes(url, [r["a"] for r in acc[:40]])
+    contracts = {r["a"] for r in acc[:40] if is_c(r["a"])}        # a contract that bought a lot is a pool or a vault, not a person
+    acc = [r for r in acc if r["a"] not in contracts]
+    out = radar_summarize(acc, latest)
+    out.update(logs=len(logs), hubs=len(res["hubs"]), calls=budget - left[0])
+    return out
+
+
+def radar_qualifies(e: dict) -> tuple[bool, str]:
+    """Does a coin's latest reading look like real accumulation? -> (yes/no, what is missing). e = a state['radar']['coins'] entry."""
+    base = e["mc"] if e.get("mc", 0) > 0 else 2 * e.get("liq", 0)      # (market cap not known: twice the liquidity stands in for it)
+    if e.get("acc", 0) < RADAR_MIN_ACC:
+        return False, f"only {e.get('acc', 0)} accumulators (need {RADAR_MIN_ACC})"
+    if e.get("usd", 0) < RADAR_MIN_NET_USD:
+        return False, f"they bought only {fmt_usd(e.get('usd', 0))} together (need {fmt_usd(RADAR_MIN_NET_USD)})"
+    if base > 0 and e["usd"] / base < RADAR_MIN_SHARE_MC:
+        return False, f"that is only {e['usd'] / base:.2%} of the coin's size (need {RADAR_MIN_SHARE_MC:.2%})"
+    if e.get("top1", 0) > RADAR_MAX_TOP1:
+        return False, f"one wallet is {e['top1']:.0%} of it (that is one big buyer, not many)"
+    if e.get("n6", 0) < RADAR_MIN_RECENT:
+        return False, f"only {e.get('n6', 0)} of them bought in the last 6 hours (need {RADAR_MIN_RECENT}) - it is cooling off"
+    if e.get("ch", 0) > RADAR_MAX_RUN:
+        return False, f"the price is already up {e['ch']:.0f}% in 24h - this alert is for buying BEFORE a run"
+    if e.get("ch", 0) < RADAR_MIN_DROP:
+        return False, f"the price fell {abs(e['ch']):.0f}% in 24h - that is a falling knife, not accumulation"
+    return True, ""
+
+
+def radar_is_small_steady(e: dict) -> bool:
+    """Too few wallets for an alert, but a steady, patient build-up that is big for the coin's size (listed in /radar, never alerted)."""
+    base = e["mc"] if e.get("mc", 0) > 0 else 2 * e.get("liq", 0)
+    return (e.get("acc", 0) >= RADAR_SMALL_MIN_ACC and base > 0 and e.get("usd", 0) / base >= RADAR_SMALL_MIN_SHARE
+            and e.get("top1", 1.0) <= RADAR_MAX_TOP1 and e.get("n6", 0) >= RADAR_SMALL_MIN_RECENT
+            and RADAR_MIN_DROP <= e.get("ch", 0) <= RADAR_MAX_RUN)
+
+
+# --- which coins are read ---
+def radar_refresh_candidates(now: float) -> int:
+    """Rebuild the list of coins to read: Robinhood Chain's busiest pools by 24h volume (GeckoTerminal, the same free feed the volume-leader
+    search uses), one entry per coin. Launch-day coins, thin ones, tiny and huge ones, quote coins and steady assets are left out."""
+    net = GECKO_NETWORK["robinhood"]
+    by_tok: dict[str, dict] = {}
+    for page in range(1, RADAR_LIST_PAGES + 1):
+        try:
+            r = gecko_get(f"https://api.geckoterminal.com/api/v2/networks/{net}/pools", tries=2,
+                          params={"page": page, "sort": "h24_volume_usd_desc"}, timeout=20)
+            pools = r.json().get("data") or []
+        except (requests.RequestException, ValueError) as e:
+            bot_stats["gecko_busy"] += 1
+            log.warning("radar: the pool list is busy (%s)", getattr(getattr(e, "response", None), "status_code", "error"))
+            break
+        if not pools:
+            break
+        for pool in pools:
+            try:
+                attrs = pool.get("attributes") or {}
+                base_id = ((pool.get("relationships") or {}).get("base_token") or {}).get("data", {}).get("id", "")
+                if "_" not in base_id:
+                    continue
+                addr = norm_addr("robinhood", base_id.split("_", 1)[1])
+                sym = str(attrs.get("name") or "").split(" / ")[0].strip()[:14] or "?"
+                liq = float(attrs.get("reserve_in_usd") or 0)
+                mc = float(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or 0)
+                vol = float((attrs.get("volume_usd") or {}).get("h24") or 0)
+                ch = float((attrs.get("price_change_percentage") or {}).get("h24") or 0)
+                px = float(attrs.get("base_token_price_usd") or 0)
+                age_h = (now - datetime.fromisoformat(str(attrs.get("pool_created_at", "")).replace("Z", "+00:00")).timestamp()) / 3600
+                pool_addr = str(attrs.get("address") or "")
+            except (ValueError, TypeError, AttributeError):
+                continue
+            c = by_tok.get(addr)
+            if c is None:
+                by_tok[addr] = {"addr": addr, "key": sk("robinhood", addr), "sym": sym, "mc": mc, "liq": liq, "vol": vol, "ch": ch, "px": px,
+                                "age_h": age_h, "pool": pool_addr, "_main": liq}
+            else:
+                c["liq"] += liq
+                c["vol"] += vol
+                c["age_h"] = max(c["age_h"], age_h)
+                if liq > c["_main"]:                                # the deepest pool gives the price, market cap and change
+                    c.update(mc=mc, ch=ch, px=px, pool=pool_addr, _main=liq)
+    out = []
+    for addr, c in by_tok.items():
+        if (addr in RH_QUOTES or c["sym"].upper() in QUOTE_SYMBOLS or is_quote_token("robinhood", addr) or c["key"] in state["steady"]
+                or c["px"] <= 0 or c["liq"] < RADAR_MIN_LIQ_USD or c["age_h"] < RADAR_MIN_AGE_H
+                or (c["mc"] > 0 and not RADAR_MIN_MC <= c["mc"] <= RADAR_MAX_MC)):
+            continue
+        out.append(c)
+    out.sort(key=lambda c: -c["liq"])
+    if by_tok:                                                       # (a failed look-up keeps the old list)
+        _radar_rt["cands"] = out[:RADAR_MAX_COINS]
+        _radar_rt["cand_t"] = now
+        state["radar"]["last_list"] = now
+    return len(out)
+
+
+def radar_due(cands: list[dict], now: float) -> list[dict]:
+    """The coins to read next: never read first, then the longest unread (a coin that qualifies is read again sooner)."""
+    coins = radar_coins()
+    scored = []
+    for c in cands:
+        e = coins.get(c["key"]) or {}
+        if now - e.get("skip", 0) < 6 * 3600:
+            continue
+        every = (25 if e.get("since") else RADAR_READ_EVERY_MIN) * 60
+        gap = now - e.get("seen", 0)
+        if gap >= every:
+            scored.append((gap / every, c))
+    scored.sort(key=lambda x: -x[0])
+    return [c for _, c in scored]
+
+
+def radar_prune(now: float):
+    coins = radar_coins()
+    for k in [k for k, e in coins.items() if now - e.get("seen", 0) > RADAR_KEEP_HOURS * 3 * 3600]:
+        del coins[k]
+
+
+# --- reading a coin, judging it, telling you ---
+def radar_read_coin(url: str, c: dict, latest: int, now: float) -> bool:
+    """Read one listed coin, store what was found, and send the alert when it has qualified on two readings in a row."""
+    coins = radar_coins()
+    e = coins.get(c["key"])
+    if not isinstance(e, dict):
+        e = coins[c["key"]] = {"first": now}
+    e.update(sym=c["sym"], mc=round(c["mc"]), liq=round(c["liq"]), vol=round(c["vol"]), ch=round(c["ch"], 1), px=c["px"], age=round(c["age_h"]))
+    try:
+        s = radar_scan_coin(url, c["addr"], c["px"], latest)
+    except RadarBusy as ex:
+        e.update(seen=now, skip=now, why="too many transfers to read politely", acc=0, usd=0, since=0, ok2=0)
+        log.info("radar: %s skipped (%s)", c["sym"], ex)
+        return False
+    e.update(seen=now, skip=0, why="", acc=s["acc"], usd=round(s["usd"]), top1=round(s["top1"], 3), top3=round(s["top3"], 3), n6=s["n6"], n1=s["n1"],
+             net6=round(s["net6"]), dca=s["dca"], last_h=round(s["last_h"], 2), top=s["top"])
+    ok, why = radar_qualifies(e)
+    if ok:
+        if not e.get("since"):
+            e.update(since=now, ok2=1, okt=now)
+        elif now - e.get("okt", 0) >= 1200:                          # (a second reading must be at least 20 minutes after the first)
+            e.update(ok2=e.get("ok2", 0) + 1, okt=now)
+    else:
+        e.update(since=0, ok2=0, why=why[:80])
+    if ok and e.get("ok2", 0) >= 2:
+        return radar_alert(c, e, now)
+    return False
+
+
+def radar_baskets() -> Counter:
+    """Wallets that are among the biggest accumulators of many coins at once: {wallet: number of coins}."""
+    cnt: Counter = Counter()
+    for e in radar_coins().values():
+        for row in e.get("top") or []:
+            cnt[row[0]] += 1
+    return cnt
+
+
+def radar_known(e: dict) -> list[str]:
+    """Wallets the bot already knows among a coin's biggest accumulators: your watched / VIP wallets and wallets with a good record."""
+    out, scores = [], None
+    for addr, usd, _nb in e.get("top") or []:
+        if scores is None:
+            scores = wallet_scores()
+        st = wallet_stars(addr, scores)
+        rec = stars_text(st) if st is not None else ""          # v3.7: stars instead of the old "N of M good"
+        info = state["watch"].get(addr)
+        if isinstance(info, dict):
+            out.append(f"{md_escape(wallet_label(addr))} ({'VIP' if info.get('vip') else 'watched'}"
+                       + (f", {rec}" if rec else "") + f", {fmt_usd(usd)})")
+            continue
+        g = record_grade(addr, scores)
+        if g in ("proven", "promising"):
+            out.append(f"`{short(addr)}` ({rec or GRADE_ICON[g] + ' ' + g}, {fmt_usd(usd)})")
+    return out
+
+
+def radar_price_line(ch: float) -> str:
+    if ch <= -5:
+        return f"📉 price {ch:+.0f}% in 24h - they are buying a dip"
+    if ch < 5:
+        return f"➖ price {ch:+.0f}% in 24h - quiet buying, nobody chasing it yet"
+    return f"📈 price {ch:+.0f}% in 24h - already moving a bit"
+
+
+def build_radar_message(key: str, pair: dict, e: dict, mc: float, now: float) -> str:
+    base = pair.get("baseToken", {})
+    addr, sym = base.get("address", ""), md_escape(str(base.get("symbol", "?")))
+    liq, vol = num(pair, "liquidity", "usd"), num(pair, "volume", "h24")
+    ref = mc if mc > 0 else 2 * liq
+    share = (e["usd"] / ref) if ref > 0 else 0
+    L = [f"📡 *ACCUMULATION: ${sym}*  |  {CHAINS['robinhood']['name']}", "",
+         f"🧺 *{e['acc']} wallets* bought it in the last {RADAR_HOURS:g}h and kept it - together about *{fmt_usd(e['usd'])}*"
+         + (f" ({share:.2%} of its market cap)" if mc > 0 else f" ({share:.1%} of twice its liquidity - market cap not known)") + ".",
+         f"✋ None of them sold more than {RADAR_MAX_SOLD:.0%} of what they bought. {e['dca']} bought in 3+ steps (patient money); "
+         f"the biggest is {e['top1']:.0%} of the total, the top 3 together {e['top3']:.0%}.",
+         f"🔥 Still going: {e['n6']} of them bought again in the last 6 hours ({fmt_usd(e.get('net6', 0))})"
+         + (f", the latest {e['last_h'] * 60:.0f} min ago" if e.get("last_h", 0) < 3 else "") + ".",
+         radar_price_line(e.get("ch", 0.0))]
+    known = radar_known(e)
+    if known:
+        L.append("👀 Wallets I know in it: " + ", ".join(known[:4]))
+    bask = radar_baskets()
+    nb = sum(1 for row in e.get("top") or [] if bask.get(row[0], 0) >= RADAR_BASKET_COINS)
+    if nb:
+        L.append(f"🧺 {nb} of its {len(e.get('top') or [])} biggest accumulators are 'basket' buyers (they accumulate {RADAR_BASKET_COINS}+ coins at once) - "
+                 "more like a fund than a bet on this coin.")
+    L.append("")
+    L.append(f"💰 Market cap *{fmt_usd(mc)}*" if mc > 0 else "💰 Market cap: not known")
+    L.append(f"💧 liquidity {fmt_usd(liq)} · 📊 24h volume {fmt_usd(vol)}")
+    body = "\n".join(L) + "\n" + chain_note("robinhood")
+    body += (f"📌 I follow this for {follow_text(RADAR_TRACK_HOURS, mc)} (win = +{(RADAR_WIN_X - 1) * 100:.0f}% before -{(1 - RADAR_STOP_X) * 100:.0f}%). "
+             "Accumulation is a clue, not a promise: the buyers can be one person with many wallets, and a coin can still fall.\n"
+             f"\n`{addr}`\n\n[DexScreener](https://dexscreener.com/robinhood/{pair.get('pairAddress', '')}) | [Token]({link('robinhood', 'token', addr)})")
+    return body
+
+
+def radar_alert(c: dict, e: dict, now: float) -> bool:
+    """A coin that has qualified on two readings in a row: one alert (once per RADAR_COOLDOWN_DAYS, RADAR_MAX_PER_DAY a day)."""
+    key = c["key"]
+    cd = state["cooldowns"]
+    quiet = not alert_on("radar")
+    stamps = day_count("rd_ts", now)
+    if now - cd.get("rd:" + key, 0) < RADAR_COOLDOWN_DAYS * 86400 or key in state["steady"]:
+        return False
+    if not quiet and len(stamps) >= RADAR_MAX_PER_DAY:
+        return False
+    try:
+        want = norm_addr("robinhood", c["addr"])
+        pairs = [p for p in fetch_pairs("robinhood", [c["addr"]]) if norm_addr("robinhood", p.get("baseToken", {}).get("address", "")) == want]
+    except requests.RequestException:
+        return False
+    pair = best_live_pair(pairs)
+    if not pair or not clear_to_alert(key, "robinhood", pair):         # (a steady asset - or not checked yet: a later reading tries again)
+        return False
+    mc = pair_mc(key, pair) or num(pair, "fdv")
+    note_mc(key, mc, num(pair, "liquidity", "usd"))
+    m = compute_metrics(key, pair)
+    if not quiet and not send_telegram(build_radar_message(key, pair, e, mc, now)):
+        return False
+    cd["rd:" + key] = now
+    if not quiet:
+        stamps.append(now)
+        bot_stats["radar"] += 1
+    if m:
+        add_record("radar", key, "robinhood", pair, m, "", now,
+                   extra={"th": RADAR_TRACK_HOURS, "wx": RADAR_WIN_X, "sx": RADAR_STOP_X, "n": e["acc"], "usd": round(e["usd"]),
+                          "sig": signals_for(m), "quiet": quiet})
+    log.info("ACCUMULATION radar: %s - %d wallets, %s%s", key, e["acc"], fmt_usd(e["usd"]), " (quiet)" if quiet else "")
+    save_state()
+    return True
+
+
+def radar_tick(force: bool = False):
+    """One round of the radar: rebuild the coin list when it is old, then read the few coins that are due."""
+    if not RADAR_ON or not EVM_RPC.get("robinhood"):
+        return
+    now = time.time()
+    _radar_rt["ticks"] += 1
+    if force or _radar_rt.pop("force", False) or not _radar_rt["cands"] or now - _radar_rt["cand_t"] >= RADAR_LIST_HOURS * 3600:
+        try:
+            n = radar_refresh_candidates(now)
+            log.info("radar: %d coins on the list to read", n)
+        except Exception:
+            log.exception("radar: the coin list could not be built")
+            if not _radar_rt["cands"]:
+                _radar_rt["cand_t"] = now - RADAR_LIST_HOURS * 3600 + 600          # (try again in 10 minutes)
+    due = radar_due(_radar_rt["cands"], now)[:RADAR_COINS_PER_ROUND]
+    if not due:
+        return
+    url = EVM_RPC["robinhood"]
+    bad, bad_t = _rpc_fail.get(url, (0, 0.0))
+    if bad >= 2 and time.time() - bad_t < 120:                       # the VIP looks are having trouble with this node: do not pile on
+        _radar_rt["last_err"] = "the node is busy with the VIP wallets - the radar waits"
+        return
+    try:
+        latest = radar_latest(url)
+    except Exception as ex:
+        _radar_rt["last_err"] = scrub(ex)[:80]
+        return
+    for c in due:
+        try:
+            radar_read_coin(url, c, latest, time.time())
+        except RuntimeError as ex:                                   # the node link is resting: leave it alone for now
+            _radar_rt["last_err"] = scrub(ex)[:80]
+            break
+        except Exception as ex:
+            _radar_rt["last_err"] = scrub(ex)[:80]
+            log.warning("radar: could not read %s: %s", c.get("sym"), scrub(ex))
+            e = radar_coins().setdefault(c["key"], {"first": now})
+            e.update(sym=c["sym"], seen=time.time(), why="could not be read: " + scrub(ex)[:40])
+        time.sleep(0.5)
+    state["radar"]["last_round"] = time.time()
+    radar_prune(now)
+
+
+async def radar_loop():
+    """Every couple of minutes: read a few coins for accumulation (nothing happens until the other loops have started)."""
+    await asyncio.sleep(RADAR_LOOP_START_DELAY)
+    while True:
+        try:
+            await asyncio.to_thread(radar_tick)
+        except Exception:
+            log.exception("radar loop error")
+        await asyncio.sleep(RADAR_ROUND_SECONDS)
+
+
+# --- the /radar command ---
+def radar_fresh_coins() -> list[tuple[str, dict]]:
+    now = time.time()
+    return [(k, e) for k, e in radar_coins().items()
+            if isinstance(e, dict) and e.get("seen") and now - e["seen"] <= RADAR_KEEP_HOURS * 3600 and e.get("acc", 0) > 0]
+
+
+def radar_line(i: int, key: str, e: dict, now: float) -> str:
+    mc = e.get("mc", 0)
+    ref = mc if mc > 0 else 2 * e.get("liq", 0)
+    sh = f" ({e['usd'] / ref:.2%} of MC)" if mc > 0 and ref > 0 else ""
+    return (f"{i}. *${md_escape(str(e.get('sym', '?')))}*" + (f" · MC {fmt_usd(mc)}" if mc > 0 else f" · liq {fmt_usd(e.get('liq', 0))}")
+            + f" - {e['acc']} wallets, {fmt_usd(e['usd'])}{sh}, {e['n6']} still buying (6h), top wallet {e['top1']:.0%}, price {e.get('ch', 0):+.0f}%"
+            + f"\n   `{key.split(':', 1)[1]}`")
+
+
+def radar_list_text() -> str:
+    now = time.time()
+    rows = radar_fresh_coins()
+    rad = state["radar"]
+    if not RADAR_ON:
+        return "📡 The accumulation radar is switched off (RADAR=false on the server)."
+    if not rows:
+        err = str(_radar_rt.get("last_err") or "")
+        return ("📡 *Accumulation radar* - no readings yet. It reads a few Robinhood Chain coins every couple of minutes, so the first full list is "
+                f"ready about {int(RADAR_MAX_COINS / RADAR_COINS_PER_ROUND * RADAR_ROUND_SECONDS / 60) + 3} minutes after start-up.\n"
+                + (f"⚠️ Last problem: {md_escape(err[:90])}\n" if err else "")
+                + "Send /radar <coin address> to read one coin right now.")
+    good, bigone, small, other = [], [], [], 0
+    for k, e in rows:
+        ok, why = radar_qualifies(e)
+        if ok:
+            good.append((k, e))
+        elif e.get("top1", 0) > RADAR_MAX_TOP1 and e.get("acc", 0) >= 15 and e.get("usd", 0) >= RADAR_MIN_NET_USD:
+            bigone.append((k, e))
+        elif radar_is_small_steady(e):
+            small.append((k, e))
+        else:
+            other += 1
+    good.sort(key=lambda x: -x[1]["usd"])
+    bigone.sort(key=lambda x: -x[1]["usd"])
+    small.sort(key=lambda x: -(x[1]["usd"] / max(1.0, x[1]["mc"] if x[1].get("mc", 0) > 0 else 2 * x[1].get("liq", 0))))
+    L = [f"📡 *Accumulation radar* - Robinhood Chain coins that many wallets bought and KEPT in the last {RADAR_HOURS:g}h "
+         f"(read {len(rows)} coins; the oldest reading is {ago(now - min(e['seen'] for _, e in rows))} old)."
+         + ("" if alert_on("radar") else "\n⚠️ The radar alert is switched OFF (/alerts radar on). It still reads and follows quietly.")]
+    if good:
+        L.append("\n*Accumulating now* (" + f"{RADAR_MIN_ACC}+ wallets, not one big buyer, still buying, price not running):")
+        for i, (k, e) in enumerate(good[:8], 1):
+            L.append(radar_line(i, k, e, now))
+    else:
+        L.append("\nNothing meets all the rules right now.")
+    if small:
+        L.append(f"\n*Smaller but steady* (not alerted: fewer than {RADAR_MIN_ACC} wallets, but a patient build-up that is big for the coin):")
+        for i, (k, e) in enumerate(small[:4], 1):
+            L.append(radar_line(i, k, e, now))
+    if bigone:
+        L.append("\n*One big wallet is most of it* (not alerted):")
+        for i, (k, e) in enumerate(bigone[:4], 1):
+            L.append(radar_line(i, k, e, now))
+    L.append(f"\n{other} other coin{'' if other == 1 else 's'} read: too few accumulators, cooling off, running, or falling.")
+    L.append("Launch-day coins (younger than " + f"{RADAR_MIN_AGE_H:g}h" + "), thin pools and stock / wrapped tokens are not read. "
+             "/radar <coin address> reads one coin now · /alerts radar off")
+    out = "\n".join(L)
+    return out if len(out) <= 3800 else out[:3800].rsplit("\n", 1)[0]
+
+
+def radar_check_one(ref: str, notify=None) -> str:
+    """/radar <coin address>: read that one coin now (takes about 20 seconds)."""
+    chain, addr, err = resolve_coin_ref(ref)
+    if err:
+        return err.replace("/check", "/radar")
+    if chain != "robinhood":
+        return "The accumulation radar reads Robinhood Chain coins only (that address is on " + CHAINS[chain]["name"] + ")."
+    url = EVM_RPC.get("robinhood")
+    if not url:
+        return "I have no node link for Robinhood Chain, so I can't read its transfers."
+    want = norm_addr(chain, addr)
+    try:
+        pairs = [p for p in fetch_pairs(chain, [addr]) if norm_addr(chain, p.get("baseToken", {}).get("address", "")) == want]
+    except requests.RequestException:
+        return "DexScreener is busy right now - try again in a minute."
+    pair = best_live_pair(pairs)
+    px = num(pair, "priceUsd") if pair else 0.0
+    if not pair or px <= 0:
+        return "I couldn't find a live trading pool with a price for that address on Robinhood Chain."
+    if notify:
+        notify("🔎 Reading that coin's transfers from the chain now - about 20 seconds.")
+    sym = md_escape(str(pair.get("baseToken", {}).get("symbol", "?")))
+    try:
+        latest = radar_latest(url)
+        s = radar_scan_coin(url, addr, px, latest, budget=RADAR_MAX_CALLS * 2)
+    except RadarBusy:
+        return f"${sym} has too many transfers for me to read politely with the free node. I skipped it."
+    except (RuntimeError, ValueError, requests.RequestException) as ex:
+        return f"I couldn't read ${sym}'s transfers just now ({md_escape(scrub(ex)[:60])}). Try again in a minute."
+    key = sk(chain, addr)
+    mc = pair_mc(key, pair) or num(pair, "fdv")
+    liq = num(pair, "liquidity", "usd")
+    e = {"acc": s["acc"], "usd": s["usd"], "top1": s["top1"], "top3": s["top3"], "n6": s["n6"], "n1": s["n1"], "net6": s["net6"], "dca": s["dca"],
+         "last_h": s["last_h"], "mc": mc, "liq": liq, "ch": num(pair, "priceChange", "h24"), "top": s["top"]}
+    ok, why = radar_qualifies(e)
+    created = num(pair, "pairCreatedAt")
+    age_h = (time.time() * 1000 - created) / 3_600_000 if created else 0.0
+    L = [f"📡 *${sym}* - accumulation over the last {RADAR_HOURS:g}h (read {s['logs']:,} transfers, {s['hubs']} pools / routers found)",
+         f"🧺 {s['acc']} accumulating wallets · {fmt_usd(s['usd'])} net bought" + (f" ({s['usd'] / mc:.2%} of MC)" if mc > 0 else ""),
+         f"✋ biggest wallet {s['top1']:.0%} of it, top 3 {s['top3']:.0%} · {s['dca']} bought in 3+ steps",
+         f"🔥 {s['n6']} bought in the last 6h ({fmt_usd(s['net6'])}), {s['n1']} in the last hour",
+         radar_price_line(e["ch"]),
+         f"💰 MC {fmt_usd(mc) if mc > 0 else 'not known'} · 💧 liquidity {fmt_usd(liq)}" + (f" · ⏱ pool {fmt_age(age_h)} old" if age_h > 0 else "")]
+    known = radar_known(e)
+    if known:
+        L.append("👀 Wallets I know in it: " + ", ".join(known[:4]))
+    if age_h and age_h < RADAR_MIN_AGE_H:
+        L.append(f"⚠️ It is only {fmt_age(age_h)} old: a launch-day coin's buying is mostly pump and wash trading, so I would not call this accumulation.")
+    L.append("✅ This meets every rule of an accumulation alert." if ok and not (age_h and age_h < RADAR_MIN_AGE_H) else f"ℹ️ Not an alert: {why or 'too young'}.")
+    return "\n".join(L)
+
+
+def cmd_radar(args: list[str], notify=None) -> str:
+    sub = args[0].lower() if args else ""
+    if sub in ("on", "off"):
+        set_alert("radar", sub == "on")
+        return "✅ The radar alert is " + ("ON." if sub == "on" else "OFF. It keeps reading and following in silence.")
+    if sub in ("scan", "refresh", "now", "rebuild"):
+        _radar_rt["force"] = True
+        _radar_rt["cand_t"] = 0.0
+        return "🔄 I'll rebuild the list of coins to read in the next minutes."
+    refs = extract_refs(" ".join(args)) if args else []
+    if refs:
+        return radar_check_one(refs[0], notify)
+    return radar_list_text()
+
+
+def radar_status_lines() -> list[str]:
+    """For the status check-in."""
+    try:
+        if not RADAR_ON:
+            return []
+        rows = radar_fresh_coins()
+        good = sorted(((e["usd"], e.get("sym", "?")) for _, e in rows if radar_qualifies(e)[0]), reverse=True)
+        sent = len(_last_day(state["tuning"].get("rd_ts"), time.time()))
+        if not rows:
+            err = str(_radar_rt.get("last_err") or "")
+            if err and time.time() - STARTED_AT > 1800:
+                return [f"📡 Accumulation radar: no coin read yet (last problem: {md_escape(err[:70])}) - I keep trying (/radar)"]
+            return ["📡 Accumulation radar: starting up (it reads a few Robinhood Chain coins every couple of minutes) - /radar"]
+        return [f"📡 Accumulation radar: {len(rows)} coins read lately" + (f", accumulating now: {', '.join('$' + md_escape(str(s)) for _, s in good[:4])}" if good else ", none accumulating right now")
+                + f" · alerts in the last 24h: {sent} (/radar)"]
+    except Exception:
+        log.exception("radar status lines failed")
+        return []
 
 
 # --- the loop that runs it all ---
@@ -4837,12 +6422,14 @@ def analyze_trades(chain: str, trades: list, pool: str, token: str, mc: float, s
         n += 1
         if ts:
             first, last = (min(first, ts) if first else ts), max(last, ts)
-        d = per.setdefault(w, {"w": w, "buy": 0.0, "sell": 0.0, "n": 0, "ns": 0, "pxw": 0.0, "t0": 0.0, "t1": 0.0})
+        d = per.setdefault(w, {"w": w, "buy": 0.0, "sell": 0.0, "n": 0, "ns": 0, "pxw": 0.0, "t0": 0.0, "t1": 0.0, "b0": 0.0, "b1": 0.0})
         d["n"] += 1
         if ts:
             d["t0"], d["t1"] = (min(d["t0"], ts) if d["t0"] else ts), max(d["t1"], ts)
         if kind == "buy":
             d["buy"] += usd
+            if ts:        # v3.8: when the wallet REALLY bought (its first and its latest buy in this look), not when I looked
+                d["b0"], d["b1"] = (min(d["b0"], ts) if d["b0"] else ts), max(d["b1"], ts)
             try:
                 d["pxw"] += float(a.get("price_to_in_usd") or 0) * usd
             except (TypeError, ValueError):
@@ -4881,7 +6468,8 @@ FLOW_MAX_WALLETS = 20        # wallets remembered per coin
 def flow_merge(holder: dict, new: dict, full: dict, now: float):
     """Add what the latest look saw to this coin's running totals per wallet. Small buys that repeat ('$100 here, $100
     there') add up over several looks; each trade is only counted once (the look remembers where the last one ended).
-    Entry = [bought $, sold $, trades, sells, first trade, last trade, price x amount bought, bot flag]."""
+    Entry = [bought $, sold $, trades, sells, first trade, last trade, price x amount bought, bot flag, first buy, last buy]
+    (v3.8: the last two are the times the wallet REALLY made its first and its latest buy)."""
     flow = holder.setdefault("flow", {})
     for w, d in new["per"].items():
         bot = bool(full["per"].get(w, d).get("bot"))
@@ -4893,9 +6481,12 @@ def flow_merge(holder: dict, new: dict, full: dict, now: float):
         if f is None and d["buy"] < FLOW_MIN_USD:
             continue
         t0, t1 = d["t0"] or now, d["t1"] or now
+        b0, b1 = d.get("b0") or 0.0, d.get("b1") or 0.0
         if f is None:
-            flow[w] = [d["buy"], d["sell"], d["n"], d["ns"], t0, t1, d["pxw"], 0]
+            flow[w] = [d["buy"], d["sell"], d["n"], d["ns"], t0, t1, d["pxw"], 0, b0, b1]
         else:
+            while len(f) < 10:        # a note from before v3.8: its first / latest trade stand in for the buy times until a newer look has them
+                f.append(f[4] if len(f) == 8 else f[5])
             f[0] += d["buy"]
             f[1] += d["sell"]
             f[2] += d["n"]
@@ -4903,6 +6494,10 @@ def flow_merge(holder: dict, new: dict, full: dict, now: float):
             f[4] = min(f[4] or t0, t0)
             f[5] = max(f[5], t1)
             f[6] += d["pxw"]
+            if b0:
+                f[8] = min(f[8] or b0, b0)
+            if b1:
+                f[9] = max(f[9], b1)
     horizon = now - FLOW_KEEP_DAYS * 86400
     for w in [w for w, f in flow.items() if f[5] < horizon]:
         del flow[w]
@@ -4913,22 +6508,27 @@ def flow_merge(holder: dict, new: dict, full: dict, now: float):
     for f in flow.values():
         f[0], f[1], f[4], f[5] = round(f[0]), round(f[1]), round(f[4]), round(f[5])
         f[6] = float(f"{f[6]:.6g}")
+        if len(f) > 9:
+            f[8], f[9] = round(f[8]), round(f[9])
 
 
 def flow_accumulators(holder: dict, mc: float, now: float) -> list:
     """Wallets that have bought a meaningful amount of this coin (all their buys add up) and sold little, and bought
-    in the last 3 days: [wallet, bought $, sold $, trades, average price paid, last trade]."""
+    in the last 3 days: [wallet, bought $, sold $, trades, average price paid, time of its latest buy, time of its first buy]
+    (v3.8: the last two are real trade times - before, the 'last trade' was any trade, and nothing else knew the first one)."""
     thr = acc_threshold(mc)
     rows = []
     for w, f in (holder.get("flow") or {}).items():
         try:
             buy, sell, n, ns, t0, t1, pxw = f[:7]
             bot = f[7] if len(f) > 7 else 0
+            b0 = (f[8] if len(f) > 9 else 0) or t0
+            b1 = (f[9] if len(f) > 9 else 0) or t1
         except (TypeError, ValueError):
             continue
-        if bot or buy < thr or sell > BUYER_MAX_SELL_SHARE * buy or now - t1 > 72 * 3600:
+        if bot or buy < thr or sell > BUYER_MAX_SELL_SHARE * buy or now - b1 > 72 * 3600:
             continue
-        rows.append([w, round(buy), round(sell), n, (pxw / buy) if buy > 0 else 0.0, round(t1)])
+        rows.append([w, round(buy), round(sell), n, (pxw / buy) if buy > 0 else 0.0, round(b1), round(b0)])
     rows.sort(key=lambda r: r[1] - r[2], reverse=True)
     return rows
 
@@ -5035,13 +6635,15 @@ def build_bottom_message(chain: str, pair: dict, m: dict, b: dict, held: dict, s
         body += chart_lines(key, c, m, num(pair, "priceUsd"))
     body += buyers_lines(b, key)
     if smart:
-        body += "⭐ Wallets with a good record are accumulating it: " + ", ".join(
-            "*" + md_escape(wallet_label(w)) + "*" for w in smart) + "\n"
+        sc_all = wallet_scores()
+        body += "👀 Wallets I trust (on your list, or earned by results) are accumulating it: " + ", ".join(
+            "*" + md_escape(wallet_label(w)) + "*" + (f" ({stars_text(sc_all[w]['stars'])})" if (sc_all.get(w) or {}).get("stars") is not None else "")
+            for w in smart) + "\n"
     body += wallets_line(held)
     if chain == "robinhood":
         body += ("⚠️ Robinhood Chain is brand new: many of its wallets are airdrop-farming bots, so wallet signals are "
                  "weaker here, and DexScreener's numbers can jump around.\n")
-    body += (f"📌 Tracking this for {BOTTOM_TRACK_HOURS / 24:g} days (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). "
+    body += (f"📌 Tracking this for {follow_text(BOTTOM_TRACK_HOURS, m['mc'])} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). "
              "A base forming is a shortlist, not a buy signal on its own.\n"
              f"ℹ️ Sparsity data through {md_escape(b.get('through') or b.get('upd') or '?')}.\n\n"
              f"`{addr}`\n\n"
@@ -5054,14 +6656,14 @@ def following_coin(key: str) -> bool:
     """Is a call or an experiment (not just a wallet buy) already following this coin?"""
     return any(r["status"] == "open" and r["key"] == key
                and r["kind"] in ("bottom", "bshadow", "shadow", "call", "narrative", "wallet", "chart", "cshadow", "smartbuy",
-                                 "vip", "lowcap", "kol")
+                                 "vip", "lowcap", "kol", "lshadow")
                for r in state["records"])
 
 
 def drop_quiet_follow(key: str, now: float):
     """The coin just got a real alert: its quiet follow-up is closed and not counted, so it is not counted twice."""
     for r in open_records(key):
-        if r["kind"] == "bshadow":
+        if r["kind"] in ("bshadow", "lshadow"):
             r["status"], r["t1"], r["void"] = "expired", now, True
 
 
@@ -5070,7 +6672,7 @@ def maybe_add_bottom_shadow(key: str, chain: str, pair: dict, m: dict, b: dict, 
     3 of 3, 2 of 3, 1 of 3 and 0 of 3, and the alerts."""
     if following_coin(key) or now - state["shadow_cd"].get("b:" + key, 0) < SHADOW_COOLDOWN:
         return
-    if len(open_records(kind="bshadow")) >= MAX_BOTTOM_SHADOWS:
+    if len(fresh_open("bshadow")) >= MAX_BOTTOM_SHADOWS:
         return
     if not clear_to_alert(key, chain, pair):
         return                        # v3.1: a steady asset (or not checked yet)
@@ -5183,13 +6785,37 @@ def open_pick_keys() -> set:
     latest: dict[str, float] = {}
     for d in list(state["book"].values()):
         for p in d.get("picks", []):
-            if p.get("st") == "o":
+            if p.get("st") == "o" and not p.get("ext"):           # (v3.8: buys on extra time are looked at in the slow lane - see slow_keys)
                 latest[p["k"]] = max(latest.get(p["k"], 0.0), p.get("t", 0.0))
     return set(sorted(latest, key=lambda k: -latest[k])[:BOOK_FOLLOW_MAX])
 
 
+def slow_keys() -> set:
+    """v3.8: coins that are only followed on extra time (a call, a wallet's buy, a coin you sent me, past its first window): they are priced
+    every SLOW_LANE_EVERY-th scan, which keeps the scans light however many there are."""
+    out = {r["key"] for r in state["records"] if r["status"] == "open" and r.get("ext")}
+    for d in list(state["book"].values()):
+        for p in d.get("picks", []):
+            if isinstance(p, dict) and p.get("st") == "o" and p.get("ext") and p.get("k"):
+                out.add(p["k"])
+    out |= link_open_keys()
+    return out
+
+
+def row_time(row: list, i: int, now: float) -> int:
+    """A real trade time from position i of an accumulator row (0 = not known / not believable)."""
+    try:
+        t = float(row[i])
+    except (IndexError, TypeError, ValueError):
+        return 0
+    return int(t) if math.isfinite(t) and 0 < t <= now + 600 else 0
+
+
 def book_add(w: str, key: str, chain: str, pair: dict, row: list, now: float) -> bool:
-    """Save one accumulating wallet and its buy: row = [wallet, bought $, sold $, trades, average price paid, last trade]."""
+    """Save one accumulating wallet and its buy: row = [wallet, bought $, sold $, trades, average price paid, time of its latest buy,
+    time of its first buy]. v3.8: the buy remembers when the wallet REALLY bought ('bt' = latest, 'bf' = first; before, only the time I
+    looked was saved, so a buy from weeks ago looked new) and how far the coin had already moved on the wallet's price when I first saw
+    the buy ('lr0': a hit that was already in the bag by then is an 'early' hit, see wallet_scores)."""
     px_now = num(pair, "priceUsd")
     if not w or px_now <= 0 or key in state["steady"]:      # (v3.1: a steady asset says nothing about a wallet)
         return False
@@ -5203,17 +6829,23 @@ def book_add(w: str, key: str, chain: str, pair: dict, row: list, now: float) ->
         d = book[w] = {"first": round(now), "last": round(now), "chain": chain, "seen": 0, "n": 0, "good": 0,
                        "win": 0, "stop": 0, "flat": 0, "picks": []}
     d["last"] = round(now)
+    bt, bf = row_time(row, 5, now), row_time(row, 6, now)
     for p in d["picks"]:
         if p["k"] == key and (p["st"] == "o" or now - (p.get("t1") or p["t"]) < 14 * 86400):
             if p["st"] == "o":
                 p["usd"] = max(p.get("usd", 0), round(row[1]))     # still accumulating: keep the bigger total
+                if bt > num(p, "bt"):
+                    p["bt"] = bt                                   # (the wallet bought again: its latest buy moves forward)
+                if bf and not p.get("bf"):
+                    p["bf"] = bf
             return False
     paid = float(row[4] or 0)
     own = 1 if (paid > 0 and 0.2 <= paid / px_now <= 5.0) else 0   # the wallet's own price, when it makes sense
     px = paid if own else px_now
     d["picks"].append({"k": key, "s": str(pair.get("baseToken", {}).get("symbol", "?"))[:12], "c": chain, "t": round(now),
                        "px": float(f"{px:.6g}"), "pa": pair.get("pairAddress", ""), "usd": round(row[1]), "st": "o",
-                       "mx": 1.0, "lr": round(px_now / px, 3), "own": own, "th": BOOK_TRACK_HOURS})
+                       "mx": 1.0, "lr": round(px_now / px, 3), "lr0": round(px_now / px, 3), "own": own, "th": BOOK_TRACK_HOURS,
+                       "bt": bt, "bf": bf or bt})
     d["seen"] += 1
     while len(d["picks"]) > BOOK_PICKS:       # keep the memory small: the oldest finished buy goes first
         i = next((j for j, p in enumerate(d["picks"]) if p["st"] != "o"), 0 if len(d["picks"]) > 2 * BOOK_PICKS else None)
@@ -5259,12 +6891,37 @@ def book_track(key: str, pair: dict | None, pairs: list | None, now: float):
                 p.setdefault("z", now)
             hi, lo = max(ratio, prev), min(ratio, prev)
             p["mx"] = round(max(p.get("mx", 1.0), lo), 3)
+            if hi > 0:
+                p["mn"] = round(min(p.get("mn", hi), hi), 3)         # v3.8: the lowest point so far (two readings in a row at or under it)
             if hi <= STOP_MULTIPLE and (ratio > 0 or now - p["z"] >= RUG_CONFIRM_SECONDS):
                 book_close(w, p, "s", now)
             elif p["mx"] >= WIN_MULTIPLE:
                 book_close(w, p, "w", now)
-            elif now - p["t"] >= hours * 3600:
+            elif p.get("lo1") and ratio > 0 and hi <= EXTEND_BREAK * p["lo1"]:
+                p["why"] = "broke"                                    # v3.8: on extra time and now under the lowest point of its first window
                 book_close(w, p, "f", now)
+            elif now - p["t"] >= hours * 3600:
+                if not extend_pick(p, ratio, now):
+                    book_close(w, p, "f", now)
+
+
+def extend_pick(p: dict, ratio: float, now: float) -> bool:
+    """v3.8: the same patience for a wallet's buy as for a call (see extend_followup): when its window ends and the coin is still at least
+    EXTEND_ALIVE x the price the wallet paid, it is followed another week - up to a limit that grows with the size of the coin - instead
+    of ending 'flat'. A wallet that bought something slow but good is no longer rated as if it had bought nothing."""
+    if not EXTEND_ON or ratio <= 0 or ratio < EXTEND_ALIVE or num(p, "px") <= 0:
+        return False
+    th = float(p.get("th") or BOOK_TRACK_HOURS)
+    cap = extend_cap_hours(mc_cached(p.get("k", ""), 3600) or 0.0, "pick")
+    if th >= cap - 1:
+        return False
+    if not p.get("ext") and extended_open() >= EXTEND_MAX_OPEN:
+        return False
+    p["th"] = min(th + EXTEND_STEP_HOURS, cap)
+    p["ext"] = int(p.get("ext") or 0) + 1
+    if not p.get("lo1"):
+        p["lo1"] = p.get("mn") or ratio
+    return True
 
 
 def book_close(w: str, p: dict, outcome: str, now: float):
@@ -5293,11 +6950,81 @@ def crowd_weight(crowd: int) -> float:
     return min(1.0, CROWD_FULL_WEIGHT / max(1, crowd))
 
 
+def star_rating(hits: float, misses: float, n: int) -> float | None:
+    """v3.7: 1-3 stars in half steps from a wallet's finished buys: 'hits' (the coin doubled before it halved) and 'misses'
+    (it halved first) among n finished buys; flat buys count in n but not in the share. None = not rated yet.
+    See the STAR_* notes at the top for why the lines sit where they do."""
+    if n < STAR_MIN_BUYS or hits + misses < STAR_MIN_CLEAR - 1e-9:
+        return None
+    share = (hits + STAR_PRIOR * STAR_PRIOR_WEIGHT) / (hits + misses + STAR_PRIOR_WEIGHT)
+    stars = 0.5
+    for line, val in STAR_STEPS:
+        if share >= line - 1e-9:
+            stars = val
+            break
+    for below, cap in STAR_CAPS:
+        if n < below:
+            stars = min(stars, cap)
+            break
+    return stars
+
+
+def stars_text(stars: float | None) -> str:
+    """'⭐⭐½ 2.5/3' (empty for a wallet that is not rated yet)."""
+    if stars is None:
+        return ""
+    full = int(stars + 1e-9)
+    half = stars - full >= 0.5 - 1e-9
+    bar = "⭐" * full + ("½" if half else "")
+    if not full:
+        bar = "½⭐"
+    return f"{bar} {stars:g}/3"
+
+
+def is_early(p: dict) -> bool:
+    """v3.8: was this buy 'early' - already well in profit when I first saw it? The coin was up EARLY_FORWARD_LR x or more on the wallet's own
+    price at that moment ('lr0'), so a doubling from the wallet's price needed only a small move AFTER I could have acted. (A buy saved by an
+    older version has no 'lr0': a win within 30 minutes of being saved counts as early.) Such hits show the wallet bought low - but not that
+    following it would have paid - so they count EARLY_WIN_WEIGHT instead of 1 in the wallet's rating."""
+    lr0 = p.get("lr0")
+    if isinstance(lr0, (int, float)) and not isinstance(lr0, bool):
+        return lr0 >= EARLY_FORWARD_LR
+    t1, t0 = p.get("t1"), p.get("t")
+    return bool(p.get("st") == "w" and isinstance(t1, (int, float)) and isinstance(t0, (int, float)) and t1 - t0 <= EARLY_QUICK_SECONDS)
+
+
+def bot_found(info) -> bool:
+    """A wallet the BOT put on the watch list by itself (a smart wallet found by results, or a low-cap hunter) - not one you added."""
+    return isinstance(info, dict) and bool(info.get("auto") or info.get("tier") == "hunter")
+
+
+def cold_record(w: str, scores: dict | None = None) -> bool:
+    """Has this wallet's record gone clearly bad? MUTE_MIN_BUYS+ finished buys, MUTE_MIN_CLEAR+ of them clear (a hit or a miss), and under
+    MUTE_BELOW stars (half a star = about 1 hit in 5 clear results, or worse)."""
+    sc = (scores if scores is not None else wallet_scores()).get(w)
+    return bool(sc and sc["n"] >= MUTE_MIN_BUYS and sc.get("win", 0) + sc.get("stop", 0) >= MUTE_MIN_CLEAR
+                and sc.get("stars") is not None and sc["stars"] < MUTE_BELOW - 1e-9)
+
+
+def wallet_cold(w: str, scores: dict | None = None) -> bool:
+    """v3.8: 'stop paying attention to wallets that keep losing'. A wallet with a cold record no longer counts toward any alert (a crowd of
+    saved wallets, a wallet with a good record, ...). Its buys are still followed in the background and it counts again by itself when its
+    record recovers. A wallet YOU added is never muted by the bot - wallet_checkup tells you about it instead."""
+    if not MUTE_ON:
+        return False
+    info = state["watch"].get(w)
+    if info is not None and not bot_found(info):
+        return False
+    return cold_record(w, scores)
+
+
 def wallet_scores() -> dict[str, dict]:
     """Per wallet: how many of its followed buys were GOOD (the coin reached SMART_GOOD_MULT x the price it paid, or hit
     the win mark). From the wallet book, plus the older 'whale buy' records. One count per coin.
     'wg' is the number of good buys with each one weighted by crowd_weight (a coin that a big crowd of saved wallets
-    bought counts less); the grades below are judged on that."""
+    bought counts less); the grades below are judged on that.
+    v3.7: also how the finished buys ENDED - 'win' (doubled before halving), 'stop' (halved first), 'flat' - and the star
+    rating made from them ('ww' / 'ws' are the hits and misses with the same crowd weighting)."""
     out: dict[str, dict] = {}
     seen = set()
     crowd = crowd_sizes()
@@ -5308,11 +7035,17 @@ def wallet_scores() -> dict[str, dict]:
         if d.get("n"):
             fin = [p for p in d["picks"] if p.get("st") != "o"]
             wts = [crowd_weight(crowd.get(p["k"], 1)) for p in fin]
+            # v3.8: a hit I could not have followed (the coin was already up on the wallet's price when I first saw the buy) counts less
+            ew = [EARLY_WIN_WEIGHT if is_early(p) else 1.0 for p in fin]
             goods = [bool(p["st"] == "w" or p.get("mx", 1.0) >= SMART_GOOD_MULT) for p in fin]
             old_n = max(0, d["n"] - len(fin))                       # finished buys no longer in the list (the oldest are forgotten)
             old_g = min(old_n, max(0, d.get("good", 0) - sum(goods)))
+            ww = sum(x * e for x, e, p in zip(wts, ew, fin) if p["st"] == "w") + max(0, d.get("win", 0) - sum(1 for p in fin if p["st"] == "w"))
+            ws = sum(x for x, p in zip(wts, fin) if p["st"] == "s") + max(0, d.get("stop", 0) - sum(1 for p in fin if p["st"] == "s"))
             out[w] = {"n": d["n"], "good": d.get("good", 0), "win": d.get("win", 0), "chain": d.get("chain", "solana"),
-                      "wg": round(sum(x for x, g in zip(wts, goods) if g) + old_g, 2),
+                      "stop": d.get("stop", 0), "flat": d.get("flat", 0), "ww": round(ww, 2), "ws": round(ws, 2),
+                      "wg": round(sum(x * e for x, e, g in zip(wts, ew, goods) if g) + old_g, 2),
+                      "early": sum(1 for p in fin if p["st"] == "w" and is_early(p)),
                       "coins": [(p["s"], p["c"], g) for p, g in zip(fin, goods)]}
     for r in state["records"]:
         w = r.get("wallet")
@@ -5324,30 +7057,57 @@ def wallet_scores() -> dict[str, dict]:
         d["n"] += 1
         d["good"] += bool(good)
         d["win"] += r["status"] == "win"
+        d["stop"] = d.get("stop", 0) + (r["status"] == "stop")
+        d["flat"] = d.get("flat", 0) + (r["status"] not in ("win", "stop"))
+        d["ww"] = round(d.get("ww", 0.0) + (r["status"] == "win"), 2)
+        d["ws"] = round(d.get("ws", 0.0) + (r["status"] == "stop"), 2)
         d["wg"] = round(d.get("wg", 0.0) + bool(good), 2)
         d["coins"].append((r["sym"], r["chain"], bool(good)))
+    for d in out.values():
+        d["stars"] = star_rating(d.get("ww", 0.0), d.get("ws", 0.0), d["n"])
     return out
 
 
 def book_grade(w: str, scores: dict | None = None) -> str:
-    """'watched' (on your list), 'proven' (enough good buys), 'promising' (a good start) or '' (nothing yet)."""
-    if w in state["watch"]:
+    """'watched' (on your list), 'cooling' (a wallet the bot put on your list by itself whose results have gone bad), 'proven'
+    (a good record: 2+ stars), 'promising' (a good start) or '' (nothing yet)."""
+    info = state["watch"].get(w)
+    if info is not None:
+        # v3.7: a smart wallet the bot added by itself (not a VIP, not a hunter) whose good run is over stays on the list but stops counting as
+        # a wallet with a good record. v3.8: ANY wallet the bot found (hunters too) whose record keeps losing stops counting (and is taken off
+        # the list at the next check-up) - a much stricter line (half a star), so a hunter with a middling record is not touched.
+        if (bot_found(info) and wallet_cold(w, scores)) or (isinstance(info, dict) and info.get("auto") and cooled_off(w, scores)):
+            return "cooling"
         return "watched"
     return record_grade(w, scores)
+
+
+def cooled_off(w: str, scores: dict | None = None) -> bool:
+    """Has this wallet's record gone bad? STAR_COOL_BUYS+ finished buys, STAR_COOL_CLEAR+ of them clear (a hit or a miss) and
+    fewer than STAR_COOL_BELOW stars. (book_grade only applies it to wallets the bot added to the list by itself.)"""
+    sc = (scores if scores is not None else wallet_scores()).get(w)
+    return bool(sc and sc["n"] >= STAR_COOL_BUYS and sc.get("win", 0) + sc.get("stop", 0) >= STAR_COOL_CLEAR
+                and sc.get("stars") is not None and sc["stars"] < STAR_COOL_BELOW - 1e-9)
 
 
 def grade_of(d: dict | None) -> str:
     """'proven', 'promising' or '' for one wallet's score. Judged on the crowd-weighted good buys (v3.1): a good result on a coin
     that a whole crowd of saved wallets bought barely counts, so a wallet has to be right on coins of its own - while every
-    finished buy, good or bad, counts in full in its hit rate."""
+    finished buy, good or bad, counts in full in its hit rate.
+    v3.7: 'proven' also needs STAR_GOOD stars (touching 1.5x on the way is not enough if the coin then halved), and a wallet that
+    is rated and has under STAR_COOL_BELOW stars is not 'promising' either."""
     if not d or not d["n"]:
         return ""
     wg = float(d.get("wg", d["good"]))
     rate = wg / d["n"]
-    if d["n"] >= SMART_MIN_BUYS and wg >= SMART_MIN_GOOD - 1e-9 and rate >= SMART_MIN_RATE:
+    stars = d["stars"] if "stars" in d else star_rating(d.get("ww", d.get("win", 0)), d.get("ws", d.get("stop", 0)), d["n"])
+    if (d["n"] >= SMART_MIN_BUYS and wg >= SMART_MIN_GOOD - 1e-9 and rate >= SMART_MIN_RATE
+            and stars is not None and stars >= STAR_GOOD - 1e-9):
         return "proven"
-    if wg >= PROMISING_MIN_WEIGHT - 1e-9 and rate >= SMART_MIN_RATE:
-        return "promising"
+    hits, misses = float(d.get("ww", d.get("win", 0))), float(d.get("ws", d.get("stop", 0)))
+    if (wg >= PROMISING_MIN_WEIGHT - 1e-9 and rate >= SMART_MIN_RATE and hits >= PROMISING_MIN_WEIGHT - 1e-9 and hits >= misses
+            and (stars is None or stars >= STAR_COOL_BELOW - 1e-9)):
+        return "promising"           # a good start = at least one real hit (doubled before halving) and no more misses than hits
     return ""
 
 
@@ -5357,20 +7117,51 @@ def record_grade(w: str, scores: dict | None = None) -> str:
 
 
 def trusted_wallet(w: str, scores: dict | None = None) -> bool:
-    """On your watch list, or earned it by results."""
+    """On your watch list (and not cooled off), or earned it by results."""
     return book_grade(w, scores) in ("watched", "proven")
 
 
-GRADE_ICON = {"watched": "⭐", "proven": "🏅", "promising": "🌱"}
+GRADE_ICON = {"watched": "👀", "cooling": "🧊", "proven": "🏅", "promising": "🌱"}
+
+
+def wallet_stars(w: str, scores: dict | None = None) -> float | None:
+    sc = (scores if scores is not None else wallet_scores()).get(w)
+    return sc.get("stars") if sc else None
+
+
+def record_counts(sc: dict) -> str:
+    """'5 doubled, 2 halved, 4 flat' - how a wallet's finished buys ended."""
+    return f"{sc.get('win', 0)} doubled, {sc.get('stop', 0)} halved, {sc.get('flat', 0)} flat"
+
+
+def trusted_points(stars: float | None) -> float:
+    """Smart-money points (of 4, in the /check scorecard) for ONE trusted wallet that is accumulating a coin, by its stars: a good record
+    gets 2, an average one - or none yet - 1.5, a weak one 0.5."""
+    if stars is None:
+        return 1.5
+    if stars >= STAR_GOOD - 1e-9:
+        return 2.0
+    if stars >= STAR_COOL_BELOW - 1e-9:
+        return 1.5
+    return 0.5
+
+
+def wallet_stars_line(sc: dict) -> str:
+    """'⭐⭐½ 2.5/3 · 5 doubled, 2 halved, 4 flat' (or 'not rated yet · ...') for one wallet's score."""
+    st = sc.get("stars")
+    return (stars_text(st) if st is not None else "not rated yet") + " · " + record_counts(sc)
 
 
 def wallet_record_text(w: str, scores: dict | None = None) -> str:
+    """The wallet's stars and how its followed buys ended (v3.7; the old 'N of M good' counted a coin that touched 1.5x and then
+    halved as good, which was too generous)."""
     sc = (scores if scores is not None else wallet_scores()).get(w)
-    g = book_grade(w, scores)
-    rec = f"{sc['good']} of {sc['n']} followed buys good" if sc and sc["n"] else "no finished buys yet"
-    if sc and sc["n"] and sc.get("wg", sc["good"]) < sc["good"] - 0.05:
-        rec += " (a crowd bought those coins too, so they count less)"
-    return (GRADE_ICON.get(g, "") + " " if g else "") + rec
+    if not sc or not sc["n"]:
+        return "no finished buys yet"
+    rec = wallet_stars_line(sc)
+    if sc.get("ww", 0) + sc.get("ws", 0) < sc.get("win", 0) + sc.get("stop", 0) - 0.05:
+        rec += " (coins that many saved wallets bought count less)"
+    return rec
 
 
 def wallet_open_picks(w: str, exclude: str | None = None) -> list[dict]:
@@ -5460,12 +7251,19 @@ def maybe_smart_buy(key: str, chain: str, pair: dict, cap: dict, scores: dict, n
         return False
     if bottom_alert_coming(key, now) or chart_alert_coming(key, now):
         return False                   # that alert is on its way and says who is buying: one message, not two
-    if lowcap_alert_coming(key, now):
+    if lowcap_alert_coming(key, now, scores):
         return False                   # v3.5: the low-cap crowd alert is on its way and says who is buying
-    rows = [r for r in (cap.get("acc") or []) if r and now - (r[5] if len(r) > 5 else cap.get("t", 0)) < 36 * 3600]
+    # v3.8: r[5] is the time of the wallet's latest BUY - it must be recent (SMARTBUY_FRESH_HOURS)
+    rows = [r for r in (cap.get("acc") or []) if r and now - (r[5] if len(r) > 5 else cap.get("t", 0)) < _tune_num("smartbuy_fresh", SMARTBUY_FRESH_HOURS) * 3600]
     strong = [r for r in rows if book_grade(r[0], scores) in ("watched", "proven")]
     soft = [r for r in rows if book_grade(r[0], scores) == "promising"]
     if not (strong or len(soft) >= 2):
+        return False
+    # v3.8: an old coin is skipped (own data: wallet-driven calls on coins over 14-30 days old almost never double) - unless a wallet YOU named is in it
+    age_cap = _tune_num("smartbuy_age", SMARTBUY_MAX_AGE_DAYS)
+    named = any(isinstance(state["watch"].get(r[0]), dict) and not bot_found(state["watch"][r[0]]) for r in strong)
+    if age_cap > 0 and not named and age_days_of(pair) > age_cap:
+        maybe_add_lshadow(key, chain, pair, "sb-old", now)
         return False
     stamps = [t for t in state["tuning"].get("sb_ts", []) if now - t < 86400]
     state["tuning"]["sb_ts"] = stamps
@@ -5498,8 +7296,10 @@ def build_smart_buy_message(chain: str, pair: dict, m: dict, rows: list, scores:
     base = pair.get("baseToken", {})
     addr, sym = base.get("address", ""), md_escape(base.get("symbol", "?"))
     key = sk(chain, addr)
+    good = [r for r in rows if (wallet_stars(r[0], scores) or 0) >= STAR_GOOD - 1e-9]
     L = [f"*🧠 SMART WALLET BUYING: ${sym}*  |  {CHAINS[chain]['name']}", "",
-         ("Wallets with a good record are accumulating it:" if strong else
+         ("Wallets with a good record (" + format(STAR_GOOD, 'g') + "+ stars) are accumulating it:" if good else
+          "Wallets on your list are accumulating it (their record with me is thin or mixed - see the stars):" if strong else
           "Two wallets with a promising start are accumulating it:")]
     for r in rows:
         w, buy, sell = r[0], r[1], r[2]
@@ -5524,7 +7324,7 @@ def build_smart_buy_message(chain: str, pair: dict, m: dict, rows: list, scores:
     if chain == "robinhood":
         body += ("⚠️ Robinhood Chain is brand new: many of its wallets are airdrop-farming bots, so wallet signals are "
                  "weaker here, and DexScreener's numbers can jump around.\n")
-    body += (f"📌 Tracking this for {BOOK_TRACK_HOURS / 24:g} days (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). "
+    body += (f"📌 Tracking this for {follow_text(BOOK_TRACK_HOURS, m['mc'])} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). "
              "A wallet with a record is a clue, not a guarantee - it can be wrong.\n\n"
              f"`{addr}`\n\n"
              f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
@@ -5543,10 +7343,10 @@ def promote_smart_wallets():
             continue
         kind = wallet_kind(w)
         key = w.lower() if kind == "evm" else w
-        if not kind or key in state["watch"] or key in removed or key in EVM_WHALES:
+        if not kind or key in state["watch"] or key in removed or key in EVM_WHALES or recently_demoted(key):
             continue
         info = state["watch"].setdefault(key, {"kind": kind, "t": time.time()})
-        info.update(name=f"smart-{short(key)[:4]}{short(key)[-4:]}", auto=True, good=d["good"], n=d["n"])
+        info.update(name=f"smart-{short(key)[:4]}{short(key)[-4:]}", auto=True, good=d["good"], n=d["n"], stars=d.get("stars"))
         if kind == "solana":
             _sweep["now"] = True
         auto_n += 1
@@ -5554,13 +7354,81 @@ def promote_smart_wallets():
         names = ", ".join(("✅" if g else "▫️") + "$" + md_escape(s) for s, _, g in d["coins"][:6])
         send_telegram(
             f"🧠 *NEW SMART WALLET FOUND*\n\n`{key}`\n"
-            f"{d['good']} of its {d['n']} followed buys were good (the coin rose {SMART_GOOD_MULT:g}x or more from the price it paid): {names}\n"
+            f"Its record with me: {wallet_stars_line(d)}\n"
+            f"Its latest followed buys (✅ = the coin rose {SMART_GOOD_MULT:g}x or more after the wallet bought it): {names}\n"
             f"I'm now watching it like the wallets you add yourself: you'll see it on alerts when it holds a coin"
             + (", and I'll message you when it buys a new coin (I look inside it every few minutes)" if kind == "solana"
                else ", and an alert can fire when it accumulates a coin I'm following")
             + f". Remove it any time with /unwatch.\n"
             f"[Wallet]({link(d['chain'] if d['chain'] in CHAINS else ('solana' if kind == 'solana' else 'ethereum'), 'addr', key)})")
         log.info("smart wallet promoted: %s (%d/%d)", short(key), d["good"], d["n"])
+
+
+def recently_demoted(key: str, now: float | None = None) -> bool:
+    """Did the bot take this wallet off the watch list for losing less than DEMOTE_DAYS ago? (Then it does not come back by itself yet.)"""
+    dem = state["tuning"].get("demoted")
+    t = dem.get(key) if isinstance(dem, dict) else None
+    return isinstance(t, (int, float)) and not isinstance(t, bool) and (time.time() if now is None else now) - t < DEMOTE_DAYS * 86400
+
+
+def demote_wallet(key: str, now: float):
+    """Take a wallet the bot added to the watch list itself off it (the wallet book keeps following its buys). Unlike /unwatch this is not
+    forever: after DEMOTE_DAYS days it can earn its place again if its record has recovered."""
+    state["watch"].pop(key, None)
+    state["accum"].pop(key, None)
+    cur = state["tuning"].get("vip_cur")
+    if isinstance(cur, dict):
+        cur.pop(key, None)
+    buys = state["tuning"].get("vip_buys")
+    if isinstance(buys, dict):
+        buys.pop(key, None)
+    _snaps.pop(key, None)
+    for k in [k for k in list(_hold_cache) if k[0] == key]:
+        _hold_cache.pop(k, None)
+    dem = state["tuning"].get("demoted")
+    if not isinstance(dem, dict):
+        dem = state["tuning"]["demoted"] = {}
+    dem[key] = round(now)
+
+
+def wallet_checkup(now: float):
+    """v3.8: 'stop paying attention to smart wallets that keep losing'. Every few hours: a wallet the BOT put on the watch list (a smart wallet
+    found by results, a low-cap hunter) whose record has gone cold is taken off it - its buys are still followed in the background, and it can
+    come back after DEMOTE_DAYS days if it wins again. A wallet YOU added is never removed by the bot, but you are told once if its record is poor."""
+    if not MUTE_ON:
+        return
+    tun = state["tuning"]
+    if now - num(tun, "checkup_t") < 6 * 3600:
+        return
+    tun["checkup_t"] = now
+    scores = wallet_scores()
+    warned = tun.get("warned")
+    if not isinstance(warned, dict):
+        warned = tun["warned"] = {}
+    dropped, yours = [], []
+    for w, info in list(state["watch"].items()):
+        if not isinstance(info, dict) or not cold_record(w, scores):
+            continue
+        label = wallet_label(w)
+        line = f"• *{md_escape(label)}* `{short(w)}` - {wallet_stars_line(scores[w])}"
+        if bot_found(info):
+            demote_wallet(w, now)
+            dropped.append(line)
+            log.info("wallet taken off the list for losing: %s", short(w))
+        elif now - num(warned, w) > 14 * 86400:
+            warned[w] = round(now)
+            yours.append(line + (f"  → /vip remove {md_escape(label)}" if info.get("vip") else f"  → /unwatch {md_escape(label)}"))
+    for w in [w for w, t in warned.items() if not isinstance(t, (int, float)) or now - t > 60 * 86400]:
+        warned.pop(w, None)
+    if not (dropped or yours):
+        return
+    L = ["🧊 *Wallet check-up*", ""]
+    if dropped:
+        L += [f"I took these off your list and stopped paying attention to them (wallets I had put there myself): their record kept losing. "
+              f"I still follow what they buy in the background, so they can earn their place back after {DEMOTE_DAYS:g} days:"] + dropped[:8] + [""]
+    if yours:
+        L += ["These are wallets YOU added and their record with me is poor. I never remove those on my own - your call:"] + yours[:8] + [""]
+    send_telegram("\n".join(L).rstrip())
 
 
 def book_crowd_note() -> str:
@@ -5595,11 +7463,25 @@ def book_report_lines() -> list[str]:
         out.append(f"🧠 Wallet book: *{s['wallets']}* wallets saved · {s['open']} buys followed · {s['finished']} with finished "
                    f"results · {s['proven']} proven · {s['promising']} promising")
     scores = wallet_scores()
-    bestw = sorted(((w, d) for w, d in scores.items() if grade_of(d)),
-                   key=lambda kv: (-kv[1].get("wg", kv[1]["good"]) / kv[1]["n"], -kv[1].get("wg", kv[1]["good"])))[:4]
+    bestw = sorted(((w, d) for w, d in scores.items() if d.get("stars") is not None and d["stars"] >= STAR_GOOD - 1e-9),
+                   key=lambda kv: (-kv[1]["stars"], -kv[1]["n"]))[:4]
     if bestw:
-        out.append("   Best so far (good/finished buys, crowded coins counted less): " + ", ".join(
-            f"{short(w)} {d['good']}/{d['n']}" for w, d in bestw))
+        out.append("   Best rated so far (stars out of 3, from buys that doubled before halving; /stars explains): " + ", ".join(
+            f"{short(w)} {stars_text(d['stars'])} ({d.get('win', 0)} doubled, {d.get('stop', 0)} halved)" for w, d in bestw))
+    try:                                                    # v3.8: how many wallet "wins" were already in the bag, and who stopped counting
+        wins_all = [p for d in state["book"].values() for p in d.get("picks", []) if isinstance(p, dict) and p.get("st") == "w"]
+        early_n = sum(1 for p in wins_all if is_early(p))
+        cold = [w for w in scores if cold_record(w, scores)]
+        off = [w for w in (state["tuning"].get("demoted") or {}) if w not in state["watch"] and recently_demoted(w)] \
+            if isinstance(state["tuning"].get("demoted"), dict) else []
+        if wins_all and early_n:
+            out.append(f"   {early_n} of the {len(wins_all)} wallet wins were mostly done before I first saw the buy - they count "
+                       f"{EARLY_WIN_WEIGHT:g} of a win each in the stars.")
+        if cold:
+            out.append(f"   🧊 {len(cold)} wallet{'' if len(cold) == 1 else 's'} with a losing record no longer {'counts' if len(cold) == 1 else 'count'} toward any alert"
+                       + (f" ({len(off)} taken off your list; /stars)" if off else " (/stars)"))
+    except Exception:
+        log.exception("wallet quality report lines failed")
     crowd = book_crowd_note()
     if crowd:
         out.append(crowd)
@@ -5786,7 +7668,7 @@ def chart_support(key: str, c: dict) -> tuple[float, list[str]]:
         trusted = [r[0] for r in acc if trusted_wallet(r[0], scores)]
         if trusted:
             bonus += 15
-            why.append(f"{len(trusted)} wallet(s) with a good record are accumulating it")
+            why.append(f"{len(trusted)} wallet(s) I trust (on your list, or with a good record) are accumulating it")
     return bonus, why
 
 
@@ -5852,7 +7734,7 @@ def build_chart_message(chain: str, pair: dict, m: dict, c: dict, why: list[str]
     if chain == "robinhood":
         body += ("⚠️ Robinhood Chain is brand new: many of its wallets are airdrop-farming bots, so wallet signals are "
                  "weaker here, and DexScreener's numbers can jump around.\n")
-    body += (f"📌 Tracking this for {CHART_TRACK_HOURS / 24:g} days (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). "
+    body += (f"📌 Tracking this for {follow_text(CHART_TRACK_HOURS, m['mc'])} (win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x). "
              "A chart shape is a hunch to test, not a promise - the report will show which shapes really paid.\n\n"
              f"`{addr}`\n\n"
              f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | "
@@ -5864,7 +7746,7 @@ def maybe_add_chart_shadow(key: str, chain: str, pair: dict, m: dict, c: dict, b
     """Follow a chart setup quietly when it did not earn an alert, so the report can compare it with the alerts."""
     if following_coin(key) or now - state["shadow_cd"].get("c:" + key, 0) < 3 * 86400:
         return
-    if len(open_records(kind="cshadow")) >= MAX_CHART_SHADOWS:
+    if len(fresh_open("cshadow")) >= MAX_CHART_SHADOWS:
         return
     if not clear_to_alert(key, chain, pair):
         return                        # v3.1: a steady asset (or not checked yet)
@@ -6039,7 +7921,8 @@ def capture_pass(cands: list, now: float, caps: list):
         m = compute_metrics(key, pair)
         if not m or m["traders"] < 100:                      # too few trades in a day to learn anything from
             continue
-        todo.append(((800 if low_in else 500 if hot else 0) + c.get("score", 0) + 10 * c.get("signs", 0) + min(20.0, m["vol_ratio"] * 10),
+        young = 40 if 0 < m["age_h"] <= 14 * 24 else 15 if 0 < m["age_h"] <= 30 * 24 else 0      # v3.8: young coins pay best in my data: their buyers are looked at first
+        todo.append(((800 if low_in else 500 if hot else 0) + c.get("score", 0) + 10 * c.get("signs", 0) + min(20.0, m["vol_ratio"] * 10) + young,
                      key, chain, pair, m, c))
     todo.sort(key=lambda x: -x[0])
     for _, key, chain, pair, m, holder in todo:
@@ -6112,7 +7995,7 @@ def cmd_bottoms() -> str:
                 acc = [r for r in cap.get("acc", []) if r]
                 if acc:
                     top = any(trusted_wallet(r[0], scores) for r in acc)
-                    bits.append(f"{len(acc)} wallet(s) accumulating" + (" ⭐" if top else ""))
+                    bits.append(f"{len(acc)} wallet(s) accumulating" + (" (incl. one I trust 👀)" if top else ""))
                 c = state["charts"].get(k) or {}
                 if c.get("ok") and c.get("pat"):
                     bits.append(f"chart: {PATTERN_LABEL.get(c['pat'], c['pat'])} {c.get('score', 0)}")
@@ -6137,7 +8020,7 @@ def cmd_smart() -> str:
          f"aside) is saved in the background. I follow each buy from the price that wallet paid for {BOOK_TRACK_HOURS / 24:g} days "
          f"(win = {WIN_MULTIPLE:g}x before {STOP_MULTIPLE:g}x; good = {SMART_GOOD_MULT:g}x or more).",
          f"Right now: *{s['wallets']}* wallets saved · {s['open']} buys being followed · {s['finished']} wallets with finished results · "
-         f"*{s['proven']}* proven · {s['promising']} promising."]
+         f"*{s['proven']}* proven ({format(STAR_GOOD, 'g')}+ stars) · {s['promising']} promising. What the stars mean: /stars"]
     # wallets whose open buys are up right now
     up = []
     for w, d in list(state["book"].items()):
@@ -6157,25 +8040,89 @@ def cmd_smart() -> str:
             L.append(f"• `{w}` ${md_escape(p['s'])} {lr - 1:+.0%}" + (f" · MC {fmt_usd(mcs[p['k']])}" if mcs.get(p["k"]) else "")
                      + f" (bought {fmt_usd(p.get('usd', 0))}) · {wallet_record_text(w, scores)}")
     if auto:
-        L.append("\n*Earned a place on your watch list by results:*")
+        L.append("\n*Put on your watch list by the bot, from results:*")
         for w, d in auto[:8]:
-            L.append(f"• *{md_escape(wallet_label(w))}* {d.get('good', '?')}/{d.get('n', '?')} good\n   `{w}`")
+            sc = scores.get(w)
+            cool = " · 🧊 cooling off (its record has slipped; it no longer counts as a good record)" if book_grade(w, scores) == "cooling" else ""
+            L.append(f"• *{md_escape(wallet_label(w))}* " + (wallet_stars_line(sc) if sc else f"{d.get('good', '?')}/{d.get('n', '?')} good when added")
+                     + cool + f"\n   `{w}`")
     prom = sorted(((w, d) for w, d in scores.items() if book_grade(w, scores) == "promising" and w not in state["watch"]),
-                  key=lambda kv: (-kv[1]["good"], kv[1]["n"]))[:5]
+                  key=lambda kv: (-(kv[1].get("stars") or 0), -kv[1]["good"], kv[1]["n"]))[:5]
     if prom:
-        L.append("\n*Promising* (a good buy or more, not enough history yet):")
+        L.append("\n*Promising* (a good start, not enough history to rate it yet):")
         for w, d in prom:
-            L.append(f"• {d['good']}/{d['n']} good: " + ", ".join("$" + md_escape(x) for x, _, g in d["coins"][:4] if g) + f"\n   `{w}`")
+            L.append(f"• {wallet_stars_line(d)}: " + ", ".join("$" + md_escape(x) for x, _, g in d["coins"][:4] if g) + f"\n   `{w}`")
     if not (up or auto or prom):
         L.append("\nNo wallet has earned a place yet. Results come in over the next days as the buys I'm following play out.")
     if multi:
         L.append("\n*Buying more than one coin right now* (worth a look, not proof):")
         for w, ps in multi:
-            L.append(f"• `{w}`{' ⭐' if w in state['watch'] else ''}\n   " + ", ".join(
+            L.append(f"• `{w}`{' 👀' if w in state['watch'] else ''}\n   " + ", ".join(
                 f"${md_escape(p['s'])} ({fmt_usd(p.get('usd', 0))}" + (f", MC {fmt_usd(mcs[p['k']])}" if mcs.get(p["k"]) else "") + ")"
                 for p in ps[:4]))
     L.append("\nWhich coins they are buying right now: /coins. Wallets you add yourself: /watch <address> <name>. "
              "Who is buying one coin: /buyers <address>.")
+    out = "\n".join(L)
+    return out if len(out) <= 3800 else out[:3800].rsplit("\n", 1)[0]
+
+
+def cmd_stars() -> str:
+    """/stars (v3.7) - what the 1-3 stars mean, the wallets on your list with their stars, and the best rated wallets that are not on it."""
+    scores = wallet_scores()
+    L = ["⭐ *Wallet stars (out of 3)*", "",
+         f"I follow every buy a wallet makes for {BOOK_TRACK_HOURS / 24:g} days. A buy is a *hit* if the coin doubled before it halved, a *miss* if it "
+         "halved first, and *flat* if it did neither (flat buys are shown, but count neither way). The stars come from how many of the clear results "
+         "were hits - and winning just 1 time in 3 already breaks even, so the lines sit lower than 'most of the time':",
+         "⭐⭐⭐ 3 - about 7 hits in 10 (excellent)",
+         "⭐⭐½ 2.5 - about 6 in 10",
+         "⭐⭐ 2 - about 5 in 10 (a good record)",
+         "⭐½ 1.5 - about 4 in 10 (around break-even)",
+         "⭐ 1 - about 2 to 3 in 10 (more misses than hits)",
+         "½⭐ 0.5 - mostly misses",
+         f"That is for a wallet with about 20 clear results. With fewer, I ask for more proof (3 lucky buys can't earn 3 stars): 2 stars is the most "
+         f"before {STAR_CAPS[0][0]} finished buys, 2.5 before {STAR_CAPS[1][0]}. Under {STAR_MIN_BUYS} finished buys it says 'not rated yet'.",
+         f"A hit that was mostly done before I first saw the buy (the coin was already up {EARLY_FORWARD_LR:g}x on the wallet's price) shows the wallet "
+         f"bought low, but not that following it would have paid - so it counts {EARLY_WIN_WEIGHT:g} of a hit, not a whole one."]
+    rows = []
+    for w, info in state["watch"].items():
+        if isinstance(info, dict):
+            rows.append((w, scores.get(w)))
+    rows.sort(key=lambda t: (-(t[1]["stars"] if t[1] and t[1].get("stars") is not None else -1), -(t[1]["n"] if t[1] else 0)))
+    if rows:
+        L.append(f"\n👀 *Wallets on your list* ({len(rows)})")
+        for w, sc in rows[:12]:
+            cool = (" · 🧊 cooling off" + (" - comes off your list at my next check-up" if cold_record(w, scores) else "")) if book_grade(w, scores) == "cooling" else ""
+            if not cool and cold_record(w, scores) and not bot_found(state["watch"].get(w)):
+                cool = " · ⚠️ poor record - your call (/unwatch)"
+            L.append(f"• {md_escape(wallet_label(w))}: " + (wallet_stars_line(sc) if sc and sc["n"] else "no finished buys yet") + cool)
+        if len(rows) > 12:
+            L.append(f"   ...and {len(rows) - 12} more (/wallets lists them all)")
+        if any(book_grade(w, scores) == "cooling" for w, _ in rows):
+            L.append("🧊 = a wallet I added to your list myself whose results have slipped, so it no longer counts as a good record. If it keeps "
+                     f"losing (half a star after {MUTE_MIN_BUYS}+ finished buys) it comes off your list at my next check-up (every 6 hours) and no longer counts "
+                     f"toward any alert. I still follow what it buys, and it can earn its place back after {DEMOTE_DAYS:g} days. "
+                     "A wallet you added yourself is never removed by me - I only warn you.")
+    dem = state["tuning"].get("demoted")
+    off = [w for w in (dem if isinstance(dem, dict) else {}) if w not in state["watch"] and recently_demoted(w)]
+    if off:
+        L.append(f"\n🧊 *Taken off your list for losing* ({len(off)}) - still followed in the background:")
+        for w in off[:6]:
+            L.append(f"• `{short(w)}`: " + (wallet_stars_line(scores[w]) if scores.get(w) and scores[w]["n"] else "no finished buys"))
+    best = sorted(((w, d) for w, d in scores.items() if w not in state["watch"] and d.get("stars") is not None and d["stars"] >= STAR_GOOD - 1e-9),
+                  key=lambda kv: (-kv[1]["stars"], -kv[1]["n"]))[:5]
+    if best:
+        L.append("\n🔎 *Best rated wallets that are not on your list* (follow one with /watch <address> <name>)")
+        for w, d in best:
+            L.append(f"• `{w}`\n   {wallet_stars_line(d)}")
+    else:
+        L.append(f"\n🔎 No wallet outside your list has earned {STAR_GOOD:g} stars yet. Ratings fill in as the buys I follow finish (7 days each).")
+    dist = Counter(d["stars"] for d in scores.values() if d.get("stars") is not None)
+    unrated = sum(1 for d in scores.values() if d.get("stars") is None and d["n"])
+    if dist or unrated:
+        L.append("\n📊 Wallets by stars: " + " · ".join(f"{k:g}: {dist[k]}" for k in (3.0, 2.5, 2.0, 1.5, 1.0, 0.5) if dist.get(k))
+                 + (f" · not rated yet: {unrated}" if unrated else ""))
+    L.append("\nThe stars describe the last few weeks in this market. A wallet that shone when everything was pumping can look poor in a cold "
+             "market, so treat them as a rough guide, not a promise.")
     out = "\n".join(L)
     return out if len(out) <= 3800 else out[:3800].rsplit("\n", 1)[0]
 
@@ -6264,7 +8211,7 @@ def cmd_coins() -> str:
     paid = book_paid_off()
     mcs = live_mcs([c["key"] for c in rows] + [c["key"] for c in paid])      # v3.5: market cap next to every coin
     if rows:
-        L.append("Open buys from the last 3 days. 🏅 = a wallet with a proven record or one you watch, 🌱 = a promising start. "
+        L.append("Open buys from the last 3 days. 🏅 = a wallet with a good record (2+ stars) or one you watch, 🌱 = a promising start (/stars explains). "
                  f"MC = the coin's market cap now (a low cap is {fmt_usd(lowcap_limit())} or less).")
         L += [coin_row(i, c, now, mcs) for i, c in enumerate(rows, 1)]
     else:
@@ -6307,7 +8254,8 @@ def cmd_buyers(ref: str) -> str:
     scores = wallet_scores()
     for d in info["acc"][:BOOK_ADD_PER_COIN]:           # everything I see is saved in the wallet book too
         try:
-            book_add(d["w"], key, chain, pair, [d["w"], d["buy"], d["sell"], d["n"], d["px"], info["last"] or now_], now_)
+            book_add(d["w"], key, chain, pair, [d["w"], d["buy"], d["sell"], d["n"], d["px"],
+                                                d.get("b1") or d.get("t1") or 0, d.get("b0") or d.get("t0") or 0], now_)
         except Exception:
             log.exception("wallet book error")
     if not info["n"]:
@@ -6323,7 +8271,7 @@ def cmd_buyers(ref: str) -> str:
     if not info["top"]:
         L.append("No wallet is net-buying in this window.")
     for i, d in enumerate(info["top"][:8], 1):
-        star = " ⭐" if d["w"] in state["watch"] else ""
+        star = " 👀" if d["w"] in state["watch"] else ""          # 👀 = on your watch list (v3.7: ⭐ is now only used for the rating)
         acc = " 🟢accumulating" if d in info["acc"] else ""
         rec = wallet_record_text(d["w"], scores) if (book_grade(d["w"], scores) or (scores.get(d["w"]) or {}).get("n")) else ""
         L.append(f"{i}. `{d['w']}`{star}{acc}\n    bought {fmt_usd(d['buy'])} in {d['n']} trade{'s' if d['n'] != 1 else ''}"
@@ -6332,7 +8280,7 @@ def cmd_buyers(ref: str) -> str:
                  + (f"\n    record: {rec}" if rec else "")
                  + f"  [wallet]({link(chain, 'addr', d['w'])})")
     L.append("\nThese are wallets that bought recently - not proof they are smart. /watch <address> <name> follows one; "
-             "the bot scores wallets it follows by what happens next.")
+             "the bot scores wallets it follows by what happens next (⭐ = that rating out of 3, /stars explains; 👀 = on your watch list).")
     return "\n".join(L)
 
 
@@ -6403,13 +8351,24 @@ HELP_TEXT = (
     "*Paste a coin's contract address* (up to 3 at a time, or a DexScreener link) and I'll give it a scorecard out of 10: wallets "
     "with a record buying it, the bottom signs, the chart shape, liquidity and volume, red flags, and how each sign has paid so far. "
     "It is a checklist, not a prediction. I follow every coin you ask about and later compare its score with what happened.\n\n"
-    "/vip - the named wallets (cryptoklotz, 0xdetweiler, unipcs and the low-cap hunters I find). When one buys a low-cap coin I ping you "
+    "/vip - the named wallets (cryptoklotz, 0xdetweiler, unipcs, notanicecat69, angery and the low-cap hunters I find). When one buys a low-cap coin I ping you "
     "loud and repeat it. /vip add `<address>` `<name>` adds one, /vip remove `<name>` takes it off the list\n"
-    "/lowcap - what counts as a low cap (now under $1M); /lowcap 500k changes it\n"
+    "/vip style - 🎯 a picky wallet (buys few coins, so each buy means more) gets the loud ping on bigger coins too, a 🔕 sprayer (buys everything) "
+    "gets a silent message. I judge it from how many different coins a wallet buys, or you set it: /vip style `<name>` picky|spray|normal|auto "
+    "(or /vip add `<address>` `<name>` picky)\n"
+    "/radar - 📡 coins on Robinhood Chain that many wallets keep buying and holding (accumulation); /radar `<coin address>` reads one coin now; "
+    "/alerts radar off silences the alert\n"
+    "/lowcap - what counts as a low cap (now under $1M); /lowcap 500k changes it. The low-cap crowd alert only fires for a young coin whose "
+    "wallets bought it in the last day: /lowcap age 30 and /lowcap fresh 12 change those two limits\n"
+    "/links - 📌 the coins you sent me: the market cap you sent each at, where it is now, and the wallets I found buying early when one "
+    "went 2x or more. Send a coin again any time and I tell you how it did since\n"
     "/shill `<coin address>` - put a coin unipcs shilled on the dip-watch; /kol lists the dip-watch (I alert when a coin on it is down 60-80% from its high)\n"
     "/coins - which coins the saved wallets are buying right now (with each coin's market cap), and which paid off lately\n"
     "/smart - the wallet book: every accumulating wallet I have saved, who is winning, who earned a place on your list\n"
-    "/alerts - which alerts are on; switch one with /alerts rerun off (names: vip, lowcap, kol, smart, wallet, bottom, chart, rerun, narrative)\n"
+    "/stars - ⭐ what the 1 to 3 star rating of a wallet means (a buy is a hit when the coin doubles before it halves; a hit that was mostly "
+    "done before I first saw the buy counts less), plus your wallets and the best rated ones with their stars. A wallet I added myself "
+    "that keeps losing is taken off your list; one you added stays, and I warn you about it\n"
+    "/alerts - which alerts are on; switch one with /alerts rerun off (names: vip, radar, lowcap, kol, smart, wallet, bottom, chart, rerun, narrative)\n"
     "/data - sends you a fresh copy of my memory file (attach it when you ask Claude what worked)\n"
     "/backup - sends my memory file now, plus your wallet list as lines to paste back. I also leave a 🗄 safety copy in this chat "
     "before every update and once a week. To restore, just send me one of those files here: I only add what is missing and "
@@ -6533,9 +8492,16 @@ def score_coin(m: dict, pair: dict, c: dict | None, b: dict | None, cap: dict | 
         lines.append("▫️ couldn't look at who is buying just now (the trade data was busy) - ask again in a minute")
     else:
         if strong:
-            p += 2.0
-            lines.append(f"✅ {len(strong)} wallet(s) with a good record are accumulating it: "
-                         + "; ".join(f"`{r[0]}` ({wallet_record_text(r[0], scores)}, bought {fmt_usd(r[1])})" for r in strong[:2]))
+            # v3.7: the points follow the wallet's star rating - a wallet on your list with a weak record no longer scores like a proven one
+            best = max(trusted_points(wallet_stars(r[0], scores)) for r in strong)
+            p += best
+            who = "; ".join(f"`{r[0]}` ({wallet_record_text(r[0], scores)}, bought {fmt_usd(r[1])})" for r in strong[:2])
+            if best >= 2.0:
+                lines.append(f"✅ {len(strong)} wallet(s) with a good record ({format(STAR_GOOD, 'g')}+ stars) are accumulating it: {who}")
+            elif best >= 1.5:
+                lines.append(f"✅ {len(strong)} wallet(s) you watch (or earned a place) are accumulating it; their record with me is average or not rated yet: {who}")
+            else:
+                lines.append(f"▫️ {len(strong)} wallet(s) you watch are accumulating it, but their record with me is weak: {who}")
         elif len(soft) >= 2:
             p += 1.5
             lines.append(f"✅ {len(soft)} wallets with a promising start are accumulating it: "
@@ -6694,15 +8660,332 @@ def follow_checked(key: str, chain: str, pair: dict, m: dict, sc: dict, now: flo
                 + f") - now {mine.get('final', 1.0):.2f}x of that price, best {mine.get('best', 1.0):.2f}x.")
     add_record("check", key, chain, pair, m, "", now,
                extra={"th": CHECK_TRACK_HOURS, "score": sc["total"], "flags": len(sc["flags"]), "grp": sc["pts"]})
-    return (f"📌 I'll follow it quietly for {CHECK_TRACK_HOURS / 24:g} days from {fmt_usd(m['mc'])} (win = {WIN_MULTIPLE:g}x before "
+    return (f"📌 I'll follow it quietly for {follow_text(CHECK_TRACK_HOURS, m['mc'], 'check')} from {fmt_usd(m['mc'])} (win = {WIN_MULTIPLE:g}x before "
             f"{STOP_MULTIPLE:g}x) and add the result to the track record above.")
 
 
-def scorecard_text(chain: str, addr: str, pair: dict, m: dict, key: str, sc: dict, follow: str) -> str:
+# ----------------------------------------------------------------------------
+# v3.8 - THE COINS YOU SEND: the market cap each one was sent at is remembered, the coin is followed in the background (up to
+# EXTEND_LINK_DAYS days), and when it reaches LINK_LOOK_X times that market cap I look at who is in it - the wallets that were there early are saved
+# in the wallet book (as early hits, which count for little until they win again) and you get a message. Send it again and you see what happened since.
+# ----------------------------------------------------------------------------
+def link_open_keys() -> set:
+    out = set()
+    for k, e in list(state["links"].items()):
+        if isinstance(e, dict) and e.get("st") == "open":
+            if k in state["steady"]:
+                e["st"] = "ended"              # (a coin that turned out to barely move is not a runner: it is no longer followed)
+                continue
+            out.add(k)
+    return out
+
+
+def link_prune(now: float):
+    links = state["links"]
+    cutoff = now - LINK_KEEP_DAYS * 86400
+    for k in [k for k, e in links.items() if not isinstance(e, dict) or (e.get("st") != "open" and num(e, "tl") < cutoff)]:
+        del links[k]
+    if len(links) >= LINK_MAX:
+        for k in sorted(links, key=lambda k_: (links[k_].get("st") == "open", num(links[k_], "tl")))[:len(links) - LINK_MAX + 1]:
+            del links[k]
+
+
+def link_state_text(e: dict) -> str:
+    return {"open": "still following it", "stop": "I stopped following it after it fell to half or less",
+            "ended": "I stopped following it" + (" after it broke under its low" if e.get("why") == "broke" else " (time ran out)")}.get(e.get("st"), "")
+
+
+def link_snapshot(key: str) -> list:
+    """Who was accumulating the coin around the time you sent it (the latest look at its buyers): [[wallet, bought $, average price paid]]."""
+    cap = cap_of(key)
+    return [[r[0], r[1], float(f"{float(r[4] or 0):.6g}")] for r in ((cap or {}).get("acc") or [])[:LINK_WALLETS_KEPT]
+            if r and len(r) > 4 and isinstance(r[0], str)]
+
+
+def link_note(key: str, chain: str, pair: dict, m: dict, now: float) -> str:
+    """Called when you send a coin. First time: remember its market cap and price (and who was accumulating it). Again: say what happened since
+    you first sent it, and - when it is up LINK_LOOK_X times or more - look at who is in it."""
+    if not LINK_ON or key in state["steady"]:
+        return ""
+    px = num(pair, "priceUsd")
+    links = state["links"]
+    e = links.get(key)
+    if not isinstance(e, dict) or num(e, "mc0") <= 0:
+        link_prune(now)
+        links[key] = {"sym": str(pair.get("baseToken", {}).get("symbol", "?"))[:14], "chain": chain, "t0": now, "tl": now, "tr": now,
+                      "mc0": m["mc"], "p0": px, "pa": pair.get("pairAddress", ""), "n": 1, "last": m["mc"], "max_mc": m["mc"],
+                      "min_mc": m["mc"], "st": "open", "ms": 0, "look": 0, "w0": link_snapshot(key)}
+        return (f"📌 *Saved:* you sent this at a market cap of *{fmt_usd(m['mc'])}*. I keep an eye on it in the background (up to "
+                f"{EXTEND_LINK_DAYS:g} days). If it reaches {LINK_LOOK_X:g}x that, I look at who is in it and message you; send it again any time "
+                "to see how it did since.")
+    e["n"] = int(num(e, "n")) + 1
+    e["tl"] = now
+    cur = read_mc(e, m["mc"], pair, [pair])
+    cur = m["mc"] if cur is None or cur <= 0 else cur
+    x = cur / e["mc0"]
+    best = max(num(e, "max_mc"), cur) / e["mc0"]
+    L = [f"🔁 *You first sent this {ago(now - e['t0'])} ago*, at a market cap of *{fmt_usd(e['mc0'])}* (you have sent it {e['n']} times). "
+         f"Now *{fmt_usd(m['mc'])}* = *{x:.2f}x* what it was then (best I saw: {best:.2f}x)."]
+    if e.get("st") != "open":
+        L.append(f"   {link_state_text(e).capitalize()}" + (" - but it is above where it was when you sent it, so I follow it again." if x > STOP_MULTIPLE * 1.2 else "."))
+        if x > STOP_MULTIPLE * 1.2:
+            e.update(st="open", tr=now)
+            for f in ("lo1", "why", "z"):
+                e.pop(f, None)
+    e["last"] = cur
+    e["max_mc"] = max(num(e, "max_mc"), cur if x >= 1 else 0)
+    if best >= LINK_LOOK_X:
+        try:
+            found = wallet_look(key, chain, pair, m, e, now)
+            # (you are being shown the look now, so the scan does not send the same milestone again a minute later)
+            e["ms"] = max(int(num(e, "ms")), 1 + (best >= LINK_LOOK_X * 2.5) + (best >= LINK_LOOK_X * 5))
+        except Exception:
+            log.exception("wallet look failed for %s", key)
+            found = None
+        L += look_lines(e, found, pair, now)
+    return "\n".join(L)
+
+
+def wallet_look(key: str, chain: str, pair: dict, m: dict, e: dict, now: float, capture: bool = True) -> list[dict]:
+    """Who was in this coin EARLY? Looks at the latest trades once more (when they have not been read in the last 3 hours) and puts together
+    everything I have on the coin's wallets - the running totals of the last days, the wallet book, who was accumulating it when you sent it,
+    the radar's readings - then keeps the wallets that paid up to LINK_EARLY_X times the price you sent it at (or bought before you sent it),
+    bought at least $300 and still hold most of it. The best of them are saved in the wallet book as an early hit. -> [{w, usd, paid, ...}]"""
+    px_now, p0 = num(pair, "priceUsd"), num(e, "p0")
+    if capture and BUYER_CAPTURE and GECKO_NETWORK.get(chain) and pair.get("pairAddress") and gecko_backlog() < 45:
+        cap = cap_of(key)
+        if not cap or now - cap.get("t", 0) > 3 * 3600:
+            holder = bottom_entry(key) or state["charts"].setdefault(
+                key, {"t": 0, "ok": None, "pat": "", "score": 0, "signs": 0, "sym": str(pair.get("baseToken", {}).get("symbol", "?"))[:14], "chain": chain})
+            try:
+                capture_buyers(key, chain, pair, m, holder, now)
+            except Exception:
+                log.exception("buyer look-up for the wallet look failed")
+    cands: dict[str, dict] = {}
+
+    def add(w, usd, paid=0.0, first=0.0, last=0.0, sold=0.0):
+        if not isinstance(w, str) or not w or usd <= 0:
+            return
+        c = cands.get(w)
+        if c is None:
+            cands[w] = {"w": w, "usd": float(usd), "paid": float(paid or 0), "first": float(first or 0), "last": float(last or 0), "sold": float(sold or 0)}
+            return
+        if usd > c["usd"]:
+            c["usd"] = float(usd)
+        if paid and not c["paid"]:
+            c["paid"] = float(paid)
+        if first and (not c["first"] or first < c["first"]):
+            c["first"] = float(first)
+        c["last"] = max(c["last"], float(last or 0))
+        c["sold"] = max(c["sold"], float(sold or 0))
+
+    for holder in (state["bottoms"].get(key), state["charts"].get(key)):
+        for w, f in ((holder or {}).get("flow") or {}).items():
+            try:
+                buy, sell, n, ns, t0, t1, pxw = f[:7]
+                if (f[7] if len(f) > 7 else 0) or buy <= 0:
+                    continue
+                add(w, buy, pxw / buy, (f[8] if len(f) > 9 else 0) or t0, (f[9] if len(f) > 9 else 0) or t1, sell)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+    for w, d in list(state["book"].items()):
+        for p in d.get("picks", []):
+            if isinstance(p, dict) and p.get("k") == key and p.get("own"):
+                add(w, num(p, "usd"), num(p, "px"), num(p, "bf") or num(p, "t"), num(p, "bt"))
+    for row in e.get("w0") or []:
+        if isinstance(row, (list, tuple)) and len(row) >= 3 and isinstance(row[0], str):
+            add(row[0], fnum(row[1]), fnum(row[2]), num(e, "t0"), num(e, "t0"))
+    for row in ((state["radar"].get("coins") or {}).get(key) or {}).get("top") or []:
+        if isinstance(row, (list, tuple)) and len(row) >= 2 and isinstance(row[0], str):
+            add(row[0], fnum(row[1]))
+    out = []
+    for c in cands.values():
+        early = (p0 > 0 and 0 < c["paid"] <= LINK_EARLY_X * p0) or (c["paid"] <= 0 and 0 < c["first"] <= num(e, "t0") + 3600)
+        if (not early or c["usd"] < 300 or c["sold"] > 0.5 * c["usd"] or is_bundler(chain, c["w"])
+                or c["w"] in (norm_addr(chain, pair.get("pairAddress", "")), norm_addr(chain, key.split(":", 1)[1]))):
+            continue
+        c["gain"] = (px_now / c["paid"]) if c["paid"] > 0 and px_now > 0 else 0.0
+        out.append(c)
+    scores = wallet_scores()
+    out.sort(key=lambda c: (-(wallet_stars(c["w"], scores) or 0), -c["usd"]))
+    out = out[:LINK_WALLETS_KEPT]
+    sym = str(pair.get("baseToken", {}).get("symbol", "?"))[:12]
+    for c in out:
+        try:
+            save_early_hit(c, key, sym, chain, pair, px_now, now)
+        except Exception:
+            log.exception("could not save an early wallet")
+    e["look"] = now
+    e["found"] = [[c["w"], round(c["usd"]), float(f"{c['paid']:.6g}")] for c in out]
+    return out
+
+
+def save_early_hit(c: dict, key: str, sym: str, chain: str, pair: dict, px_now: float, now: float):
+    """Put a wallet found on a coin that went up into the wallet book, as a finished buy that doubled - an EARLY hit (it bought low, long before I
+    looked), which counts for EARLY_WIN_WEIGHT in its rating until it wins on coins I could follow. Nothing to do if its buy of this coin is
+    already in the book, or if the price it paid is not known."""
+    w, paid = c["w"], c["paid"]
+    if paid <= 0 or px_now <= 0 or px_now / paid < WIN_MULTIPLE:
+        return
+    book = state["book"]
+    d = book.get(w)
+    if d is None:
+        if len(book) >= BOOK_MAX:
+            book_prune(now)
+            if len(book) >= BOOK_MAX:
+                return
+        d = book[w] = {"first": round(now), "last": round(now), "chain": chain, "seen": 0, "n": 0, "good": 0,
+                       "win": 0, "stop": 0, "flat": 0, "picks": []}
+    if any(p.get("k") == key for p in d["picks"] if isinstance(p, dict)):
+        return
+    d["last"] = round(now)
+    d["picks"].append({"k": key, "s": sym, "c": chain, "t": round(now), "t1": round(now), "px": float(f"{paid:.6g}"), "pa": pair.get("pairAddress", ""),
+                       "usd": round(c["usd"]), "st": "w", "mx": round(px_now / paid, 3), "lr": round(px_now / paid, 3), "lr0": round(px_now / paid, 3),
+                       "own": 1, "th": BOOK_TRACK_HOURS, "bt": round(c["last"]) if c["last"] else 0, "bf": round(c["first"]) if c["first"] else 0, "src": "look"})
+    d["seen"] += 1
+    d["n"] += 1
+    d["win"] += 1
+    d["good"] += 1
+    d.setdefault("found", key)
+    while len(d["picks"]) > BOOK_PICKS:
+        i = next((j for j, p in enumerate(d["picks"]) if p.get("st") != "o"), None)
+        if i is None:
+            break
+        d["picks"].pop(i)
+
+
+def look_lines(e: dict, found: list | None, pair: dict, now: float) -> list[str]:
+    """The wallet look as lines of text."""
+    if found is None:
+        return ["   (I couldn't look at the wallets just now - the trade data was busy. Ask again in a minute.)"]
+    if not found:
+        return ["🔎 *Who was in early?* No wallet stands out among the trades I can see (GeckoTerminal only shows the latest trades, so the "
+                "earliest buyers are often out of view). I keep watching for them."]
+    scores = wallet_scores()
+    p0, px = num(e, "p0"), num(pair, "priceUsd")
+    L = ["🔎 *Wallets that were in early* (they paid close to the price you sent it at, or less, and still hold most of it):"]
+    for c in found[:5]:
+        rel = ""
+        if p0 > 0 and c["paid"] > 0:
+            rel = (f", paid about {1 - c['paid'] / p0:.0%} under the price you sent it at" if c["paid"] < 0.95 * p0 else
+                   ", paid about the price you sent it at" if c["paid"] <= 1.05 * p0 else f", paid {c['paid'] / p0 - 1:.0%} over the price you sent it at")
+        gain = f", up {c['gain'] - 1:+.0%} on its price" if c.get("gain") else ""
+        rec = wallet_record_text(c["w"], scores) if (book_grade(c["w"], scores) or (scores.get(c["w"]) or {}).get("n")) else "no record with me yet"
+        L.append(f"• `{c['w']}`  {rec}\n   bought {fmt_usd(c['usd'])}{rel}{gain}")
+    L.append("   I saved them in the wallet book; a hit like this counts for little until they win again on coins I can follow. "
+             "(/watch <address> <name> follows one.)")
+    return L
+
+
+def link_track(key: str, mc: float, pair: dict | None, pairs: list | None, now: float, cands: list):
+    """Every scan, for each coin you sent: update it (the same two-readings-in-a-row rule as everywhere), end the story when it fell to half or
+    broke under the low of its first week, or when time ran out, and queue it for the wallet look when it first reaches LINK_LOOK_X times."""
+    e = state["links"].get(key)
+    if not isinstance(e, dict) or e.get("st") != "open" or num(e, "mc0") <= 0:
+        return
+    cur = read_mc(e, mc, pair, pairs)
+    if cur is None:
+        return
+    prev = e.get("last", cur)
+    e["last"] = cur
+    if cur > 0:
+        e.pop("z", None)
+    else:
+        e.setdefault("z", now)
+    hi, lo = max(cur, prev), min(cur, prev)
+    e["max_mc"] = max(num(e, "max_mc"), lo)
+    if hi > 0:
+        e["min_mc"] = min(num(e, "min_mc") or hi, hi)
+    start = num(e, "tr") or num(e, "t0")
+    if not e.get("lo1") and now - start >= TRACK_HOURS * 3600:
+        e["lo1"] = e["min_mc"]                       # the lowest point of the first week
+    if hi <= STOP_MULTIPLE * e["mc0"] and (cur > 0 or now - num(e, "z") >= RUG_CONFIRM_SECONDS):
+        e["st"] = "stop"
+    elif e.get("lo1") and cur > 0 and hi <= EXTEND_BREAK * e["lo1"]:
+        e.update(st="ended", why="broke")
+    elif now - start >= EXTEND_LINK_DAYS * 86400:
+        e["st"] = "ended"
+    if e["st"] == "open" and e["max_mc"] >= LINK_LOOK_X * e["mc0"] * (2.5 if num(e, "ms") >= 1 else 1.0) * (2.0 if num(e, "ms") >= 2 else 1.0):
+        cands.append((key, e))
+
+
+def link_pass(cands: list, now: float, caps: list | None = None):
+    """After a scan: coins you sent that just reached LINK_LOOK_X times (and then 5x and 10x) - look at their wallets and message you.
+    At most two per scan, so the trade data is not flooded."""
+    done = 0
+    for key, e in cands:
+        if done >= 2 or e.get("st") != "open":
+            break
+        ms = int(num(e, "ms"))
+        if ms >= 3 or (ms >= 1 and now - num(e, "look") < 6 * 3600):
+            continue
+        chain = e.get("chain")
+        token = key.split(":", 1)[1]
+        pairs = []
+        try:
+            pairs = [p for p in fetch_pairs(chain, [token]) if norm_addr(chain, p.get("baseToken", {}).get("address", "")) == norm_addr(chain, token)]
+        except requests.RequestException:
+            continue
+        pair = best_live_pair(pairs)
+        m = compute_metrics(key, pair) if pair else None
+        if not pair or not m:
+            continue
+        try:
+            found = wallet_look(key, chain, pair, m, e, now)
+        except Exception:
+            log.exception("wallet look failed for %s", key)
+            continue
+        x = max(num(e, "max_mc"), m["mc"]) / e["mc0"]
+        if send_telegram(build_link_message(key, chain, pair, m, e, found, x, now)):
+            e["ms"] = ms + 1
+            bot_stats["link_hit"] += 1
+            done += 1
+            log.info("a coin you sent reached %.1fx: %s (%d early wallets)", x, key, len(found))
+
+
+def build_link_message(key: str, chain: str, pair: dict, m: dict, e: dict, found: list, x: float, now: float) -> str:
+    base = pair.get("baseToken", {})
+    addr, sym = base.get("address", ""), md_escape(str(base.get("symbol", "?")))
+    L = [f"*🔔 A COIN YOU SENT IS UP {x:.1f}x: ${sym}*  |  {CHAINS[chain]['name']}", "",
+         f"You sent it {ago(now - e['t0'])} ago, when its market cap was *{fmt_usd(e['mc0'])}*. It is *{fmt_usd(m['mc'])}* now "
+         f"({m['mc'] / e['mc0']:.2f}x; best {x:.2f}x)."]
+    L += look_lines(e, found, pair, now)
+    L += ["", f"💧 liquidity {fmt_usd(m['liq'])} ({m['liq_ratio'] * 100:.1f}% of MC) · 📊 24h volume {fmt_usd(m['vol24'])} · ⏱ {fmt_age(m['age_h'])}",
+          "I keep following it. Nothing here is a buy signal - the coin already ran; the wallets are what I learn from.", "",
+          f"`{addr}`", f"[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | [Token]({link(chain, 'token', addr)})"]
+    out = "\n".join(L)
+    return out if len(out) <= 3900 else out[:3900].rsplit("\n", 1)[0]
+
+
+def cmd_links() -> str:
+    """/links: the coins you sent, with the market cap each was sent at."""
+    items = [(k, e) for k, e in state["links"].items() if isinstance(e, dict) and num(e, "mc0") > 0]
+    if not items:
+        return ("You haven't sent me any coin yet. Paste a coin address and I save the market cap it had then, follow it in the background, "
+                f"and tell you if it reaches {LINK_LOOK_X:g}x (and which wallets were in early).")
+    items.sort(key=lambda kv: -num(kv[1], "tl"))
+    now = time.time()
+    L = [f"📌 *Coins you sent me* ({len(items)})", ""]
+    for k, e in items[:15]:
+        cur = mc_cached(k, 12 * 3600) or num(e, "last")
+        x = cur / e["mc0"] if cur > 0 else 0.0
+        best = max(num(e, "max_mc"), cur) / e["mc0"]
+        L.append(f"• ${md_escape(str(e.get('sym', '?')))} · {CHAINS.get(e.get('chain'), {'name': e.get('chain')})['name']} · sent {ago(now - e['t0'])} ago at "
+                 f"{fmt_usd(e['mc0'])} → {fmt_usd(cur) if cur else '?'} (*{x:.2f}x*, best {best:.2f}x) · {link_state_text(e) or '?'}"
+                 + (f" · looked at its wallets ({len(e.get('found') or [])} early)" if e.get("look") else ""))
+    if len(items) > 15:
+        L.append(f"...and {len(items) - 15} older ones.")
+    L.append(f"\nI look at a coin's wallets when it reaches {LINK_LOOK_X:g}x the market cap you sent it at (and again at 5x and 10x). Send an address again to see how it did.")
+    return "\n".join(L)[:3900]
+
+
+def scorecard_text(chain: str, addr: str, pair: dict, m: dict, key: str, sc: dict, follow: str, linked: str = "") -> str:
     base = pair.get("baseToken", {})
     sym = md_escape(str(base.get("symbol", "?")))
     L = [f"🔍 *${sym}*  |  {CHAINS[chain]['name']}", f"`{addr}`", "",
          f"{sc['icon']} *{sc['name']}* - {sc['total']:g} of 10   (a checklist of signs, not a prediction)", ""]
+    if linked:
+        L += [linked, ""]
     for title, got, top, lines in sc["groups"]:
         L.append(f"*{title}*  {got:g}/{top:g}")
         L += lines
@@ -6759,8 +9042,13 @@ def cmd_check(ref: str) -> str:
     cap = buyers_for_check(key, chain, pair, m, now)
     held = watch_holders(chain, addr, num(pair, "priceUsd"))
     sc = score_coin(m, pair, c, bottom_entry(key), cap, held, wallet_scores())
+    linked = ""
+    try:
+        linked = link_note(key, chain, pair, m, now)         # v3.8: the market cap you sent it at is remembered; sent before? what happened since
+    except Exception:
+        log.exception("link memory error")
     follow = follow_checked(key, chain, pair, m, sc, time.time())
-    return scorecard_text(chain, addr, pair, m, key, sc, follow)
+    return scorecard_text(chain, addr, pair, m, key, sc, follow, linked)
 
 
 def cmd_check_many(refs: list[str], notify=None):
@@ -6784,16 +9072,26 @@ def cmd_check_many(refs: list[str], notify=None):
 
 def scorecard_report_lines() -> list[str]:
     """For the report: did the scores of the coins you asked about mean anything?"""
+    out: list[str] = []
+    try:                                                    # v3.8: the coins you sent, with the market cap each was sent at
+        items = [e for e in state["links"].values() if isinstance(e, dict) and num(e, "mc0") > 0]
+        if items:
+            hit = sum(1 for e in items if num(e, "max_mc") >= LINK_LOOK_X * e["mc0"])
+            looked = sum(1 for e in items if e.get("look"))
+            out.append(f"📌 Coins you sent me: *{len(items)}* remembered, {hit} reached {LINK_LOOK_X:g}x or more from the market cap you sent "
+                       f"them at, {looked} had their wallets looked at (/links)")
+    except Exception:
+        log.exception("links report line failed")
     chk = closed_records("check")
     if not chk:
-        return []
+        return out
     parts = []
     for lab, lo, hi in (("7+ of 10", 7, 11), ("5 to 7", 5, 7), ("3 to 5", 3, 5), ("under 3", -1, 3)):
         rs = [r for r in chk if lo <= r.get("score", 0) < hi]
         if rs:
             x = summarize(rs)
             parts.append(f"{lab}: {x['w']}/{x['n']}")
-    return ["🔍 Coins you asked about, by scorecard (won/followed): " + " | ".join(parts)] if parts else []
+    return out + (["🔍 Coins you asked about, by scorecard (won/followed): " + " | ".join(parts)] if parts else [])
 
 
 def cmd_watch(args: list[str]) -> str:
@@ -6832,6 +9130,7 @@ def cmd_wallets() -> str:
     if not ws:
         return ("You're not watching any wallets yet. Add one you trust:\n/watch <wallet address> <a name you choose>")
     L = [f"👛 *Your watched wallets ({len(ws)})*"]
+    scores = wallet_scores()
     for i, (w, d) in enumerate(ws, 1):
         snap = _snaps.get(w)
         if snap:
@@ -6848,9 +9147,12 @@ def cmd_wallets() -> str:
             info = vip_status_text(w, d) or info
         kind_name = "Solana" if chain == "solana" else "Robinhood Chain" if chain == "robinhood" else "Ethereum-style"
         tag = (" · 🚨 VIP" if d.get("tier") == "vip" else " · 🎯 low-cap hunter") if d.get("vip") else ""
+        st = wallet_stars(w, scores)
         L.append(f"{i}. *{md_escape(wallet_label(w))}* · {kind_name} · "
-                 f"[{short(w)}]({link(chain, 'addr', w)}) · {info}" + (" · 🧠 found by results" if d.get("auto") else "") + tag)
-    return "\n".join(L)
+                 f"[{short(w)}]({link(chain, 'addr', w)}) · {info}" + (" · 🧠 found by results" if d.get("auto") else "") + tag
+                 + (f" · {stars_text(st)}" if st is not None else "") + (" · 🧊 cooling off" if book_grade(w, scores) == "cooling" else ""))
+    out = chunk_lines(L)                       # (v3.8: more than one message when the list is long)
+    return out[0] if len(out) == 1 else out
 
 
 def alerts_state_line() -> str:
@@ -6928,8 +9230,9 @@ def cmd_backup():
     lines = []
     for w, d in list(state["watch"].items()):
         name = re.sub(r"[`\r\n]+", " ", str((d or {}).get("name") or "")).strip()
-        if isinstance(d, dict) and d.get("vip"):           # v3.5: a VIP wallet comes back as a VIP
-            lines.append(f"/vip add {w} {name}".strip() + (" kol" if d.get("kol") else ""))
+        if isinstance(d, dict) and d.get("vip"):           # v3.5: a VIP wallet comes back as a VIP (v3.6: with the style word you gave it)
+            sw = {"selective": " picky", "spray": " spray", "normal": " normal"}.get(d.get("style"), "")
+            lines.append(f"/vip add {w} {name or (short(w) if sw else '')}".strip() + (" kol" if d.get("kol") else "") + sw)
         else:
             lines.append(f"/watch {w} {name}".strip())
     if lines:
@@ -7008,14 +9311,20 @@ def handle_command(text: str, notify=None):
         return cmd_bottoms()
     if cmd == "smart":
         return cmd_smart()
+    if cmd in ("stars", "star", "rating", "ratings"):
+        return cmd_stars()
     if cmd == "coins":
         return cmd_coins()
     if cmd == "alerts":
         return cmd_alerts(args)
     if cmd in ("vip", "vips"):
         return cmd_vip(args)
+    if cmd in ("radar", "accum", "accumulating", "accumulation"):
+        return cmd_radar(args, notify)
     if cmd in ("lowcap", "low-cap", "lowcaps"):
         return cmd_lowcap(args)
+    if cmd in ("links", "linked", "sent", "mycoins"):
+        return cmd_links()
     if cmd in ("shill", "dipwatch"):
         return cmd_shill(args, notify)
     if cmd == "kol":
@@ -7066,7 +9375,7 @@ def handle_update(u: dict):
         try:
             extra = build_report_part2()
             if extra:
-                send_telegram(extra[:3900])
+                send_telegram_long(extra)
         except Exception:
             log.exception("second part of the report failed")
 
@@ -7693,12 +10002,14 @@ def build_checkin(with_wallets: bool = True) -> str:
         L += ["", sparsity_status_line()]
     L += [chart_status_line(), book_status_line()]
     L += vip_status_lines()
+    L += radar_status_lines()
     L += smart_coin_lines(fetch=with_wallets)
     sent = ", ".join(f"{n} {k}" for k, n in (("re-run", bot_stats["rerun"]), ("narrative", bot_stats["narrative"]),
                                               ("wallet-backed", bot_stats["walletdip"]), ("bottom", bot_stats["bottom"]),
                                               ("chart", bot_stats["chart"]), ("smart-wallet", bot_stats["smartbuy"]),
                                               ("VIP low-cap", bot_stats["vip"]), ("low-cap crowd", bot_stats["lowcap"]),
-                                              ("dip-watch", bot_stats["kol"]), ("whale", bot_stats["whale"])))
+                                              ("dip-watch", bot_stats["kol"]), ("accumulation", bot_stats["radar"]),
+                                              ("whale", bot_stats["whale"])))
     rules_line = (f"⚙️ Rules in use: past high of at least {fmt_usd(MIN_PEAK_MC)}, now down {T['retrace_min']:.0f}-"
                   f"{T['retrace_max']:.0f}% from it, liquidity at least {T['liq'] * 100:.0f}% and 24h volume at least "
                   f"{T['vol'] * 100:.0f}% of market cap, {T['traders']:.0f}+ trades in 24h, pair at least "
@@ -7712,7 +10023,10 @@ def build_checkin(with_wallets: bool = True) -> str:
           f"{len(open_records(kind='wallet'))} wallet-backed, {len(open_records(kind='bottom'))} bottom, "
           f"{len(open_records(kind='chart'))} chart, {len(open_records(kind='smartbuy'))} smart-wallet, "
           f"{len(open_records(kind='vip'))} VIP, {len(open_records(kind='lowcap'))} low-cap crowd, {len(open_records(kind='kol'))} dip-watch, "
-          f"{len(open_records(kind='shadow')) + len(open_records(kind='bshadow')) + len(open_records(kind='cshadow'))} experiments.",
+          f"{len(open_records(kind='radar'))} accumulation, "
+          f"{sum(len(open_records(kind=k_)) for k_ in ('shadow', 'bshadow', 'cshadow', 'lshadow'))} experiments"
+          + (f" ({extended_open()} of all these on extra time - a call that is still alive after its first week is followed on)" if extended_open() else "") + ".",
+          *([f"📌 Coins you sent me: {len(link_open_keys())} followed in the background (/links)."] if link_open_keys() else []),
           (f"👛 Watching {len(state['watch'])} wallet(s) - /wallets to see them." if state["watch"]
            else "👛 Tip: add wallets you trust with /watch <wallet address> and I'll show whether they're still in each coin."),
           "ℹ️ No alert just means nothing met an alert's rules at once - that is by design.",
@@ -7803,11 +10117,14 @@ async def lifespan(app: FastAPI):
     # that this one replaces is still running for a minute or two and its last save, when it stops, must not land on top of this one.)
     show34 = not state["tuning"].get("note34")
     show35 = not state["tuning"].get("note35")
+    show36 = not state["tuning"].get("note36")
+    show37 = not state["tuning"].get("note37")
+    show38 = not state["tuning"].get("note38")
     log.info("Bot v%s copy %s starting at %s", BOT_VERSION, INSTANCE_ID, my_host())
     log.info("Tracking %d tokens across %s", len(TOKENS), sorted({c for c, _ in TOKENS}))
     log.info("EVM whale wallets configured: %d", len(EVM_WHALES))
     online_sent = await asyncio.to_thread(
-        send_telegram,
+        send_telegram_long,
         f"✅ Bot is online (v{BOT_VERSION}, copy {INSTANCE_ID}). "
         + ("Auto-discovery ON. " if AUTO_DISCOVER else "")
         + (f"Manually watching {len(TOKENS)} coin(s). " if TOKENS else "")
@@ -7846,6 +10163,9 @@ async def lifespan(app: FastAPI):
            + "any `bot_memory` file you send back here is restored, and /backup sends you the file and your wallet list.\n"
            if show34 else "")
         + (vip_startup_note() if show35 else "")
+        + (startup_note36() if show36 else "")
+        + (startup_note37() if show37 else "")
+        + (startup_note38() if show38 else "")
         + ("⚠️ I couldn't find my memory file: something else is pinned in this chat instead of it. If I had wallets or results saved "
            "here before, scroll up, find the newest `bot_memory` file and send it to me here (or pin it again) and I'll restore from it.\n"
            if _pin_problem["other"] else "")
@@ -7862,9 +10182,17 @@ async def lifespan(app: FastAPI):
         state["tuning"]["note34"] = True       # (the v3.4 note is only shown once)
     if show35 and online_sent:
         state["tuning"]["note35"] = True       # (...and so is the v3.5 note)
+    if show36 and online_sent:
+        state["tuning"]["note36"] = True       # (...and the v3.6 note)
+    if show37 and online_sent:
+        state["tuning"]["note37"] = True       # (...and the v3.7 note)
+    if show38 and online_sent:
+        state["tuning"]["note38"] = True       # (...and the v3.8 note)
     tasks = [asyncio.create_task(scanner_loop()), asyncio.create_task(keepalive_loop()),
              asyncio.create_task(wallet_loop()), asyncio.create_task(command_loop()),
              asyncio.create_task(vip_loop())]
+    if RADAR_ON:
+        tasks.append(asyncio.create_task(radar_loop()))      # v3.6: the accumulation radar
     yield
     for t in tasks:
         t.cancel()
