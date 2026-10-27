@@ -102,7 +102,7 @@ GECKO_DEEP_PAGES = min(10, int(os.getenv("GECKO_DEEP_PAGES", "8")))  # one chain
 MAX_COIN_MC = 1_000_000_000                                  # coins above $1B never do a deep-dip re-run setup
 
 # --- Staying awake, status check-ins, double-copy detection --------------------
-BOT_VERSION = "3.8"
+BOT_VERSION = "3.8.1"
 # Render's free plan puts a service to sleep after 15 minutes without incoming web traffic, so the bot
 # visits its own web address every few minutes. Render fills in RENDER_EXTERNAL_URL by itself.
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
@@ -2894,9 +2894,10 @@ def evm_balance(chain: str, wallet: str, token: str) -> float:
 
 def watch_holders(chain: str, token: str, price: float, use_rpc: bool = True, max_age: float = HOLD_CACHE_SECONDS) -> dict:
     """Which of the owner's watched wallets are holding this coin right now? Never raises.
-    {"in": [(name, usd, amount)], "out": [names], "unknown": [names], "total": how many wallets could hold it}
+    {"in": [(name, usd, amount)], "out": [names], "unknown": [names], "total": how many wallets could hold it,
+     "in_w": the wallet address behind each entry of "in" (v3.8.1)}
     An earlier answer younger than max_age seconds is reused instead of asking the blockchain again."""
-    res = {"in": [], "out": [], "unknown": [], "total": 0}
+    res = {"in": [], "out": [], "unknown": [], "total": 0, "in_w": []}
     try:
         kind = "solana" if chain == "solana" else "evm"
         if not rpc_url_for(chain):
@@ -2925,6 +2926,7 @@ def watch_holders(chain: str, token: str, price: float, use_rpc: bool = True, ma
                 res["unknown"].append(label)
             elif amt > 0 and (price <= 0 or amt * price >= WATCH_MIN_HOLD_USD):
                 res["in"].append((label, amt * price, amt))
+                res["in_w"].append(w)               # v3.8.1: the wallet behind each name (the scorecard skips a 🧊 cooling one)
             else:
                 res["out"].append(label)
     except Exception:
@@ -4841,6 +4843,14 @@ def startup_note38() -> str:
             "(/lowcap age, /lowcap fresh).\n")
 
 
+def startup_note381() -> str:
+    """The v3.8.1 start-up note (shown once)."""
+    return ("🆕 v3.8.1: the scorecard and the coin lists now tell the same story about who is buying. /check counts every accumulating "
+            "wallet (it only kept the biggest 6) and says how many of the buyers have a weak record or are 🧊 cooling. The coin lists "
+            "(/coins and the check-in) show how many buyers are trusted, cooling, weak or not rated yet, so a medal can no longer hide "
+            "a weak crowd. A 🧊 wallet that holds a coin no longer earns a smart-money point either.\n")
+
+
 def lowcap_book_numbers() -> dict:
     """From the wallet book: coins that 3+ saved wallets bought while their market cap was low (the price the 3rd wallet paid x the supply).
     -> {"n", "w", "s", "o", "f"} counted by how that 3rd wallet's buy turned out, plus the low-cap coins that already doubled."""
@@ -6463,6 +6473,7 @@ def fmt_span(hours: float) -> str:
 
 FLOW_MIN_USD = 100           # a wallet that has bought less than this in total is not remembered
 FLOW_MAX_WALLETS = 20        # wallets remembered per coin
+CAP_ACC_KEPT = 12            # v3.8.1: accumulating wallets kept per look (it was 6: a wallet with a record that ranked 7th by size was never seen)
 
 
 def flow_merge(holder: dict, new: dict, full: dict, now: float):
@@ -6555,7 +6566,8 @@ def capture_buyers(key: str, chain: str, pair: dict, m: dict, b: dict, now: floa
         b["wm"] = full["last"]
     acc = flow_accumulators(b, m["mc"], now)
     b["cap"] = {"t": now, "n": full["n"], "span": round(full["span"], 1), "buy": round(full["buy"]),
-                "sell": round(full["sell"]), "nb": full["nb"], "ns": full["ns"], "bots": full["bots"], "acc": acc[:6]}
+                "sell": round(full["sell"]), "nb": full["nb"], "ns": full["ns"], "bots": full["bots"],
+                "acc": acc[:CAP_ACC_KEPT], "na": len(acc)}
     b["cap_tries"] = 0
     for row in acc[:BOOK_ADD_PER_COIN]:
         try:
@@ -7162,6 +7174,45 @@ def wallet_record_text(w: str, scores: dict | None = None) -> str:
     if sc.get("ww", 0) + sc.get("ws", 0) < sc.get("win", 0) + sc.get("stop", 0) - 0.05:
         rec += " (coins that many saved wallets bought count less)"
     return rec
+
+
+def acc_count(cap: dict | None) -> int:
+    """How many wallets were accumulating a coin in a look. (v3.8.1: the true count - only the biggest CAP_ACC_KEPT are kept as rows,
+    and a look saved by an older version kept 6.)"""
+    cap = cap or {}
+    return max(int(num(cap, "na")), sum(1 for r in (cap.get("acc") or []) if r))
+
+
+def buyer_mix(rows: list, scores: dict) -> dict[str, list]:
+    """v3.8.1: split a coin's accumulating wallets by what I know about them: 'good' (a medal: on your list, or a good record, or a promising
+    start), 'cool' (was on your list, its results turned bad), 'weak' (rated, under STAR_COOL_BELOW stars), 'mid' (rated, average, no medal)
+    and 'new' (not rated yet)."""
+    out: dict[str, list] = {"good": [], "cool": [], "weak": [], "mid": [], "new": []}
+    for r in rows:
+        if not r:
+            continue
+        g = book_grade(r[0], scores)
+        st = wallet_stars(r[0], scores)
+        kind = ("good" if g in ("watched", "proven", "promising") else "cool" if g == "cooling" else "new" if st is None
+                else "weak" if st < STAR_COOL_BELOW - 1e-9 else "mid")
+        out[kind].append(r)
+    return out
+
+
+def buyer_mix_text(rows: list, scores: dict) -> str:
+    """'2 🧊 cooling (smart-0x188e25 ⭐½ 0.5/3, ...), 6 with a weak record, 4 not rated yet' - the buyers that have no medal, and why."""
+    mix = buyer_mix(rows, scores)
+    parts = []
+    if mix["cool"]:
+        names = ", ".join(f"{md_escape(wallet_label(r[0]))} {stars_text(wallet_stars(r[0], scores))}".strip() for r in mix["cool"][:2])
+        parts.append(f"{len(mix['cool'])} 🧊 cooling ({names}{', ...' if len(mix['cool']) > 2 else ''})")
+    if mix["weak"]:
+        parts.append(f"{len(mix['weak'])} with a weak record")
+    if mix["mid"]:
+        parts.append(f"{len(mix['mid'])} with an average record")
+    if mix["new"]:
+        parts.append(f"{len(mix['new'])} not rated yet")
+    return ", ".join(parts)
 
 
 def wallet_open_picks(w: str, exclude: str | None = None) -> list[dict]:
@@ -7814,7 +7865,7 @@ def maybe_chart_alert(key: str, chain: str, pair: dict, c: dict, now: float) -> 
         add_record("chart", key, chain, pair, m, "", now,
                    extra={"pat": c["pat"], "score": c["score"], "signs": c.get("signs", 0), "bonus": bonus,
                           "th": CHART_TRACK_HOURS, "sig": signals_for(m, len(held["in"])),
-                          "acc": len(cap.get("acc") or []),
+                          "acc": acc_count(cap),
                           "smart": sum(1 for r in (cap.get("acc") or []) if r and trusted_wallet(r[0], scores)),
                           "sp": (b.get("signs") if b and bottom_active(b) else None)})
         bot_stats["chart"] += 1
@@ -7849,7 +7900,7 @@ def cmd_patterns() -> str:
         if b and bottom_active(b) and isinstance(b.get("signs"), int):
             bits.append(f"Sparsity {b['signs']}/3")
         if cap and cap.get("acc") and now - cap.get("t", 0) < 72 * 3600:
-            bits.append(f"{len(cap['acc'])} wallet(s) accumulating")
+            bits.append(f"{acc_count(cap)} wallet(s) accumulating")
         sl = shape_line(c)
         L.append(f"{i}. " + " · ".join(bits) + (f"\n    {md_escape(sl)}" if sl else "")
                  + f"\n    `{ca}`  [chart](https://dexscreener.com/{chain}/{ca})")
@@ -8140,7 +8191,7 @@ def book_coins_now(hours: float = 72.0, limit: int = 8) -> list[dict]:
                     or now - num(p, "t") > hours * 3600:
                 continue
             c = coins.setdefault(p["k"], {"key": p["k"], "sym": p.get("s") or "?", "chain": p.get("c") or "solana", "wallets": [],
-                                          "usd": 0.0, "lr": [], "t": 0.0, "strong": 0, "soft": 0})
+                                          "usd": 0.0, "lr": [], "t": 0.0, "strong": 0, "soft": 0, "cool": 0, "weak": 0})
             c["wallets"].append(w)
             c["usd"] += num(p, "usd")
             c["lr"].append(num(p, "lr", default=1.0) or 1.0)
@@ -8150,6 +8201,12 @@ def book_coins_now(hours: float = 72.0, limit: int = 8) -> list[dict]:
                 c["strong"] += 1
             elif g == "promising":
                 c["soft"] += 1
+            elif g == "cooling":
+                c["cool"] += 1
+            else:
+                st = wallet_stars(w, scores)           # v3.8.1: rated and under STAR_COOL_BELOW stars = a weak record
+                if st is not None and st < STAR_COOL_BELOW - 1e-9:
+                    c["weak"] += 1
     rows = sorted(coins.values(), key=lambda c: (-(3 * c["strong"] + 2 * c["soft"] + len(c["wallets"])), -c["usd"]))
     return rows[:limit]
 
@@ -8171,17 +8228,41 @@ def book_paid_off(days: float = 7.0, limit: int = 6) -> list[dict]:
     return sorted(coins.values(), key=lambda c: (-c["mx"], -c["n"]))[:limit]
 
 
+def grade_bits(c: dict) -> str:
+    """v3.8.1: who the buyers of a coin are, in words: '🏅🏅 2 trusted · 🧊 1 cooling · 3 weak record · 2 not rated'. (Before, a medal was
+    all it said - and a medal next to '8 wallets' read like 'smart wallets', although the other wallets were unrated or weak.)"""
+    n = len(c["wallets"])
+    strong, soft, cool, weak = c["strong"], c["soft"], c.get("cool", 0), c.get("weak", 0)
+    parts = []
+    if strong:
+        parts.append("🏅" * min(strong, 3) + f" {strong} trusted")
+    if soft:
+        parts.append("🌱" * min(soft, 3) + f" {soft} promising")
+    if cool:
+        parts.append(f"🧊 {cool} cooling")
+    if weak:
+        parts.append(f"{weak} weak record")
+    rest = n - strong - soft - cool - weak
+    if rest > 0:
+        parts.append("none rated yet" if rest == n else f"{rest} not rated")
+    return " · ".join(parts)
+
+
 def coin_row(i: int, c: dict, now: float, mcs: dict | None = None) -> str:
     chain, ca = c["chain"], c["key"].split(":", 1)[1]
     n = len(c["wallets"])
-    grades = ("🏅" * min(c["strong"], 3) + "🌱" * min(c["soft"], 3))
+    gb = grade_bits(c)
     mc = (mcs or {}).get(c["key"]) or mc_cached(c["key"])        # v3.5: the coin's market cap, right after its name
     bits = [f"${md_escape(str(c['sym']))}", CHAINS.get(chain, {"name": chain})["name"]]
     if mc:
         bits.append(f"*MC {fmt_usd(mc)}*")
-    bits += [f"{n} wallet{'s' if n != 1 else ''}" + (f" ({grades})" if grades else "") + f" bought {fmt_usd(c['usd'])}",
+    bits += [f"{n} wallet{'s' if n != 1 else ''} bought {fmt_usd(c['usd'])}" + (f" ({gb})" if gb else ""),
              f"{median(c['lr']) - 1:+.0%} since their buys", f"last buy {ago(now - c['t'])} ago"]
     return f"{i}. " + " · ".join(bits) + f"\n    `{ca}`  [chart](https://dexscreener.com/{chain}/{ca})"
+
+
+GRADE_LEGEND = ("🏅 trusted (on your list, or a good record) · 🌱 promising start · 🧊 cooling (was trusted, results turned bad) · "
+                "weak record = under 1.5 stars. Every saved wallet counts here, rated or not.")
 
 
 def smart_coin_lines(limit: int = 3, fetch: bool = True) -> list[str]:
@@ -8192,7 +8273,8 @@ def smart_coin_lines(limit: int = 3, fetch: bool = True) -> list[str]:
             return []
         now = time.time()
         mcs = live_mcs([c["key"] for c in rows], fetch=fetch)
-        return ["", "🧠 *Coins the saved wallets are buying right now* (/coins shows more):"] + [coin_row(i, c, now, mcs) for i, c in enumerate(rows, 1)]
+        return (["", "🧠 *Coins the saved wallets are buying right now* (/coins shows more):", GRADE_LEGEND]
+                + [coin_row(i, c, now, mcs) for i, c in enumerate(rows, 1)])
     except Exception:
         log.exception("could not list the coins the saved wallets are buying")
         return []
@@ -8211,7 +8293,7 @@ def cmd_coins() -> str:
     paid = book_paid_off()
     mcs = live_mcs([c["key"] for c in rows] + [c["key"] for c in paid])      # v3.5: market cap next to every coin
     if rows:
-        L.append("Open buys from the last 3 days. 🏅 = a wallet with a good record (2+ stars) or one you watch, 🌱 = a promising start (/stars explains). "
+        L.append("Open buys from the last 3 days. " + GRADE_LEGEND + " (/stars explains). "
                  f"MC = the coin's market cap now (a low cap is {fmt_usd(lowcap_limit())} or less).")
         L += [coin_row(i, c, now, mcs) for i, c in enumerate(rows, 1)]
     else:
@@ -8486,6 +8568,7 @@ def score_coin(m: dict, pair: dict, c: dict | None, b: dict | None, cap: dict | 
     # --- 1. smart money (up to 4)
     p, lines = 0.0, []
     acc = [r for r in ((cap or {}).get("acc") or []) if r]
+    n_acc = max(acc_count(cap), len(acc))
     strong = [r for r in acc if book_grade(r[0], scores) in ("watched", "proven")]
     soft = [r for r in acc if book_grade(r[0], scores) == "promising"]
     if cap is None:
@@ -8510,23 +8593,31 @@ def score_coin(m: dict, pair: dict, c: dict | None, b: dict | None, cap: dict | 
             p += 1.0
             lines.append(f"✅ 1 wallet with a promising start is accumulating it: `{soft[0][0]}` (bought {fmt_usd(soft[0][1])})")
         else:
-            lines.append("❌ no wallet with a record is buying it")
+            lines.append("❌ no wallet with a good record is buying it")
+            mixt = buyer_mix_text(acc, scores)         # v3.8.1: who the buyers ARE (a medal in an older check-in could say otherwise)
+            if mixt:
+                lines.append(f"   the {len(acc)} biggest buyers: {mixt}")
             missing.append("a wallet with a good record buying it")
         nb, ns = int(cap.get("nb", 0)), int(cap.get("ns", 0))
         flow = (f"{nb} wallets net-buying vs {ns} net-selling - bought {fmt_usd(cap.get('buy', 0))}, sold "
                 f"{fmt_usd(cap.get('sell', 0))} (latest {cap.get('n', 0)} trades, {fmt_span(cap.get('span', 0))})")
         if len(acc) >= 2 and nb > ns:
             p += 1.0
-            lines.append(f"✅ {len(acc)} wallets are accumulating it; {flow}")
+            lines.append(f"✅ {n_acc} wallets are accumulating it (last 3 days); {flow}")
         elif ns > nb and cap.get("sell", 0) > cap.get("buy", 0):
             flags.append((1, f"more wallets are selling than buying - {flow}"))
         else:
             lines.append(f"▫️ {flow}")
-    if held.get("in"):
+    hin, hw = list(held.get("in") or []), list(held.get("in_w") or [])
+    good_in = [e for i, e in enumerate(hin) if not (i < len(hw) and book_grade(hw[i], scores) == "cooling")]
+    cool_in = [e for i, e in enumerate(hin) if i < len(hw) and book_grade(hw[i], scores) == "cooling"]
+    if good_in:
         p += 1.0
-        lines.append("✅ wallets you watch are in it: " + ", ".join(md_escape(n) for n, _, _ in held["in"][:3]))
-    elif held.get("total"):
+        lines.append("✅ wallets you watch are in it: " + ", ".join(md_escape(n) for n, _, _ in good_in[:3]))
+    elif held.get("total") and not cool_in:
         lines.append(f"▫️ none of your {held['total']} watched wallet(s) hold it")
+    if cool_in:        # v3.8.1: a wallet whose results turned bad does not earn points for holding a coin either
+        lines.append("🧊 in it, but their results turned bad so they don't count: " + ", ".join(md_escape(n) for n, _, _ in cool_in[:3]))
     lines += accum_lines(pair)       # v3.4: what the wallets you watch added / sold lately (information only - no points)
     pts["smart"] = min(p, 4.0)
     groups.append(("🧠 Smart money", pts["smart"], 4.0, lines))
@@ -10120,6 +10211,7 @@ async def lifespan(app: FastAPI):
     show36 = not state["tuning"].get("note36")
     show37 = not state["tuning"].get("note37")
     show38 = not state["tuning"].get("note38")
+    show381 = not state["tuning"].get("note381")
     log.info("Bot v%s copy %s starting at %s", BOT_VERSION, INSTANCE_ID, my_host())
     log.info("Tracking %d tokens across %s", len(TOKENS), sorted({c for c, _ in TOKENS}))
     log.info("EVM whale wallets configured: %d", len(EVM_WHALES))
@@ -10166,6 +10258,7 @@ async def lifespan(app: FastAPI):
         + (startup_note36() if show36 else "")
         + (startup_note37() if show37 else "")
         + (startup_note38() if show38 else "")
+        + (startup_note381() if show381 else "")
         + ("⚠️ I couldn't find my memory file: something else is pinned in this chat instead of it. If I had wallets or results saved "
            "here before, scroll up, find the newest `bot_memory` file and send it to me here (or pin it again) and I'll restore from it.\n"
            if _pin_problem["other"] else "")
@@ -10188,6 +10281,8 @@ async def lifespan(app: FastAPI):
         state["tuning"]["note37"] = True       # (...and the v3.7 note)
     if show38 and online_sent:
         state["tuning"]["note38"] = True       # (...and the v3.8 note)
+    if show381 and online_sent:
+        state["tuning"]["note381"] = True      # (...and the v3.8.1 note)
     tasks = [asyncio.create_task(scanner_loop()), asyncio.create_task(keepalive_loop()),
              asyncio.create_task(wallet_loop()), asyncio.create_task(command_loop()),
              asyncio.create_task(vip_loop())]
