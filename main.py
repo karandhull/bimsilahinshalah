@@ -10,6 +10,8 @@ Run locally:  uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
 import asyncio
+import calendar
+import gzip
 import hashlib
 import hmac
 import json
@@ -20,6 +22,7 @@ import re
 import secrets
 import threading
 import time
+import zlib
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -92,8 +95,19 @@ REPORT_EVERY_CALLS = int(os.getenv("REPORT_EVERY_CALLS", "3"))
 SHADOW_COOLDOWN = 24 * 3600
 TELEGRAM_BACKUP = os.getenv("TELEGRAM_BACKUP", "true").lower() != "false"
 BACKUP_TAG = "BOT_STATE_BACKUP v1"
-BACKUP_MIN_GAP = 300                  # never re-save the memory more often than this...
-BACKUP_REFRESH_SECONDS = 6 * 3600     # ...and re-save at least this often even if only prices moved
+# v3.9.1: the memory used to be uploaded in full (3 MB) every 5 minutes, because a counter in it (where the last look at each VIP wallet
+# stopped) changed every minute - about 0.9 GB a day, which used up Render's free 5 GB of data for the month in under a week.
+# Now the file is compressed (about 1 MB), the counter does not count as a change, and saves are spaced out:
+BACKUP_FIRST_GAP = 300                # the first save after an update waits this long (the copy being replaced saves once more as it stops)
+BACKUP_MIN_GAP = BACKUP_FIRST_GAP     # (the older name)
+BACKUP_URGENT_GAP = 600               # after something you did, or a message I sent you (an alert, a reply): saved within about this long
+BACKUP_ROUTINE_GAP = max(900, int(env_float("BACKUP_ROUTINE_MINUTES", 120) * 60))   # ...and when only the background drifts (prices, followed calls): this often at most
+BACKUP_REFRESH_SECONDS = 6 * 3600     # ...and re-save at least this often even if nothing changed
+BACKUP_DAY_MB = env_float("BACKUP_DAY_MB", 30)   # the most the automatic saves may upload in one day (0 = no limit); the save when I stop is not counted
+BACKUP_FILE = "bot_memory.json.gz"    # the pinned file is compressed (the safety copies and /backup stay plain .json)
+MAX_UNPACKED_MB = 150                 # a compressed memory file is never unpacked past this size
+_urgent = {"t": 0.0}                  # when I last sent a message to the chat or answered you (an alert, a reply): the memory then follows soon
+_backup_fail = {"t": 0.0, "n": 0}     # automatic saves that failed in a row (so a failing upload is not repeated every minute)
 SNAPSHOT_DAYS = env_float("SNAPSHOT_DAYS", 7)   # v3.4: a dated safety copy of the memory is left in the chat this often, and one before every update (0 = none)
 MAX_MEMORY_FILE_MB = 19               # Telegram lets a bot read files up to 20 MB
 MAX_SHADOWS_OPEN = 150
@@ -102,7 +116,7 @@ GECKO_DEEP_PAGES = min(10, int(os.getenv("GECKO_DEEP_PAGES", "8")))  # one chain
 MAX_COIN_MC = 1_000_000_000                                  # coins above $1B never do a deep-dip re-run setup
 
 # --- Staying awake, status check-ins, double-copy detection --------------------
-BOT_VERSION = "3.8.1"
+BOT_VERSION = "3.9.1"
 # Render's free plan puts a service to sleep after 15 minutes without incoming web traffic, so the bot
 # visits its own web address every few minutes. Render fills in RENDER_EXTERNAL_URL by itself.
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
@@ -210,6 +224,9 @@ VIP_FIRST_LOOKBACK_MIN = 15                                  # first look at an 
 VIP_MAX_CATCHUP_BLOCKS = 250_000                             # after a long pause at most this many blocks are read back (~7 hours on Robinhood Chain)
 VIP_BLOCKS_PER_SECOND = 9.5                                  # Robinhood Chain
 VIP_LOG_WINDOW = 25_000                                      # the free node allows at most 30,000 blocks per log request
+VIP_EVM_CHAINS = ("robinhood", "base", "ethereum", "bsc")    # v3.9: the chains an Ethereum-style VIP wallet is looked at on (/vip chains <name> <chains> picks fewer)
+VIP_CATCHUP_HOURS = 7.0                                      # v3.9: after a pause at most this many hours are read back on Base / Ethereum / BNB Chain
+VIP_GROUP_MAX = 20                                           # v3.9: wallets asked about in ONE log request (the wallets of a chain are looked at together)
 HUNTER_ON = os.getenv("HUNTERS", "true").lower() != "false"  # wallets that keep buying low-cap coins that double join the VIP list by themselves
 HUNTER_MAX = int(env_float("HUNTER_MAX", 10))
 HUNTER_MIN_WINS = int(env_float("HUNTER_MIN_WINS", 2))       # low-cap buys that doubled
@@ -247,9 +264,12 @@ VIP_WALLETS = (
      "Fomo trader 'Wood' (@notanicecat69, Top 100), bought ABYSS early", "selective"),
     # v3.7: 'angery' (Fomo, 335 followers). His address was matched on-chain to the holdings on his Fomo profile: 12.8M CLAUS (Ethereum) and on
     # Robinhood Chain 3.45M Artificial Inu and 511.3K Ramses (the amounts agree to 3 digits; the CLAUS buy cost about $3.9K at the launch).
-    # No default style: the bot judges him itself after a few days. A VIP wallet is only looked at on Robinhood Chain for now.
+    # No default style: the bot judges him itself after a few days. (v3.9: looked at on Base, Ethereum and BNB Chain too - his CLAUS buy was on Ethereum.)
     ("angery", "0x340e669fc0ccfa36b29a6cbdfcc919570643b7fc", "robinhood", "certain", False,
-     "Fomo trader 'angery', holds Artificial Inu and Ramses on Robinhood Chain, bought CLAUS at its launch"),
+     "Fomo trader 'angery', holds Artificial Inu and Ramses on Robinhood Chain, bought CLAUS (Ethereum) at its launch"),
+    # v3.9: a Base wallet from my research of the 'worth' / ZC charts: about +$574K realized over one year (my research notes; not matched to a Fomo profile).
+    ("base-574k", "0xddeb5dae1e53d7ed06e4dbc14621cc9370b09881", "base", "research", False,
+     "Base wallet from my 'worth' / ZC research, about +$574K realized over one year"),
 )
 VIP_SWEEPS_ON = os.getenv("VIP_SWEEPS", "true").lower() != "false"          # look inside the VIP wallets (the nodes' free plans are used politely)
 HUNTER_SWEEP_SECONDS = max(120, int(env_float("HUNTER_SWEEP_SECONDS", 300)))  # bot-found wallets on Solana are looked at less often than the named ones
@@ -296,6 +316,7 @@ RADAR_MIN_LIQ_USD = env_float("RADAR_MIN_LIQ_USD", 80_000)      # a coin with le
 RADAR_MIN_MC = env_float("RADAR_MIN_MC", 150_000)
 RADAR_MAX_MC = env_float("RADAR_MAX_MC", 500_000_000)
 RADAR_MIN_AGE_H = env_float("RADAR_MIN_AGE_H", 48)              # launch-day coins are pumps and wash trades, not accumulation
+RADAR_SMALL_MAX_AGE_D = env_float("RADAR_SMALL_MAX_AGE_D", 30)  # v3.9: Base / Ethereum / BNB Chain / Solana skip coins whose pools are older than this (days; 0 = any age): an old coin has had its run
 RADAR_MAX_CALLS = int(env_float("RADAR_MAX_CALLS", 14))         # node requests for one coin; a busier coin is skipped (and says so)
 RADAR_MIN_BUY_USD = env_float("RADAR_MIN_BUY_USD", 300)         # a wallet counts as an accumulator from this much bought...
 RADAR_MAX_SOLD = 0.25                                           # ...selling at most this share of it...
@@ -384,7 +405,7 @@ ALERT_DEFAULT = {"rerun": RERUN_ALERTS, "narrative": NARRATIVE_ALERTS, "walletdi
                  "vip": VIP_ON, "lowcap": LOWCAP_ALERTS, "kol": KOL_ALERTS, "radar": RADAR_ON}
 ALERT_MENU = (    # what /alerts lists, in this order: (word you type, internal name, what it is)
     ("vip", "vip", "🚨 VIP low-cap ping - a named wallet (cryptoklotz, 0xdetweiler, unipcs, notanicecat69, angery, wallets the bot found) buys a low-cap coin: loud, with repeats. A picky wallet (few coins, big buys) is loud on bigger coins too; a sprayer gets a silent message (/vip style)"),
-    ("radar", "radar", "📡 Accumulation radar - a coin on Robinhood Chain that many wallets keep buying and holding (/radar lists them)"),
+    ("radar", "radar", "📡 Accumulation radar - a coin on Robinhood Chain, Base, Ethereum, BNB Chain or Solana that many wallets keep buying and holding (/radar lists them)"),
     ("lowcap", "lowcap", "🎯 Low-cap crowd - 3+ saved wallets bought a coin under your low-cap line (/lowcap changes it)"),
     ("kol", "kol", "📉 Dip-watch - a coin unipcs bought or shilled is down 60-80% from its high"),
     ("smart", "smartbuy", "🧠 Smart-wallet buying - wallets with a good record (2+ stars) or wallets you watch are accumulating a coin, or several of them keep adding to one over days"),
@@ -566,7 +587,89 @@ SPL_TOKEN_PROGRAMS = ("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",     # the t
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
-http = requests.Session()
+
+
+# --- v3.9.1: the data meter. Render's free plan lets only so much data LEAVE the server each month (5 GB; past that the whole service is
+# --- switched off until the next month). Everything the bot sends goes through ONE web connection, which counts what it sends.
+BANDWIDTH_GB = max(0.0, env_float("BANDWIDTH_GB", 5.0))        # what the host lets leave this server each month (0 = no limit: the saver never steps in)
+BANDWIDTH_FUDGE = min(2.0, max(0.5, env_float("BANDWIDTH_FUDGE", 1.10)))   # my count x this (headers, handshakes and acknowledgements are guessed, so it errs high)
+BANDWIDTH_GUARD = min(0.98, max(0.3, env_float("BANDWIDTH_GUARD", 0.85)))  # the saver steps in when the month is on course to use more than this share
+_bw_lock = threading.Lock()
+_bw_live = {"out": 0.0, "cat": {}}          # bytes counted since they were last written into the memory's tallies
+
+
+def bw_request_bytes(request) -> int:
+    """About how many bytes one request puts on the wire going out: the request line, the headers and the body."""
+    n = len(request.method or "") + len(request.url or "") + 12
+    for k, v in (request.headers or {}).items():
+        n += len(str(k)) + len(str(v)) + 4
+    body = request.body
+    if isinstance(body, (bytes, bytearray)):
+        n += len(body)
+    elif isinstance(body, str):
+        n += len(body)
+    elif body is not None:                  # (a stream: its length is in the header, if it has one)
+        try:
+            n += int(request.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            pass
+    return n
+
+
+def bw_kind(url: str) -> str:
+    """Which part of the bot a request belongs to (for the 'where it goes' line of /bandwidth)."""
+    u = (url or "").lower()
+    host = u.split("://", 1)[-1].split("/", 1)[0].rsplit("@", 1)[-1]
+    if host == "api.telegram.org":
+        return "memory" if ("/editmessagemedia" in u or "/senddocument" in u) else "telegram"
+    if host.endswith(("dexscreener.com", "geckoterminal.com", "sparsitydata.com")):
+        return "market"
+    pub = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().lower().split("://", 1)[-1].rstrip("/")
+    if pub and host == pub:
+        return "self"
+    return "chains"                         # (the free blockchain nodes, or your own)
+
+
+def bw_count(request, resp=None) -> float:
+    """Add one request to the meter. The answer coming back also costs a little going out (the receiving side acknowledges what it gets)."""
+    wire_in = 0
+    if resp is not None:
+        try:
+            wire_in = int(resp.raw.tell())              # (what came over the wire, before it was unpacked)
+        except Exception:
+            try:
+                wire_in = int(resp.headers.get("Content-Length") or 0)
+            except Exception:
+                wire_in = 0
+    out = (bw_request_bytes(request) * 1.04 + 160 + 0.03 * max(0, wire_in)) * BANDWIDTH_FUDGE
+    kind = bw_kind(request.url)
+    with _bw_lock:
+        _bw_live["out"] += out
+        _bw_live["cat"][kind] = _bw_live["cat"].get(kind, 0.0) + out
+    return out
+
+
+class MeteredSession(requests.Session):
+    """The bot's one web connection (every request it makes goes through here): the same as a normal requests.Session, but it counts
+    the bytes that leave this server. A counting problem can never get in the way of a request."""
+
+    def send(self, request, **kwargs):
+        try:
+            resp = super().send(request, **kwargs)
+        except Exception:
+            try:
+                bw_count(request)                       # (the request may have gone out before it failed)
+            except Exception:
+                pass
+            raise
+        try:
+            bw_count(request, resp)
+        except Exception:
+            pass
+        return resp
+
+
+http = MeteredSession()
 http.headers.update({"User-Agent": f"multichain-alert-bot/{BOT_VERSION}"})
 
 
@@ -807,6 +910,19 @@ def sanitize_new_memory():
                 info["tier"] = "vip"
             if not isinstance(info.get("chain"), str):
                 info["chain"] = "solana" if info.get("kind") == "solana" else "robinhood"
+        if isinstance(info, dict) and ("chains" in info or "chains_user" in info):      # v3.9: the chains a VIP wallet is looked at on
+            mine = [c for c in VIP_EVM_CHAINS if isinstance(info.get("chains"), list) and c in info["chains"]]
+            if info.get("kind") == "evm" and mine:
+                info["chains"] = mine
+                if info.get("chains_user"):
+                    info["chains_user"] = True
+                else:
+                    info.pop("chains_user", None)
+            else:
+                info.pop("chains", None)
+                info.pop("chains_user", None)
+        if isinstance(info, dict) and info.get("vip") and info.get("kind") == "evm" and info.get("tier") == "vip" and "chains" not in info:
+            info["chains"] = list(VIP_EVM_CHAINS)          # (a VIP wallet saved before v3.9 is looked at on every chain too, also when its memory file is sent into the chat)
     cur = state["tuning"].get("vip_cur")
     if isinstance(cur, dict):
         for w in [w for w, b in cur.items() if not isinstance(b, int) or isinstance(b, bool)]:
@@ -847,9 +963,13 @@ def sanitize_new_memory():
             continue
         e["sym"] = str(e.get("sym") or "?")[:14]
         for f in ("t", "seen", "acc", "usd", "mc", "liq", "vol", "top1", "top3", "n6", "n1", "net6", "dca", "ch", "age", "since", "ok2", "okt",
-                  "first", "skip", "px", "last_h"):
-            if not isinstance(e.get(f), (int, float)) or isinstance(e.get(f), bool):
+                  "first", "skip", "px", "last_h", "cover", "gap"):
+            if not isinstance(e.get(f), (int, float)) or isinstance(e.get(f), bool) or not math.isfinite(e.get(f)):
                 e[f] = 0
+        if not isinstance(e.get("hrs"), (int, float)) or isinstance(e.get("hrs"), bool) or not math.isfinite(e["hrs"]) or e["hrs"] <= 0:
+            e.pop("hrs", None)                                   # v3.9: hours one reading covered (missing = the usual 24)
+        c0 = k.split(":", 1)[0]                                  # v3.9: which chain a reading belongs to (older ones are Robinhood Chain's)
+        e["chain"] = c0 if c0 in CHAINS else "robinhood"
         e["why"] = str(e.get("why") or "")[:80]
         rows = e.get("top")
         e["top"] = [[r[0], r[1], r[2]] for r in (rows if isinstance(rows, list) else [])
@@ -858,8 +978,29 @@ def sanitize_new_memory():
     for f in ("last_list", "last_round"):
         if not isinstance(rad.get(f), (int, float)) or isinstance(rad.get(f), bool):
             rad[f] = 0
-    if len(coins) > RADAR_MAX_COINS * 3:                         # (a damaged or very old file: only the newest readings are kept)
-        for k in sorted(coins, key=lambda k_: coins[k_].get("seen", 0))[:len(coins) - RADAR_MAX_COINS * 3]:
+    win = rad.get("win")                                         # v3.9: how many blocks one log request may span, per node (learned from the nodes' answers)
+    if isinstance(win, dict):
+        for u in [u for u, v in win.items() if not isinstance(u, str) or not u.startswith("http") or not isinstance(v, int) or isinstance(v, bool)
+                  or not 200 <= v <= 200_000]:
+            del win[u]
+        if len(win) > 40:
+            win.clear()
+    elif win is not None:
+        rad.pop("win", None)
+    ovr = state["tuning"].get("radar_cfg")                       # v3.9: the radar rules you changed with /radar set
+    if isinstance(ovr, dict):
+        for ch_ in list(ovr):
+            mine = ovr[ch_]
+            if ch_ not in RADAR_ALL or not isinstance(mine, dict):
+                del ovr[ch_]
+                continue
+            for f_ in list(mine):
+                if not radar_val_ok(f_, mine[f_]):
+                    del mine[f_]
+    elif ovr is not None:
+        state["tuning"].pop("radar_cfg", None)
+    if len(coins) > RADAR_MAX_COINS * 2 * len(RADAR_ALL):        # (a damaged or very old file: only the newest readings are kept)
+        for k in sorted(coins, key=lambda k_: coins[k_].get("seen", 0))[:len(coins) - RADAR_MAX_COINS * 2 * len(RADAR_ALL)]:
             del coins[k]
     # v3.8: the real buy times on a wallet's buys, the extra-time notes on buys and calls, the coins you sent, the wallets taken off the list
     for w, d in list(state["book"].items()):
@@ -916,6 +1057,8 @@ def sanitize_new_memory():
                 del v[w]
         elif v is not None:
             state["tuning"].pop(name, None)
+    if "bw" in state["tuning"]:                                  # v3.9.1: the data tallies
+        state["tuning"]["bw"] = bw_clean(state["tuning"]["bw"])
 
 
 def valid_record(r) -> bool:
@@ -1119,9 +1262,17 @@ def load_state():
     except Exception:
         log.exception("the wallet-style start day could not be set - ignored")
     state["tuning"]["ver"] = BOT_VERSION     # v3.4: which version last saved this memory (an update leaves a safety copy first)
+    try:
+        _bw_lv["lv"] = bw_data()["lv"]       # v3.9.1: the data-saver level the memory was left at (judged again within minutes)
+    except Exception:
+        log.exception("data meter could not be read from the memory")
 
 
 def save_state():
+    try:
+        bw_flush()                  # v3.9.1: what the web connection has counted goes into the memory with everything else
+    except Exception:
+        log.exception("data meter could not be updated")
     with _state_lock:
         try:
             tmp = STATE_FILE + ".tmp"
@@ -1130,6 +1281,283 @@ def save_state():
             os.replace(tmp, STATE_FILE)
         except (OSError, RuntimeError, TypeError, ValueError) as e:
             log.warning("Could not persist state: %s", e)
+
+
+# ----------------------------------------------------------------------------
+# DATA METER (v3.9.1): the tallies kept in the memory, /bandwidth, and the automatic data saver.
+# The web connection (MeteredSession, above) counts what leaves this server; here the counts are kept per hour, day and month, a
+# projection says where the month is heading, and when it is heading past the allowance the loops slow down BEFORE the host switches
+# the whole bot off (a switched-off bot sees nothing at all; a slower one still does).
+# ----------------------------------------------------------------------------
+BW_FACTORS = (1, 2, 4, 4)       # how many times slower the loops run at each level
+BW_NAMES = ("normal", "saver", "strong saver", "resting")
+BW_EVAL_SECONDS = 300
+BW_KIND_WORDS = (("memory", "memory saves"), ("market", "market data"), ("chains", "blockchain nodes"),
+                 ("telegram", "Telegram messages"), ("self", "keep-awake pings"))
+_bw_lv = {"lv": 0}              # the level the loops follow right now
+_bw_eval = {"t": 0.0}
+_bw_tally_lock = threading.Lock()
+
+
+def utc_day(t: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(t))
+
+
+def fmt_data(n: float) -> str:
+    n = max(0.0, float(n))
+    if n >= 1e9:
+        return f"{n / 1e9:.2f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.0f} MB"
+    return f"{n / 1e3:.0f} KB"
+
+
+def _num_ok(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def bw_clean(t) -> dict:
+    """The data tallies, checked (a damaged or hand-edited memory file can never break the bot)."""
+    t = dict(t) if isinstance(t, dict) else {}
+    t["m"] = t["m"] if isinstance(t.get("m"), str) and re.fullmatch(r"\d{4}-\d\d", t["m"]) else ""
+    t["mb"] = float(t["mb"]) if _num_ok(t.get("mb")) and t["mb"] >= 0 else 0.0
+    t["adj"] = float(t["adj"]) if _num_ok(t.get("adj")) else 0.0
+    for f, keep in (("d", 40), ("h", 60), ("c", 12)):
+        v = t.get(f)
+        rows = {str(k): float(x) for k, x in v.items() if _num_ok(x) and x >= 0} if isinstance(v, dict) else {}
+        if f == "h":
+            rows = {k: x for k, x in rows.items() if k.lstrip("-").isdigit()}
+        if f == "d":
+            rows = {k: x for k, x in rows.items() if re.fullmatch(r"\d{4}-\d\d-\d\d", k)}
+        t[f] = dict(sorted(rows.items())[-keep:])
+    t["lv"] = t["lv"] if isinstance(t.get("lv"), int) and not isinstance(t.get("lv"), bool) and 0 <= t["lv"] <= 3 else 0
+    t["lv_t"] = float(t["lv_t"]) if _num_ok(t.get("lv_t")) else 0.0
+    if "lim" in t and not (_num_ok(t["lim"]) and 0 <= t["lim"] <= 100000):
+        t.pop("lim")
+    if "lv_reset" in t and t["lv_reset"] is not True:
+        t.pop("lv_reset")
+    return t
+
+
+def bw_data(now: float | None = None) -> dict:
+    """The data tallies in the memory (state['tuning']['bw']), brought up to date: a new month starts them over, old hours and days go."""
+    now = now or time.time()
+    t = state["tuning"].get("bw")
+    if not (isinstance(t, dict) and isinstance(t.get("d"), dict) and isinstance(t.get("h"), dict) and isinstance(t.get("c"), dict)
+            and _num_ok(t.get("mb")) and _num_ok(t.get("adj"))):
+        t = state["tuning"]["bw"] = bw_clean(t)
+    month = time.strftime("%Y-%m", time.gmtime(now))
+    if t.get("m") != month:
+        if t.get("m"):                               # a new month: Render's allowance starts over, so do my tallies (and the saver)
+            if t.get("lv", 0) > 0:
+                t["lv_reset"] = True                 # (bw_check tells you the saver is off again)
+            t.update(m=month, mb=0.0, adj=0.0, c={}, lv=0)
+            _bw_lv["lv"] = 0
+        else:                                        # tallies with no month yet (brand new, or damaged): they begin now
+            t.update(m=month, mb=0.0, adj=0.0, c={})
+    hnow = int(now // 3600)
+    for k in [k for k in t["h"] if not k.lstrip("-").isdigit() or int(k) < hnow - 49]:
+        del t["h"][k]
+    day_old = utc_day(now - 35 * 86400)
+    for k in [k for k in t["d"] if k < day_old]:
+        del t["d"][k]
+    return t
+
+
+def bw_flush(now: float | None = None) -> dict:
+    """Write what the web connection has counted since the last time into the tallies (month, day, hour, and what it was for)."""
+    now = now or time.time()
+    with _bw_tally_lock:                 # (the scan, the backup and the commands all call this: one at a time, so no count is lost)
+        with _bw_lock:
+            out, cat = _bw_live["out"], _bw_live["cat"]
+            _bw_live["out"], _bw_live["cat"] = 0.0, {}
+        t = bw_data(now)
+        if out > 0:
+            t["mb"] += out
+            hk, dk = str(int(now // 3600)), utc_day(now)
+            t["h"][hk] = t["h"].get(hk, 0.0) + out
+            t["d"][dk] = t["d"].get(dk, 0.0) + out
+            for k, v in cat.items():
+                t["c"][k] = t["c"].get(k, 0.0) + v
+        return t
+
+
+def bw_limit_gb() -> float:
+    """The month's allowance in GB: what you set with /bandwidth limit, else BANDWIDTH_GB (0 = none)."""
+    t = state["tuning"].get("bw")
+    lim = t.get("lim") if isinstance(t, dict) else None
+    return float(lim) if _num_ok(lim) and lim >= 0 else BANDWIDTH_GB
+
+
+def bw_month_end(now: float) -> float:
+    g = time.gmtime(now)
+    y, m = (g.tm_year + 1, 1) if g.tm_mon == 12 else (g.tm_year, g.tm_mon + 1)
+    return float(calendar.timegm((y, m, 1, 0, 0, 0)))
+
+
+def bw_numbers(now: float | None = None) -> dict:
+    """Where the month stands: bytes used (as I count them), the allowance, the last 24 hours, and where the month is heading."""
+    now = now or time.time()
+    t = bw_flush(now)
+    used = max(0.0, t["mb"] + t["adj"])
+    lim = bw_limit_gb() * 1e9
+    hnow = int(now // 3600)
+    rows = {int(k): v for k, v in t["h"].items() if hnow - 23 <= int(k) <= hnow}
+    last24 = sum(rows.values())
+    span = max(6, min(24, hnow - min(rows) + 1)) if rows else 24      # (a bot with less than a day of history: the hours it has)
+    per_day = last24 / span * 24
+    end = bw_month_end(now)
+    days_left = max(0.02, (end - now) / 86400)
+    yday = t["d"].get(utc_day(now - 86400), 0.0)
+    return {"t": t, "used": used, "lim": lim, "last24": last24, "per_day": per_day, "days_left": days_left, "end": end,
+            "proj": used + per_day * days_left, "yday": yday, "today": t["d"].get(utc_day(now), 0.0)}
+
+
+def bw_level_for(used_f: float, proj_f: float, k: float = 1.0) -> int:
+    """0 normal, 1 saver, 2 strong saver, 3 resting. k < 1 shrinks the lines (used to decide whether a level can be left)."""
+    if used_f >= 0.96 * k:
+        return 3
+    if proj_f > 1.0 * k or used_f >= 0.90 * k:
+        return 2
+    if proj_f > BANDWIDTH_GUARD * k:
+        return 1
+    return 0
+
+
+def bw_slow() -> int:
+    """How many times slower the loops run right now (1 = full speed)."""
+    return BW_FACTORS[_bw_lv["lv"]]
+
+
+def bw_paused() -> bool:
+    """True while resting: scanning, discovery, the radar and the hunters wait for the allowance to start over."""
+    return _bw_lv["lv"] >= 3
+
+
+def bw_month_word(end: float) -> str:
+    g = time.gmtime(end)
+    return f"{g.tm_mday} {calendar.month_name[g.tm_mon]}"
+
+
+def bw_notice(level: int, n: dict) -> str:
+    used, lim, proj = fmt_data(n["used"]), fmt_data(n["lim"]), fmt_data(n["proj"])
+    if level == 0:
+        return (f"✅ *Data saver off.* The month is back on course ({used} of {lim} used, about {proj} by the month's end), "
+                "so everything runs at full speed again.")
+    if level == 1:
+        return (f"🪫 *Data saver on.* This month I have sent about {used} of the {lim} that Render allows, and at this pace the month would end "
+                f"near {proj}. So I now look at the market, the radar and the wallets about half as often (alerts still come, a little later) "
+                "and save my memory less often. Nothing is switched off. /bandwidth shows where the data goes.")
+    if level == 2:
+        return (f"🪫 *Strong data saver.* About {used} of the {lim} that Render allows is used, and at this pace the month would end near {proj}. "
+                "I now look about 4 times less often than usual. If you would rather keep full speed, you can let Render charge for extra data "
+                "(Remove usage limits on its dashboard, about $0.15 per GB) and then send /bandwidth limit 0.")
+    return (f"⛔ *Resting.* About {used} of the {lim} that Render allows is used. To stop Render switching the whole bot off, scanning, the "
+            f"radar and hunting are paused until the allowance starts over on {bw_month_word(n['end'])}. Chat commands, saving my memory and your VIP "
+            "wallets (slowly) keep working. If you add a card or upgrade, send /bandwidth limit 25 (or /bandwidth limit 0 for no limit).")
+
+
+def bw_check(now: float | None = None, force: bool = False) -> int:
+    """Look at where the month is heading and set the level (about every 5 minutes). A level goes up as soon as it is needed and comes
+    down only when things are clearly better. A change is told to you."""
+    now = now or time.time()
+    if not force and now - _bw_eval["t"] < BW_EVAL_SECONDS:
+        return _bw_lv["lv"]
+    _bw_eval["t"] = now
+    n = bw_numbers(now)
+    t, cur = n["t"], _bw_lv["lv"]
+    if n["lim"] <= 0:
+        new = 0
+    else:
+        used_f, proj_f = n["used"] / n["lim"], n["proj"] / n["lim"]
+        new = bw_level_for(used_f, proj_f)
+        if new < cur:
+            new = min(cur, max(new, bw_level_for(used_f, proj_f, 0.9)))
+    reset = t.pop("lv_reset", False)
+    _bw_lv["lv"] = t["lv"] = new
+    if new != cur:
+        t["lv_t"] = now
+        log.info("Data saver level %s -> %s (%s used of %s, month heading for %s)", cur, new, fmt_data(n["used"]), fmt_data(n["lim"]), fmt_data(n["proj"]))
+        send_telegram(bw_notice(new, n))
+    elif reset:
+        send_telegram("🔄 *New month.* Render's data allowance has started over, so I am back to full speed.")
+    return new
+
+
+def bw_status_line() -> str:
+    """One line for the check-in."""
+    n = bw_numbers()
+    if n["lim"] <= 0:
+        return f"📶 Data sent this month: {fmt_data(n['used'])} (no limit set)."
+    lv = _bw_lv["lv"]
+    return (f"📶 Data sent this month: {fmt_data(n['used'])} of {fmt_data(n['lim'])} ({n['used'] / n['lim']:.0%}), heading for {fmt_data(n['proj'])}"
+            + (f" - {BW_NAMES[lv]} mode" if lv else "") + " (/bandwidth).")
+
+
+def bw_text() -> str:
+    n = bw_numbers()
+    t, lv = n["t"], _bw_lv["lv"]
+    if n["lim"] <= 0:
+        head = "Render's data allowance: none set, so the saver never steps in (/bandwidth limit 5 sets it again)."
+    else:
+        head = (f"Used so far: *{fmt_data(n['used'])}* of {fmt_data(n['lim'])} ({n['used'] / n['lim']:.0%}). "
+                f"At this pace the month ends near *{fmt_data(n['proj'])}* ({n['proj'] / n['lim']:.0%}).")
+    tot = sum(t["c"].values()) or 0.0
+    where = " · ".join(f"{word} {t['c'].get(k, 0.0) / tot:.0%}" for k, word in BW_KIND_WORDS if tot > 0 and t["c"].get(k, 0.0) / tot >= 0.005)
+    mode = {0: "normal - everything runs at full speed.",
+            1: "saver - I look at the market, the radar and the wallets about half as often, and save my memory less often.",
+            2: "strong saver - I look about 4 times less often than usual.",
+            3: f"resting - scanning, the radar and hunting are paused until the allowance starts over on {bw_month_word(n['end'])}; "
+               "chat commands, saving my memory and your VIP wallets (slowly) keep working."}[lv]
+    return ("📶 *Data I have sent this month*\n"
+            "Render's free plan lets a limited amount of data leave the server each month; past that it switches the whole service off "
+            "until the next month.\n\n"
+            + head + "\n"
+            f"Last 24 hours: {fmt_data(n['last24'])} · yesterday: {fmt_data(n['yday'])} · today so far: {fmt_data(n['today'])}\n"
+            + (f"Where it goes: {where}\n" if where else "")
+            + f"Mode: {mode}\n\n"
+            "These are my own counts (a little on the high side on purpose), so Render's dashboard is the one to trust. If its number "
+            "differs, tell me its figure: `/bandwidth set 2.4` (GB used so far this month). To change the allowance (an upgraded plan, say): "
+            "`/bandwidth limit 25`; `/bandwidth limit 0` = no limit, `/bandwidth limit auto` = the server's setting.")
+
+
+def bw_parse_gb(text: str) -> float | None:
+    m = re.fullmatch(r"\s*(\d+(?:[.,]\d+)?)\s*(gb|g|mb|m)?\s*", text.lower())
+    if not m:
+        return None
+    v = float(m.group(1).replace(",", "."))
+    return v / 1000 if (m.group(2) or "gb").startswith("m") else v
+
+
+def cmd_bandwidth(args: list[str]) -> str:
+    """/bandwidth - the month's data use. /bandwidth set 2.4 = Render's own figure (GB used so far); /bandwidth limit 25 = the allowance."""
+    sub = (args[0].lower() if args else "")
+    if sub in ("set", "used", "now", "calibrate"):
+        gb = bw_parse_gb(" ".join(args[1:])) if len(args) > 1 else None
+        if gb is None or gb > 100000:
+            return "Send it like this: /bandwidth set 2.4   (the number of GB Render's dashboard shows as used so far this month)"
+        t = bw_flush()
+        t["adj"] = gb * 1e9 - t["mb"]
+        _bw_eval["t"] = 0.0
+        bw_check(force=True)
+        save_state()
+        return f"✅ Noted: {fmt_data(gb * 1e9)} used so far this month, as Render shows it. I count from there.\n\n" + bw_text()
+    if sub in ("limit", "allowance", "max"):
+        word = (args[1].lower() if len(args) > 1 else "")
+        if word in ("auto", "default", "reset"):
+            bw_flush().pop("lim", None)
+        else:
+            gb = bw_parse_gb(word)
+            if gb is None or gb > 100000:
+                return "Send it like this: /bandwidth limit 25   (GB per month; 0 = no limit; auto = the server's setting)"
+            bw_flush()["lim"] = float(gb)
+        _bw_eval["t"] = 0.0
+        bw_check(force=True)
+        save_state()
+        return f"✅ Allowance: {'no limit' if bw_limit_gb() <= 0 else fmt_data(bw_limit_gb() * 1e9) + ' a month'}.\n\n" + bw_text()
+    if sub in ("", "status", "show"):
+        return bw_text()
+    return "Send /bandwidth to see this month's data, /bandwidth set 2.4 to give me Render's figure, or /bandwidth limit 25 to change the allowance."
 
 
 # ----------------------------------------------------------------------------
@@ -1169,6 +1597,7 @@ def send_telegram(text: str, silent: bool = False) -> bool:
             payload.pop("parse_mode")
             r = http.post(url, json=payload, timeout=15)
         r.raise_for_status()
+        _urgent["t"] = time.time()      # v3.9.1: a message went out (an alert, a reply): the memory follows within ~10 minutes
         return True
     except requests.RequestException as e:
         log.error("Telegram send failed: %s", scrub(e))
@@ -2052,37 +2481,53 @@ def scan_once():
              alerts, len(open_records(kind="call")), len(open_records(kind="shadow")))
 
 
+def rest_round():
+    """v3.9.1: a round while the data saver is resting (scanning is paused): the memory is still kept and saved."""
+    save_state()
+    try:
+        backup_state_to_telegram()
+    except Exception as e:
+        log.warning("Telegram backup failed: %s", scrub(e))
+
+
 async def scanner_loop():
     last_discovery, wait_for = 0.0, 0
     while True:
         round_started = time.time()
-        if AUTO_DISCOVER and time.time() - last_discovery >= wait_for:
-            wait_for = DISCOVERY_SECONDS
+        slow = bw_slow()                 # v3.9.1: the data saver makes every round slower (1 = full speed); 'resting' pauses the scan
+        if bw_paused():
             try:
-                added = await asyncio.to_thread(discover_tokens)
-                if added < 0:
-                    wait_for = 90  # all feeds failed (rate limited) - try again in 90s
-                    log.warning("Discovery failed this round, retrying in %ds", wait_for)
-                else:
-                    log.info("Discovery: +%d new coins (pool now %d)", added, len(state["discovered"]))
+                await asyncio.to_thread(rest_round)
             except Exception:
-                log.exception("discovery error")
-            last_discovery = time.time()
-        if SPARSITY_FEED:
+                log.exception("resting round error")
+        else:
+            if AUTO_DISCOVER and time.time() - last_discovery >= wait_for:
+                wait_for = DISCOVERY_SECONDS * slow
+                try:
+                    added = await asyncio.to_thread(discover_tokens)
+                    if added < 0:
+                        wait_for = 90 * slow  # all feeds failed (rate limited) - try again in 90s
+                        log.warning("Discovery failed this round, retrying in %ds", wait_for)
+                    else:
+                        log.info("Discovery: +%d new coins (pool now %d)", added, len(state["discovered"]))
+                except Exception:
+                    log.exception("discovery error")
+                last_discovery = time.time()
+            if SPARSITY_FEED:
+                try:
+                    await asyncio.to_thread(refresh_sparsity)
+                except Exception:
+                    log.exception("Sparsity refresh error")
             try:
-                await asyncio.to_thread(refresh_sparsity)
+                await asyncio.to_thread(scan_once)
             except Exception:
-                log.exception("Sparsity refresh error")
-        try:
-            await asyncio.to_thread(scan_once)
-        except Exception:
-            log.exception("scanner loop error")
+                log.exception("scanner loop error")
         try:
             await asyncio.to_thread(housekeeping)
         except Exception:
             log.exception("housekeeping error")
         # one round every POLL_SECONDS, however long the work took (but always a short breather)
-        await asyncio.sleep(max(min(5.0, POLL_SECONDS), POLL_SECONDS - (time.time() - round_started)))
+        await asyncio.sleep(max(min(5.0, POLL_SECONDS), POLL_SECONDS * slow - (time.time() - round_started)))
 
 
 # ----------------------------------------------------------------------------
@@ -3500,11 +3945,37 @@ def day_count(name: str, now: float) -> list:
 
 
 def vip_cursors() -> dict:
-    """Where the last look at each VIP wallet on an Ethereum-style chain stopped: {wallet: block number}."""
+    """Where the last look at each VIP wallet on an Ethereum-style chain stopped: {wallet: block number} for Robinhood Chain,
+    {'base:wallet': block number} for the others (v3.9)."""
     cur = state["tuning"].get("vip_cur")
     if not isinstance(cur, dict):
         cur = state["tuning"]["vip_cur"] = {}
     return cur
+
+
+def vip_cursor_key(w: str, chain: str) -> str:
+    return w if chain == "robinhood" else f"{chain}:{w}"
+
+
+def vip_drop_cursors(key: str, keep: list[str]) -> None:
+    """Forget where the last look stopped on every chain a wallet is NOT looked at on (any more): a chain put back later starts with a fresh
+    look at the last minutes, not with hours of buys that happened while it was off."""
+    cursors = vip_cursors()
+    for c_ in VIP_EVM_CHAINS:
+        if c_ not in keep:
+            cursors.pop(vip_cursor_key(key, c_), None)
+
+
+def vip_chains(info: dict) -> list[str]:
+    """The Ethereum-style chains a VIP wallet is looked at on (v3.9). A wallet saved before then has only its one chain."""
+    if not isinstance(info, dict):
+        return ["robinhood"]
+    ch = info.get("chains")
+    if isinstance(ch, list):
+        out = [c for c in VIP_EVM_CHAINS if c in ch]              # (in the chains' own order; anything else in a damaged list is ignored)
+        if out:
+            return out
+    return [info["chain"]] if info.get("chain") in VIP_EVM_CHAINS else ["robinhood"]
 
 
 # --- the VIP list ---
@@ -3527,9 +3998,14 @@ def seed_vip_wallets():
         if not info.get("name"):
             info["name"] = name
         info.update(vip=True, tier="vip", chain=chain, kol=bool(kol), sure=sure, note=note)
+        if kind == "evm" and not info.get("chains_user"):
+            info["chains"] = list(VIP_EVM_CHAINS)        # (v3.9) looked at on every Ethereum-style chain; /vip chains <name> <chains> picks fewer and is kept
         if style in ("selective", "spray", "normal") and "style" not in info and not info.get("style_seeded"):
             info["style"] = style              # (v3.7) a default style, given once: a style you set yourself - or reset to 'auto' - is never overwritten
             info["style_seeded"] = True
+    for w, info in vip_items("evm"):                     # (v3.9) a VIP wallet you added before 'chains' existed is looked at on every chain too
+        if info.get("tier") == "vip" and "chains" not in info:
+            info["chains"] = list(VIP_EVM_CHAINS)
 
 
 def vip_items(kind: str | None = None) -> list[tuple[str, dict]]:
@@ -3538,20 +4014,66 @@ def vip_items(kind: str | None = None) -> list[tuple[str, dict]]:
             if isinstance(d, dict) and d.get("vip") and (kind is None or d.get("kind") == kind)]
 
 
-def vip_note_ok(w: str, text: str):
-    _vip_rt["look"][w] = (time.time(), True, text)
+def vip_note_ok(w: str, text: str, chain: str | None = None):
+    """A look at a VIP wallet worked. chain = which Ethereum-style chain (v3.9): the errors are counted per chain, so a chain that keeps
+    failing is not hidden by the others that work."""
+    now = time.time()
+    if chain:
+        _vip_rt.setdefault("clook", {})[(w, chain)] = (now, True, text)
+        cerr = _vip_rt.setdefault("cerr", {})
+        cerr.pop((w, chain), None)
+        worst = max([cerr.get((w, c), 0) for c in vip_chains(state["watch"].get(w) or {})] or [0])
+        if worst:
+            _vip_rt["err"][w] = worst
+        else:
+            _vip_rt["err"].pop(w, None)
+        multi = len(vip_chains(state["watch"].get(w) or {})) > 1
+        if not worst:
+            _vip_rt["look"][w] = (now, True, (CHAINS[chain]["name"] + ": " if multi else "") + text)
+        return
+    _vip_rt["look"][w] = (now, True, text)
     _vip_rt["err"].pop(w, None)
 
 
-def vip_note_error(w: str, e):
+def vip_note_error(w: str, e, chain: str | None = None):
+    now = time.time()
+    if chain:
+        cerr = _vip_rt.setdefault("cerr", {})
+        n = cerr.get((w, chain), 0) + 1
+        cerr[(w, chain)] = n
+        _vip_rt.setdefault("clook", {})[(w, chain)] = (now, False, scrub(e)[:80])
+        _vip_rt["err"][w] = max(_vip_rt["err"].get(w, 0), n)
+        multi = len(vip_chains(state["watch"].get(w) or {})) > 1
+        _vip_rt["look"][w] = (now, False, (CHAINS[chain]["name"] + ": " if multi else "") + scrub(e)[:80])
+        if n in (1, 5, 20, 100):
+            log.warning("could not look at VIP wallet %s on %s (%d in a row): %s", short(w), chain, n, scrub(e))
+        return
     n = _vip_rt["err"].get(w, 0) + 1
     _vip_rt["err"][w] = n
-    _vip_rt["look"][w] = (time.time(), False, scrub(e)[:80])
+    _vip_rt["look"][w] = (now, False, scrub(e)[:80])
     if n in (1, 5, 20, 100):
         log.warning("could not look at VIP wallet %s (%d in a row): %s", short(w), n, scrub(e))
 
 
 def vip_status_text(w: str, d: dict | None = None) -> str:
+    d = d if isinstance(d, dict) else (state["watch"].get(w) or {})
+    chs = vip_chains(d) if d.get("kind") == "evm" else []
+    if len(chs) > 1:                                          # v3.9: one line for all the chains this wallet is looked at on
+        now = time.time()
+        clook = _vip_rt.get("clook") or {}
+        good = [(c, clook[(w, c)]) for c in chs if (w, c) in clook and clook[(w, c)][1]]
+        bad = [(c, clook[(w, c)]) for c in chs if (w, c) in clook and not clook[(w, c)][1]]
+        if not good and not bad:
+            return "not looked at yet"
+        parts = []
+        if good:
+            parts.append(f"looked {ago(now - max(h[0] for _, h in good))} ago on " + ", ".join(CHAINS[c]["name"] for c, _ in good))
+        for c, h in bad:
+            parts.append(f"couldn't look on {CHAINS[c]['name']} {ago(now - h[0])} ago ({h[2]}) - I keep trying")
+        waiting = [CHAINS[c]["name"] for c in chs if (w, c) not in clook]
+        if waiting:
+            parts.append("not yet looked at on " + ", ".join(waiting))
+        return "; ".join(parts)
     hit = _vip_rt["look"].get(w)
     if not hit:
         return "not looked at yet"
@@ -3705,6 +4227,7 @@ def vip_why_line(info: dict) -> str:
     how = {"certain": "its address matched his Fomo profile exactly",
            "likely": "a probable match for his Fomo profile, about 90% sure",
            "found": "found by the bot from results",
+           "research": "found in my research of a coin's chart - not matched to a Fomo profile",
            "added by you": "added by you"}.get(sure, "")
     bits = [x for x in (note, f"({how})" if how and how != note else "") if x]
     return ("🏷 " + md_escape(" ".join(bits)) + "\n") if bits else ""
@@ -3725,7 +4248,8 @@ def build_vip_message(w: str, info: dict, chain: str, pair: dict, mc: float, usd
     liq, vol = num(pair, "liquidity", "usd"), num(pair, "volume", "h24")
     created = num(pair, "pairCreatedAt")
     age_h = (now * 1000 - created) / 3_600_000 if created else 0.0
-    wchain = info.get("chain") if info.get("chain") in CHAINS else ("solana" if info.get("kind") == "solana" else "ethereum")
+    wchain = ("solana" if info.get("kind") == "solana" else chain if info.get("kind") == "evm" and chain in CHAINS
+              else info.get("chain") if info.get("chain") in CHAINS else "ethereum")      # (v3.9: a wallet address is the same on every Ethereum-style chain: the link is to the chain of the buy)
     picky, spray = style == "selective", style == "spray"
     hot = low or (picky and 0 < mc <= PICKY_MAX_MC)             # a coin this wallet's buy is announced loudly for
     if picky and hot:
@@ -4099,14 +4623,15 @@ def vip_sweep_solana(tier: str) -> int:
     return n
 
 
-def evm_is_contract(url: str, addr: str) -> bool:
-    """Is this address a contract (a pool, a router) and not a person's wallet? Remembered."""
+def evm_is_contract(url, addr: str, chain: str = "robinhood") -> bool:
+    """Is this address a contract (a pool, a router) and not a person's wallet? Remembered (one memory per chain).
+    url = one node's address or (v3.9) a NodePool."""
     if addr in FOMO_ROUTERS:
         return True
-    cache = _vip_rt["code"]
+    cache = code_cache(chain)
     if addr in cache:
         return cache[addr]
-    code = rpc_call(url, "eth_getCode", [addr, "latest"])
+    code = rpc_any(url, "eth_getCode", [addr, "latest"])
     res = isinstance(code, str) and len(code) > 2
     if len(cache) > 5000:
         cache.clear()
@@ -4114,11 +4639,11 @@ def evm_is_contract(url: str, addr: str) -> bool:
     return res
 
 
-def evm_token_decimals(url: str, chain: str, token: str) -> int:
+def evm_token_decimals(url, chain: str, token: str) -> int:
     dec = _decimals.get((chain, token))
     if dec is None:
         try:
-            dec = int(rpc_call(url, "eth_call", [{"to": token, "data": "0x313ce567"}, "latest"]), 16)
+            dec = int(rpc_any(url, "eth_call", [{"to": token, "data": "0x313ce567"}, "latest"]), 16)
         except Exception:
             return 18                      # (not remembered: it is asked again next time)
         if not 0 <= dec <= 36:
@@ -4127,9 +4652,44 @@ def evm_token_decimals(url: str, chain: str, token: str) -> int:
     return dec
 
 
+def vip_events(ins: dict, outs: dict, quotes: set) -> list:
+    """The transfers into a wallet (and out of it), grouped by transaction -> [(block, tx, token, raw amount, the address it came from)],
+    newest first: a coin that arrived and did NOT also leave in the same transaction (a swap leg is both)."""
+    events = []
+    for tx, rows in ins.items():
+        gone = {t_ for t_, _, _, _ in outs.get(tx, [])}
+        per: dict[str, list] = {}
+        for token, val, other, blk in rows:
+            if not token or token in quotes or token in gone:
+                continue
+            e = per.setdefault(token, [0, other, blk])
+            e[0] += val
+        for token, (val, other, blk) in per.items():
+            events.append((blk, tx, token, val, other))
+    events.sort(reverse=True)
+    return events
+
+
+def vip_handle_events(node, chain: str, w: str, events: list, latest: int, now: float, bps: float) -> int:
+    """The newest few arrivals of a VIP wallet: one that came from a contract (a pool or a router - not from a person) is a buy."""
+    n = 0
+    for blk, tx, token, val, other in events[:8]:               # (the newest few: a flood of airdrops cannot flood the chat)
+        if not (evm_is_contract(node, other, chain)):
+            continue
+        amount = val / 10 ** evm_token_decimals(node, chain, token)
+        at = now - max(0, latest - blk) / bps
+        try:
+            if vip_buy_event(w, chain, token, amount, 0.0, at, tx):
+                n += 1
+        except Exception:
+            log.exception("VIP buy on %s could not be handled", chain)
+    return n
+
+
 def evm_vip_wallet(url: str, chain: str, w: str, latest: int, now: float) -> int:
     """Read the coins that arrived in / left an Ethereum-style VIP wallet since the last look (the token-transfer log of the chain).
-    A coin that arrived from a contract (a pool or a router - not from a person) and did not also leave in the same transaction is a buy."""
+    A coin that arrived from a contract (a pool or a router - not from a person) and did not also leave in the same transaction is a buy.
+    This is the Robinhood Chain way (its own node, one wallet per request); the other chains use evm_vip_group()."""
     cursors = vip_cursors()
     cur = cursors.get(w)
     if not isinstance(cur, int) or isinstance(cur, bool) or cur <= 0 or cur > latest:
@@ -4159,52 +4719,152 @@ def evm_vip_wallet(url: str, chain: str, w: str, latest: int, now: float) -> int
         a = b + 1
         if a <= latest:
             time.sleep(0.3)
-    events = []
-    for tx, rows in ins.items():
-        gone = {t_ for t_, _, _, _ in outs.get(tx, [])}
-        per: dict[str, list] = {}
-        for token, val, other, blk in rows:
-            if not token or token in RH_QUOTES or token in gone:
-                continue
-            e = per.setdefault(token, [0, other, blk])
-            e[0] += val
-        for token, (val, other, blk) in per.items():
-            events.append((blk, tx, token, val, other))
-    events.sort(reverse=True)
-    n = 0
-    for blk, tx, token, val, other in events[:8]:               # (the newest few: a flood of airdrops cannot flood the chat)
-        if not (evm_is_contract(url, other)):
-            continue
-        amount = val / 10 ** evm_token_decimals(url, chain, token)
-        at = now - max(0, latest - blk) / VIP_BLOCKS_PER_SECOND
-        try:
-            if vip_buy_event(w, chain, token, amount, 0.0, at, tx):
-                n += 1
-        except Exception:
-            log.exception("VIP buy on %s could not be handled", chain)
+    n = vip_handle_events(url, chain, w, vip_events(ins, outs, RH_QUOTES), latest, now, VIP_BLOCKS_PER_SECOND)
     cursors[w] = latest
-    vip_note_ok(w, f"up to block {latest:,}")
+    vip_note_ok(w, f"up to block {latest:,}", chain)
+    return n
+
+
+class VipOrRefused(Exception):
+    """Every node refused the 'any of these wallets' form of the log request (so the wallets are asked one at a time)."""
+
+
+def evm_vip_group(pool, chain: str, group: list, latest: int, now: float) -> int:
+    """One look for the VIP wallets of one chain (Base, Ethereum, BNB Chain): the coins that arrived in / left ANY of them since each one's
+    last look - two log requests per block range for the whole group (the wallets are an 'any of these' filter), not two per wallet.
+    The block range of one request is what the chain's nodes have shown they allow (a NodePool learns it). Returns the buys handled."""
+    bps = chain_bps(chain, pool)
+    cursors = vip_cursors()
+    first_back, max_back = int(VIP_FIRST_LOOKBACK_MIN * 60 * bps), int(VIP_CATCHUP_HOURS * 3600 * bps)
+    starts: dict[str, int] = {}
+    for w, _ in group:
+        cur = cursors.get(vip_cursor_key(w, chain))
+        start = latest - first_back if (not isinstance(cur, int) or isinstance(cur, bool) or cur <= 0 or cur > latest) else cur + 1
+        starts[w] = max(start, latest - max_back, 0)
+    pads = {"0x" + w[2:].lower().rjust(64, "0"): w for w, _ in group}
+    who = {"0x" + w[2:].lower(): w for w, _ in group}
+    ask = list(pads) if len(pads) > 1 else next(iter(pads))                 # (one wallet: the plain form every node knows)
+    ins: dict[str, dict] = {w: {} for w, _ in group}
+    outs: dict[str, dict] = {w: {} for w, _ in group}
+    a, cap, steps = min(starts.values()), None, 0
+    while a <= latest:
+        steps += 1
+        if steps > 60:
+            raise RuntimeError("too many log requests for one look")
+        span = pool.window() if cap is None else min(pool.window(), cap)
+        b = min(latest, a + max(NODE_WIN_MIN, span) - 1)
+        got = {}
+        try:
+            for name, topics in (("in", [TRANSFER_TOPIC, None, ask]), ("out", [TRANSFER_TOPIC, ask, None])):
+                got[name] = pool.call("eth_getLogs", [{"fromBlock": hex(a), "toBlock": hex(b), "topics": topics}], timeout=30) or []
+        except RadarTooMany as ex:
+            if ex.kind == "range":
+                node_shrink(ex.url, b - a + 1, chain, ex.limit)               # the node says the range is too wide: from now on it is asked for less
+            elif b - a < 100:
+                raise RuntimeError("too many transfers in a tiny range")
+            else:
+                cap = max(50, (b - a + 1) // 2)                               # too many matching transfers: this stretch is cut in half
+            continue
+        except ValueError as ex:
+            if len(pads) > 1:
+                raise VipOrRefused(str(ex)[:80])
+            raise
+        cap = None
+        for name, store, mine, theirs in (("in", ins, 2, 1), ("out", outs, 1, 2)):
+            for lg in got[name]:
+                t = lg.get("topics") or []
+                data = lg.get("data") or ""
+                if len(t) != 3 or len(data) < 3:
+                    continue                                               # (not a plain coin transfer - an NFT, say)
+                try:
+                    val, blk = int(data, 16), int(lg["blockNumber"], 16)
+                except (ValueError, TypeError, KeyError):
+                    continue
+                w = who.get("0x" + str(t[mine])[-40:].lower())
+                if w is None or blk < starts[w]:
+                    continue
+                store[w].setdefault(str(lg.get("transactionHash") or ""), []).append(
+                    ((lg.get("address") or "").lower(), val, "0x" + str(t[theirs])[-40:].lower(), blk))
+        a = b + 1
+        if a <= latest:
+            time.sleep(0.3)
+    n = 0
+    quotes = evm_quote_set(chain)
+    for w, _ in group:
+        try:
+            n += vip_handle_events(pool, chain, w, vip_events(ins[w], outs[w], quotes), latest, now, bps)
+            cursors[vip_cursor_key(w, chain)] = latest
+            vip_note_ok(w, f"up to block {latest:,}", chain)
+        except Exception as e:
+            vip_note_error(w, e, chain)
+    return n
+
+
+def vip_sweep_chain(chain: str, group: list) -> int:
+    """The VIP wallets of one chain (Base, Ethereum, BNB Chain), all looked at together through the chain's free public nodes."""
+    pool = NodePool(chain, scope="vip")
+    if not pool.urls:
+        return 0
+    try:
+        if pool.down():
+            raise RuntimeError("all the free nodes of " + CHAINS[chain]["name"] + " are resting after errors")
+        latest = int(pool.call("eth_blockNumber", [], timeout=15), 16)
+    except Exception as e:
+        for w, _ in group:
+            vip_note_error(w, e, chain)
+        return 0
+    n, now = 0, time.time()
+    or_bad = _vip_rt.setdefault("or_bad", {})
+    for i in range(0, len(group), VIP_GROUP_MAX):
+        part = group[i:i + VIP_GROUP_MAX]
+        batches = [[x] for x in part] if (now < or_bad.get(chain, 0) or len(part) == 1) else [part]
+        for batch in batches:
+            try:
+                n += evm_vip_group(pool, chain, batch, latest, now)
+            except VipOrRefused as ex:
+                or_bad[chain] = now + 3600                                     # (asked wallet by wallet for the next hour)
+                log.warning("VIP: the %s nodes refused the 'any of these wallets' request (%s) - asking one wallet at a time", chain, ex)
+                if pool.down():
+                    break                                                      # (every node is resting after saying no: the next look - 90 s later - asks wallet by wallet)
+                for x in batch:
+                    try:
+                        n += evm_vip_group(pool, chain, [x], latest, now)
+                    except Exception as e:
+                        vip_note_error(x[0], e, chain)
+            except Exception as e:
+                for w, _ in batch:
+                    vip_note_error(w, e, chain)
     return n
 
 
 def vip_sweep_evm() -> int:
-    """Robinhood Chain: the VIP wallets there, one look for all of them (the chain's own free node)."""
-    wallets = [(w, d) for w, d in vip_items("evm") if (d.get("chain") or "robinhood") == "robinhood"]
+    """The VIP wallets on the Ethereum-style chains: Robinhood Chain first (its own free node, one look for all of them), then Base,
+    Ethereum and BNB Chain (v3.9: each chain's free public nodes, the wallets of a chain looked at together)."""
+    n = 0
+    items = vip_items("evm")
+    wallets = [(w, d) for w, d in items if "robinhood" in vip_chains(d)]
     url = EVM_RPC.get("robinhood", "")
-    if not wallets or not url:
-        return 0
-    try:
-        latest = int(rpc_call(url, "eth_blockNumber", []), 16)
-    except Exception as e:
-        for w, _ in wallets:
-            vip_note_error(w, e)
-        return 0
-    n, now = 0, time.time()
-    for w, _ in wallets:
+    if wallets and url:
         try:
-            n += evm_vip_wallet(url, "robinhood", w, latest, now)
+            latest = int(rpc_call(url, "eth_blockNumber", []), 16)
         except Exception as e:
-            vip_note_error(w, e)
+            for w, _ in wallets:
+                vip_note_error(w, e, "robinhood")
+        else:
+            now = time.time()
+            for w, _ in wallets:
+                try:
+                    n += evm_vip_wallet(url, "robinhood", w, latest, now)
+                except Exception as e:
+                    vip_note_error(w, e, "robinhood")
+    for chain in ("base", "ethereum", "bsc"):
+        group = [(w, d) for w, d in items if chain in vip_chains(d)]
+        if not group:
+            continue
+        try:
+            n += vip_sweep_chain(chain, group)
+        except Exception:
+            log.exception("VIP sweep (%s) error", chain)
     return n
 
 
@@ -4251,7 +4911,7 @@ def hunters_pass() -> int:
             break
         decided = s["wins"] + s["stops"]
         if (s["wins"] < HUNTER_MIN_WINS or s["wsum"] < 0.6 * HUNTER_MIN_WINS or s["wins"] / decided < HUNTER_MIN_RATE
-                or s["chain"] not in ("solana", "robinhood")):
+                or s["chain"] not in ("solana",) + VIP_EVM_CHAINS):         # (v3.9: Base, Ethereum and BNB Chain wallets can be looked at now too)
             continue
         kind = wallet_kind(w)
         key = w.lower() if kind == "evm" else w
@@ -4470,24 +5130,38 @@ def parse_money(text: str) -> float | None:
 def vip_add(rest: list[str]) -> str:
     addr = next((a for a in rest if wallet_kind(a)), None)
     if not addr:
-        return ("Send it like this: /vip add <wallet address> <a name you choose> [kol] [picky|spray|normal]\n"
+        return ("Send it like this: /vip add <wallet address> <a name you choose> [chains] [kol] [picky|spray|normal]\n"
+                "• chains: base, eth, bnb, robinhood (or all) - the chains an Ethereum-style wallet is looked at on; no word = all four.\n"
                 "• kol at the end: every coin it buys also goes on the dip-watch.\n"
                 "• picky: a wallet that rarely trades (you get the loud ping on bigger coins too) · spray: a wallet that buys everything (quiet messages) · "
                 "no word: I judge it myself from how many different coins it buys.")
     words = [a for a in rest if a != addr]
-    kol, style = False, None
-    while words and (words[-1].lower() == "kol" or (len(words) > 1 and words[-1].lower() in STYLE_WORDS)):    # (the words may come in either order)
+    kol, style, chains = False, None, []
+    while words and (words[-1].lower() == "kol" or (len(words) > 1 and (words[-1].lower() in STYLE_WORDS or words[-1].lower() == "all"
+                                                                           or norm_chain(words[-1]) in VIP_EVM_CHAINS))):    # (the words may come in any order)
         wd = words.pop().lower()
         if wd == "kol":
             kol = True
-        else:
+        elif wd == "all":
+            chains.extend(VIP_EVM_CHAINS)
+        elif wd in STYLE_WORDS:
             style = STYLE_WORDS[wd]
+        else:
+            chains.append(norm_chain(wd))
     kind = wallet_kind(addr)
     new = (addr.lower() if kind == "evm" else addr) not in state["watch"]
     key = add_watch(addr, " ".join(words).strip())
     info = state["watch"][key]
     kol = kol or bool(info.get("kol"))                 # (adding it again without the word kol does not switch the dip-watch off)
     info.update(vip=True, tier="vip", chain="solana" if kind == "solana" else "robinhood", kol=kol, sure="added by you")
+    if kind == "evm":
+        if chains:
+            info["chains"] = [c for c in VIP_EVM_CHAINS if c in chains]
+            info["chains_user"] = True
+            vip_drop_cursors(key, info["chains"])
+        elif "chains" not in info:
+            info["chains"] = list(VIP_EVM_CHAINS)
+        info["chain"] = vip_chains(info)[0]
     info.setdefault("note", "added by you")
     info.setdefault("vip_t", time.time())
     if style == "auto":
@@ -4501,8 +5175,9 @@ def vip_add(rest: list[str]) -> str:
     if kind == "solana":
         how = "I look inside it every ~90 seconds."
     else:
-        how = ("I read its coin transfers on Robinhood Chain every ~90 seconds. (For a VIP wallet I only look at Robinhood Chain; "
-               "if this one trades on another chain, use /watch for that.)")
+        names = ", ".join(CHAINS[c]["name"] for c in vip_chains(info))
+        how = (f"I read its coin transfers on {names} every ~90 seconds."
+               + ("" if info.get("chains_user") else " (Only some of these chains? /vip chains " + md_escape(wallet_label(key)) + " base eth ...)"))
     cur = info.get("style")
     if cur == "selective":
         st = (f"\n🎯 Style: *picky* (you set it) - when it buys, you get the loud message on any coin up to {fmt_usd(PICKY_MAX_MC)} market cap, "
@@ -4556,13 +5231,41 @@ def vip_set_style(rest: list[str]) -> str:
     return out if len(out) <= 3800 else out[:3800].rsplit("\n", 1)[0]
 
 
+def vip_set_chains(rest: list[str]) -> str:
+    """/vip chains <name> <chains | all> - which Ethereum-style chains a VIP wallet is looked at on. Just /vip chains lists them."""
+    words = list(rest)
+    chains: list[str] = []
+    while len(words) > 1 and (words[-1].lower() == "all" or norm_chain(words[-1]) in VIP_EVM_CHAINS):
+        wd = words.pop().lower()
+        chains.extend(VIP_EVM_CHAINS if wd == "all" else [norm_chain(wd)])
+    if not chains:
+        L = ["🌐 *Chains for VIP wallets* - an Ethereum-style wallet (the same 0x address everywhere) is looked at on Robinhood Chain, Base, Ethereum and BNB Chain "
+             "unless you pick fewer."]
+        for w, d in vip_items("evm"):
+            L.append(f"• {md_escape(wallet_label(w))}: " + ", ".join(CHAINS[c]["name"] for c in vip_chains(d)) + (" ✏️" if d.get("chains_user") else ""))
+        L.append("\nChange one: /vip chains <name> base eth   (or: all). Solana wallets are always looked at on Solana.")
+        return "\n".join(L)
+    key = find_watch(" ".join(words))
+    info = state["watch"].get(key) if key else None
+    if not isinstance(info, dict) or not info.get("vip"):
+        return "I don't have a VIP wallet like that. Send /vip to see the list."
+    if info.get("kind") != "evm":
+        return "That is a Solana wallet - it is looked at on Solana only."
+    info["chains"] = [c for c in VIP_EVM_CHAINS if c in chains]
+    info["chains_user"] = True
+    info["chain"] = info["chains"][0]
+    vip_drop_cursors(key, info["chains"])
+    save_state()
+    return f"✅ *{md_escape(wallet_label(key))}* is now looked at on " + ", ".join(CHAINS[c]["name"] for c in info["chains"]) + "."
+
+
 def vip_remove(rest: list[str]) -> str:
     key = find_watch(" ".join(rest))
     if not key or not (state["watch"].get(key) or {}).get("vip"):
         return "I don't have a VIP wallet like that. Send /vip to see the list."
     info = state["watch"][key]
     label = wallet_label(key)
-    for f in ("vip", "tier", "kol", "sure", "note", "chain", "style", "style_seeded", "vip_t"):
+    for f in ("vip", "tier", "kol", "sure", "note", "chain", "chains", "chains_user", "style", "style_seeded", "vip_t"):
         info.pop(f, None)
     buys = state["tuning"].get("vip_buys")
     if isinstance(buys, dict):
@@ -4572,8 +5275,7 @@ def vip_remove(rest: list[str]) -> str:
         off = state["tuning"]["vip_off"] = []
     if key not in off:
         off.append(key)                   # (so that a built-in VIP does not come back at the next start-up)
-    cursors = vip_cursors()
-    cursors.pop(key, None)
+    vip_drop_cursors(key, [])
     return (f"🗑 *{md_escape(label)}* is off the VIP list. I still watch it like your other wallets (/unwatch stops that too).")
 
 
@@ -4585,6 +5287,8 @@ def cmd_vip(args: list[str]) -> str:
         return vip_remove(args[1:])
     if sub in ("style", "styles", "type", "types"):
         return vip_set_style(args[1:])
+    if sub in ("chains", "chain", "networks"):
+        return vip_set_chains(args[1:])
     if sub in ("min", "minimum") or sub in ("ping", "pings", "repeat", "repeats"):
         if len(args) < 2:
             return "Send it like this: /vip min 300   (ignore buys under $300)   or   /vip ping 3   (repeat each loud message 3 times, 0-4)"
@@ -4611,15 +5315,18 @@ def cmd_vip(args: list[str]) -> str:
     if not items:
         L.append("\nNo VIP wallets yet. Add one: /vip add <wallet address> <name>")
     for i, (w, d) in enumerate(items, 1):
-        chain = d.get("chain") if d.get("chain") in CHAINS else ("solana" if d.get("kind") == "solana" else "ethereum")
-        tag = "🎯 hunter found by the bot" if d.get("tier") == "hunter" else {"certain": "✅ certain match", "likely": "🔶 probable match"}.get(d.get("sure"), "")
+        chs = vip_chains(d) if d.get("kind") == "evm" else []
+        chain = (chs[0] if chs else d.get("chain")) if (chs or d.get("chain") in CHAINS) else ("solana" if d.get("kind") == "solana" else "ethereum")
+        where = (f"{len(chs)} chains" if len(chs) == len(VIP_EVM_CHAINS) else " + ".join(CHAINS[c]["name"] for c in chs)) if len(chs) > 1 else CHAINS[chain]["name"]
+        tag = ("🎯 hunter found by the bot" if d.get("tier") == "hunter"
+               else {"certain": "✅ certain match", "likely": "🔶 probable match", "research": "🔎 found in my research"}.get(d.get("sure"), ""))
         last = vip_last_buy(w)
         lb = (f"\n   last buy seen: ${md_escape(str(last.get('s', '?')))} {fmt_usd(last.get('usd', 0))} at market cap {fmt_usd(last.get('mc', 0))}, "
               f"{ago(now - last.get('t', now))} ago" if last else "\n   no buy seen since I started looking")
-        L.append(f"\n{i}. *{md_escape(wallet_label(w))}* · {CHAINS[chain]['name']} · [{short(w)}]({link(chain, 'addr', w)})"
+        L.append(f"\n{i}. *{md_escape(wallet_label(w))}* · {where} · [{short(w)}]({link(chain, 'addr', w)})"
                  + (f" · {tag}" if tag else "") + (" · 📉 dip-watch on" if d.get("kol") else "") + style_tag(w, d, now)
                  + f"\n   {vip_status_text(w, d)}{lb}")
-    L.append("\n/vip add <address> <name> [kol] [picky|spray] · /vip style <name> picky|spray|normal|auto · /vip remove <name> · /vip min 300 · /vip ping 3 · /lowcap 500k · /alerts vip off")
+    L.append("\n/vip add <address> <name> [chains] [kol] [picky|spray] · /vip chains <name> base eth · /vip style <name> picky|spray|normal|auto · /vip remove <name> · /vip min 300 · /vip ping 3 · /lowcap 500k · /alerts vip off")
     out = "\n".join(L)
     return out if len(out) <= 3800 else out[:3800].rsplit("\n", 1)[0]
 
@@ -4765,7 +5472,15 @@ def vip_status_lines() -> list[str]:
         loud = len(_last_day(state["tuning"].get("vip_ts"), now))
         L = [f"🚨 VIP wallets: {', '.join(named[:5]) or 'none'}" + (f" + {hunters} low-cap hunter{'' if hunters == 1 else 's'}" if hunters else "")
              + f" · a low cap = {fmt_usd(lowcap_limit())} or less · loud pings in the last 24h: {loud} (/vip)"]
-        bad = [w for w, _ in items if _vip_rt["err"].get(w, 0) >= 3]
+        cerr, clook = _vip_rt.get("cerr") or {}, _vip_rt.get("clook") or {}
+        for c in VIP_EVM_CHAINS:                           # (v3.9: one warning per chain, so one bad BNB node does not look like every wallet is broken)
+            here = [(w, d) for w, d in items if d.get("kind") == "evm" and c in vip_chains(d)]
+            bad_here = [w for w, _ in here if cerr.get((w, c), 0) >= 3]
+            if bad_here:
+                why = (clook.get((bad_here[0], c)) or (0, False, ""))[2]
+                L.append(f"⚠️ I couldn't look inside {len(bad_here)} of {len(here)} VIP wallet(s) on {CHAINS[c]['name']} lately ({md_escape(str(why)[:60])}) - I keep trying"
+                         + (" (/radar nodes)" if c != "robinhood" else ""))
+        bad = [w for w, d in items if d.get("kind") != "evm" and _vip_rt["err"].get(w, 0) >= 3]
         if bad:
             L.append(f"⚠️ I couldn't look inside {len(bad)} VIP wallet(s) lately: {md_escape(vip_status_text(bad[0]))}")
         if STYLE_ON:
@@ -4849,6 +5564,51 @@ def startup_note381() -> str:
             "wallet (it only kept the biggest 6) and says how many of the buyers have a weak record or are 🧊 cooling. The coin lists "
             "(/coins and the check-in) show how many buyers are trusted, cooling, weak or not rated yet, so a medal can no longer hide "
             "a weak crowd. A 🧊 wallet that holds a coin no longer earns a smart-money point either.\n")
+
+
+def startup_note39() -> str:
+    """The v3.9 start-up note (shown once)."""
+    on = [c for c in radar_chains_on() if c in CHAINS]
+    names = ", ".join(CHAINS[c]["name"] for c in on) or "no chain"
+    big = radar_base("base")["acc"]
+    age_d = radar_base("base")["age_d"]
+    age_txt = (f" Coins whose pools are older than {age_d:g} days are skipped there (no point pinging old coins; /radar set base age 60 changes it, 0 = any age)."
+               if age_d > 0 else "")
+    return ("🆕 v3.9: the accumulation radar and the VIP wallets now work on more than Robinhood Chain.\n"
+            f"📡 *Radar on {names}.* Same idea as before - many different wallets keep buying a coin and holding it - but on Base, Ethereum and BNB Chain "
+            "I read the coin's own transfer log from free public nodes (they differ in how much they let me ask for, so I learn each node's limit by "
+            "trying, and I have backup nodes). Solana has no such log, so for Solana I collect GeckoTerminal's latest trades (the ones above "
+            f"${BUYER_TRADE_FLOOR_USD:g}) over several hours: I need about {SOL_MIN_COVER_H:g} hours of one coin before it can alert, and a coin that trades "
+            "too fast for me to follow is skipped. On the big chains the limits are lower and aimed at smaller coins "
+            f"({big} wallets instead of Robinhood Chain's {RADAR_MIN_ACC}) - they are first guesses, you can change each one." + age_txt + f" I send at most {RADAR_CHAIN_MAX_PER_DAY} radar alerts a day per chain "
+            f"({RADAR_MAX_PER_DAY} on Robinhood Chain) and {RADAR_TOTAL_PER_DAY} in all.\n"
+            "/radar solana, /radar eth, /radar base, /radar bnb or /radar robinhood shows one chain; /radar `<coin address>` reads one coin now "
+            "(any of the five chains); /radar nodes shows which nodes I read from and the limits I learned; /radar set changes a limit "
+            "without a new upload.\n"
+            "🚨 *VIP wallets on every chain.* Before, I only looked inside a VIP wallet on Robinhood Chain, so angery's CLAUS buy on Ethereum never "
+            "pinged you. Now an 0x VIP wallet is looked at on Robinhood Chain, Base, Ethereum and BNB Chain every ~90 seconds "
+            "(/vip chains `<name>` base eth picks fewer; /vip add `<address>` `<name>` base eth does the same when adding). "
+            "One new built-in VIP: a Base wallet (base-574k) from my research - it was about +$574K over a year, but I could not re-check that, "
+            "so /vip remove base-574k if you do not want it.\n"
+            "⚠️ I could not test the free nodes of Base, Ethereum and BNB Chain before sending this, and every limit above is a first guess. "
+            "/radar shows 'not reading yet' for a chain whose nodes refuse me; then send me the /radar nodes text, or set the address of your own "
+            "node (from a provider like Alchemy or QuickNode; its plan has to allow reading logs over a few thousand blocks) as `RPC_BASE`, "
+            "`RPC_ETHEREUM` or `RPC_BSC` (the VIP wallets use it too).\n")
+
+
+def startup_note391() -> str:
+    """The v3.9.1 start-up note (shown once)."""
+    lim = bw_limit_gb()
+    return ("🆕 v3.9.1: why Render switched me off, and the fix.\n"
+            f"Render's free plan lets only {lim:g} GB of data leave the server each month; past that it switches the whole service off until the next month. "
+            "By my own count most of it was my memory backup: I re-sent my whole memory file (about 3 MB) every 5 minutes, roughly 0.9 GB a day.\n"
+            f"💾 *Now* the pinned memory file is compressed (about a third of the size) and saved far less often: within about {BACKUP_URGENT_GAP // 60} minutes "
+            f"after something you did or a message I sent, otherwise every {BACKUP_ROUTINE_GAP / 3600:g} hours at most"
+            + (f", and never more than {BACKUP_DAY_MB:g} MB a day" if BACKUP_DAY_MB > 0 else "")
+            + ". It is called `bot_memory.json.gz`; I read both kinds, and the safety copies and /backup stay plain .json files.\n"
+            "📶 I also count every byte I send (/bandwidth shows it). If a month is on course to pass the allowance I slow down by myself - a saver mode, "
+            "I tell you when it starts and stops - instead of being switched off. My count is an estimate, so check Render's own number (Metrics, outbound "
+            "bandwidth) and tell me with /bandwidth set 2.4 if they differ.\n")
 
 
 def lowcap_book_numbers() -> dict:
@@ -5003,7 +5763,142 @@ ZERO_ADDR = "0x" + "0" * 40
 DEAD_ADDR = "0x000000000000000000000000000000000000dead"
 RADAR_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951"      # the Uniswap v4 PoolManager on Robinhood Chain: the coins of every v4 pool sit in it
 RADAR_SEED_HUBS = {RADAR_POOL_MANAGER, ZERO_ADDR, DEAD_ADDR} | set(FOMO_ROUTERS)
-_radar_rt: dict = {"cands": [], "cand_t": 0.0, "latest": (0.0, 0), "last_err": "", "force": False, "ticks": 0}
+
+
+# ----------------------------------------------------------------------------
+# v3.9 - THE RADAR ON EVERY CHAIN. Robinhood Chain works as before. Base, Ethereum and BNB Chain are read the same way (the coin's own
+# transfer log, from free public nodes - with backups, and limits that each node's own answers teach the bot). Solana has no log to read,
+# so it is a SAMPLE: GeckoTerminal's list of the latest trades (up to 300 per look) is collected over hours, and an alert needs at least
+# SOL_MIN_COVER_H hours of it. On the big chains the coins that matter are the smaller ones, so their settings sit below Robinhood Chain's
+# (15 wallets, not 25), and they skip coins whose pools are older than RADAR_SMALL_MAX_AGE_D days. All of them are first guesses:
+# /radar set <chain> acc|net|buy|recent|age <number> changes one without a new upload, and the results of the alerts (/lowcap) will show
+# whether to tighten or loosen them.
+# ----------------------------------------------------------------------------
+RADAR_EVM = ("robinhood", "base", "ethereum", "bsc")
+RADAR_ALL = RADAR_EVM + ("solana",)
+RADAR_CHAINS = [c for c in dict.fromkeys(norm_chain(x) or "" for x in os.getenv("RADAR_CHAINS", ",".join(RADAR_ALL)).split(",")) if c in RADAR_ALL]
+RADAR_CHAIN_MAX_PER_DAY = int(env_float("RADAR_CHAIN_MAX_PER_DAY", 2))        # alerts per chain per 24h (RADAR_MAX_PER_DAY is the limit for all of them together)
+RADAR_TOTAL_PER_DAY = int(env_float("RADAR_TOTAL_PER_DAY", 6))                # alerts per 24h over all the chains together
+RADAR_TICK_BUDGET = 150.0                                       # seconds: one round over all the chains stops starting new chains after this long
+RADAR_MIN_HOURS = 6.0                                           # a reading that covers fewer hours than this (a slow node) is not trusted
+SOL_MIN_COVER_H = env_float("SOL_MIN_COVER_H", 6)               # Solana: hours of collected trades needed before the radar may alert
+SOL_MAX_GAP = 0.35                                              # Solana: more than this share of the covered time unseen (the list overflowed between looks) = too busy to follow
+SOL_TOO_ACTIVE_H = 0.4                                          # Solana: 300 trades above the floor within less than this many hours = a hot coin, not followed
+SOL_FULL_SAMPLE = 290                                           # a trade list this long is cut off at the oldest trade: it may not reach back as far as the last look
+SOL_API_HOURS = 24.0                                            # GeckoTerminal's trade list reaches back at most this far
+SOL_MAX_COINS = 90                                              # coins whose collected trades are kept in memory
+SOL_MAX_TRADES = 4000                                           # trades kept per coin (a very busy coin loses its oldest, and the covered time starts later)
+SOL_COINS_PER_ROUND = 2                                         # Solana coins looked at per round (GeckoTerminal's free limit is shared with the whole bot)
+SOL_MAX_CANDS = 45                                              # Solana coins on the list to look at
+RADAR_SMALL = dict(liq=40_000.0, mc_min=80_000.0, mc_max=150_000_000.0, age_h=48.0, age_d=max(0.0, RADAR_SMALL_MAX_AGE_D), buy=150.0, acc=15, net=8_000.0,
+                   recent=6, run=35.0, drop=-45.0, pages=5)
+RADAR_PROFILES = {
+    "base": dict(RADAR_SMALL),
+    "ethereum": dict(RADAR_SMALL, liq=60_000.0, mc_min=100_000.0, mc_max=300_000_000.0, buy=300.0, net=15_000.0, recent=5),
+    "bsc": dict(RADAR_SMALL),
+    "solana": dict(RADAR_SMALL, acc=12, recent=5),
+}
+RADAR_TUNABLE = {"acc": "wallets that must be accumulating", "net": "dollars they must have bought together",
+                 "buy": "dollars one wallet must have bought to count", "recent": "of them still buying in the last 6 hours",
+                 "age_d": "the oldest a coin's pools may be, in days (0 = any age)"}
+RADAR_V4_MANAGERS = {"ethereum": "0x000000000004444c5dc75cb358380d2e3de08a90", "base": "0x498581ff718922c3f8e6a244956af099b2652b2b",
+                     "bsc": "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df"}        # Uniswap v4's PoolManager: the coins of every v4 pool sit in it (a wrong address here does no harm)
+# the free public nodes for each chain, best first: the first one that answers is used, one that fails rests for a while and the next one is asked
+LOG_NODES = {
+    "ethereum": ("https://ethereum-rpc.publicnode.com", "https://eth.drpc.org", "https://gateway.tenderly.co/public/mainnet", "https://1rpc.io/eth"),
+    "base": ("https://base-rpc.publicnode.com", "https://base.drpc.org", "https://mainnet.base.org", "https://gateway.tenderly.co/public/base", "https://1rpc.io/base"),
+    "bsc": ("https://bsc-rpc.publicnode.com", "https://bsc.drpc.org", "https://bsc-dataseed.binance.org", "https://bsc-dataseed1.defibit.io", "https://1rpc.io/bnb"),
+}
+_RPC_ENV = {"ethereum": "RPC_ETHEREUM", "base": "RPC_BASE", "bsc": "RPC_BSC", "robinhood": "RPC_ROBINHOOD"}
+NODE_REST = (45, 180, 600, 1800)                                # a node that fails rests this many seconds (longer each time in a row)
+NODE_WIN_START = {"ethereum": 10_000, "base": 25_000, "bsc": 25_000, "robinhood": 25_000}      # blocks per log request until a node's answers say otherwise (a refusal that names its limit teaches the exact number at once)
+NODE_WIN_MIN, NODE_WIN_MAX = 200, 200_000
+NODE_GROW_AFTER = 10                                            # after this many full-size requests in a row a node's window is tried at twice the size
+DEFAULT_BPS = {"ethereum": 1 / 12, "base": 0.5, "bsc": 2.2, "robinhood": 9.8}     # blocks per second, used until the node's own time stamps have been read
+BPS_KEEP_SECONDS = 6 * 3600
+
+
+def _radar_blank() -> dict:
+    return {"cands": [], "cand_t": 0.0, "latest": (0.0, 0), "last_err": "", "force": False, "ticks": 0}
+
+
+_radar_rt: dict = _radar_blank()                               # Robinhood Chain's (the name the first version used)
+_radar_rts: dict = {"robinhood": _radar_rt}                    # every chain's own
+
+
+def radar_rt(chain: str) -> dict:
+    """The radar's working notes for one chain (its coin list, the latest block, the last problem)."""
+    rt = _radar_rts.get(chain)
+    if rt is None:
+        rt = _radar_rts[chain] = _radar_blank()
+    return rt
+
+
+def radar_base(chain: str) -> dict:
+    """The built-in settings of one chain. Robinhood Chain's follow the RADAR_* numbers at the top of the file (so changing those still counts)."""
+    if chain in RADAR_PROFILES:
+        return RADAR_PROFILES[chain]
+    return dict(liq=RADAR_MIN_LIQ_USD, mc_min=RADAR_MIN_MC, mc_max=RADAR_MAX_MC, age_h=RADAR_MIN_AGE_H, age_d=0.0, buy=RADAR_MIN_BUY_USD, acc=RADAR_MIN_ACC,
+                net=RADAR_MIN_NET_USD, recent=RADAR_MIN_RECENT, run=RADAR_MAX_RUN, drop=RADAR_MIN_DROP, pages=RADAR_LIST_PAGES)
+
+
+def radar_val_ok(field: str, v) -> bool:
+    """Is v a usable value for one of the radar settings you can change? (all must be above 0; the age limit may also be 0 = any age)"""
+    return (field in RADAR_TUNABLE and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            and (v > 0 or (field == "age_d" and v == 0)))
+
+
+def radar_cfg(chain: str, field: str) -> float:
+    """One setting of one chain: what /radar set gave it, else the built-in one."""
+    ov = state["tuning"].get("radar_cfg")
+    v = ov[chain].get(field) if isinstance(ov, dict) and isinstance(ov.get(chain), dict) else None
+    if radar_val_ok(field, v):
+        return float(v)
+    return radar_base(chain)[field]
+
+
+def radar_too_old(e: dict, chain: str) -> bool:
+    """Are a coin's pools older than the chain's age limit (radar_cfg 'age_d'; 0 = no limit)? e['age'] is the age in hours that was read with it."""
+    lim = radar_cfg(chain, "age_d")
+    return lim > 0 and e.get("age", 0) > lim * 24
+
+
+def radar_chain_of(e: dict, key: str = "") -> str:
+    """Which chain a radar reading belongs to (readings from before v3.9 have no 'chain': they are Robinhood Chain's)."""
+    c = e.get("chain") if isinstance(e, dict) else None
+    if c in RADAR_ALL:
+        return c
+    c = key.split(":", 1)[0] if ":" in key else ""
+    return c if c in RADAR_ALL else "robinhood"
+
+
+def chain_nodes(chain: str) -> list[str]:
+    """The nodes to read one chain's logs from, best first: the one you set (RPC_BASE and so on), then the free public ones."""
+    urls: list[str] = []
+    mine = os.getenv(_RPC_ENV.get(chain, ""), "").strip() if chain in _RPC_ENV else ""
+    if mine:
+        urls.append(mine)
+    if chain == "robinhood":
+        if EVM_RPC.get("robinhood"):
+            urls.append(EVM_RPC["robinhood"])
+    else:
+        urls.extend(LOG_NODES.get(chain, ()))
+    return list(dict.fromkeys(u for u in urls if u))
+
+
+def radar_chains_on() -> list[str]:
+    """The chains the radar reads right now."""
+    if not RADAR_ON:
+        return []
+    return [c for c in RADAR_CHAINS if c == "solana" or chain_nodes(c)]
+
+
+def evm_quote_set(chain: str) -> set:
+    """Money, not coins: the chain's wrapped native coin and its main stable coins."""
+    out = set(EVM_STABLES.get(chain, ()))
+    if WRAPPED_NATIVE.get(chain):
+        out.add(WRAPPED_NATIVE[chain])
+    return out
 
 
 def radar_coins() -> dict:
@@ -5018,17 +5913,58 @@ def radar_coins() -> dict:
 
 
 class RadarTooMany(Exception):
-    """The node has more transfers than it returns in one answer (or the block range is too wide): ask for a smaller range."""
+    """The node has more transfers than it returns in one answer (or the block range is too wide): ask for a smaller range.
+    .kind = 'range' (too many blocks in one request) or 'results' (too many matching transfers); .url = the node that said so."""
+    kind = "results"
+    url = ""
+    limit = None                                         # the number of blocks a node said it allows ('limited to a 2,000 range'), when its message names one
 
 
 class RadarBusy(Exception):
     """This coin has too many transfers to read politely (it would take more node requests than RADAR_MAX_CALLS)."""
 
 
-def radar_rpc(url: str, method: str, params: list, timeout: float = 30.0):
+class RadarNodeLimit(RadarBusy):
+    """Not this coin's fault: the chain's nodes only answer very small block ranges right now (it is tried again at the next reading)."""
+
+
+def too_big_kind(msg: str) -> str:
+    """Is a node's error message about the SIZE of the question? -> 'range' (too many blocks in one request), 'results' (too many matching
+    transfers, or the answer would be too heavy) or '' (anything else: a rate limit, a down node, a refused method...)."""
+    m = msg.lower()
+    if any(x in m for x in ("rate limit", "rate-limit", "too many requests", "requests per", "per second", "quota", "credit", "api key", "unauthorized",
+                            "forbidden", "method not", "does not exist", "unknown method", "not whitelisted")):
+        return ""                                              # a rate limit, a refused method, a missing key: not a question of size
+    if ("not supported" in m or "not available" in m) and not (("range" in m or "blocks" in m) and re.search(r"\d{3,}", m)):
+        return ""                                              # ('method not supported' is a refusal; 'ranges over 10000 blocks are not supported' is a size limit)
+    about_results = any(x in m for x in ("result", "log response", "response size", "response is too large", "response too large", "payload",
+                                         "matched", "too many logs", "more than", "timeout", "timed out", "took too long"))
+    about_range = ("range" in m or "blocks" in m) and (any(x in m for x in ("large", "wide", "exceed", "limit", "max", "too many", "up to", "at most",
+                                                                              "no more than", "less than", "smaller than", "should be", "must be", "greater"))
+                                                       or re.search(r"\d{3,}", m) is not None)
+    if about_results:
+        return "results"
+    return "range" if about_range else ""
+
+
+def range_limit_from(msg: str) -> int | None:
+    """A node that names how many blocks it allows ('limited to a 10,000 range', 'maximum block range: 5000', 'ranges over 10000 blocks are not
+    supported') -> that number; None when the message names none (then the bot halves its guess instead)."""
+    m = re.sub(r"0x[0-9a-f]+", " ", msg.lower().replace(",", ""))
+    for rx in (r"(\d+(?:\.\d+)?)\s*(k)?\s*(?:blocks?|block range|range)", r"(?:range|blocks?)\D{0,30}?(\d+(?:\.\d+)?)\s*(k)?\b"):
+        mt = re.search(rx, m)
+        if mt:
+            n = float(mt.group(1)) * (1000 if mt.group(2) else 1)
+            if NODE_WIN_MIN <= n <= NODE_WIN_MAX:
+                return int(n)
+    return None
+
+
+def radar_rpc(url: str, method: str, params: list, timeout: float = 30.0, scope: str = "radar"):
     """Like rpc_call, but (1) 'too many results' is not counted as the node being down (the range is simply cut in two and asked again) and
-    (2) its failures are counted apart from the VIP wallets' (the radar must never make the VIP looks wait)."""
-    fk = url + "#radar"
+    (2) its failures are counted apart from the VIP wallets' (the radar must never make the VIP looks wait). scope='vip' counts them
+    together with the VIP wallets' own (the same count rpc_call keeps)."""
+    fk = url + "#radar" if scope == "radar" else url
     n, t = _rpc_fail.get(fk, (0, 0.0))
     if n >= 3 and time.time() - t < 120:
         raise RuntimeError("node link is busy - skipped for a moment")
@@ -5042,11 +5978,13 @@ def radar_rpc(url: str, method: str, params: list, timeout: float = 30.0):
     err = d.get("error") if isinstance(d, dict) else None
     if err:
         msg = str(err.get("message") if isinstance(err, dict) else err)
-        low_msg = msg.lower()
-        if any(x in low_msg for x in ("exceeds limit", "too many results", "result size", "block range", "range too large", "range is too large",
-                                      "maximum block range", "query returned more than")):
+        kind = too_big_kind(msg)
+        if kind:
             _rpc_fail.pop(fk, None)                                # (the node answered; the question was just too big)
-            raise RadarTooMany(msg[:100])
+            ex = RadarTooMany(msg[:100])
+            ex.kind, ex.url = kind, url
+            ex.limit = range_limit_from(msg) if kind == "range" else None
+            raise ex
         _rpc_fail[fk] = (n + 1, time.time())
         raise ValueError("node answered with an error: " + msg[:100])
     if not isinstance(d, dict) or "result" not in d:
@@ -5056,25 +5994,226 @@ def radar_rpc(url: str, method: str, params: list, timeout: float = 30.0):
     return d["result"]
 
 
-def radar_get_logs(url: str, token: str, a: int, b: int, left: list) -> list[tuple]:
+# --- the nodes of a chain: backups, and limits learned from the nodes' own answers ---
+_nodes: dict[str, dict] = {}
+_bps: dict[str, tuple] = {}                                    # chain -> (when, blocks per second, 'measured' / 'default')
+
+
+def node_stat(url: str) -> dict:
+    st = _nodes.get(url)
+    if st is None:
+        st = _nodes[url] = {"fails": 0, "until": 0.0, "err": "", "win": 0, "wins": 0, "ok": 0, "t_ok": 0.0, "batch": True}
+        saved = state["radar"].get("win") if isinstance(state.get("radar"), dict) else None
+        v = saved.get(url) if isinstance(saved, dict) else None
+        if isinstance(v, int) and not isinstance(v, bool) and NODE_WIN_MIN <= v <= NODE_WIN_MAX:
+            st["win"] = v                                      # (what an earlier run learned about this node)
+    return st
+
+
+def node_failed(url: str, ex) -> None:
+    st = node_stat(url)
+    st["fails"] += 1
+    st["until"] = time.time() + NODE_REST[min(st["fails"] - 1, len(NODE_REST) - 1)]
+    st["err"] = scrub(ex)[:80]
+    if st["fails"] in (1, 5, 20):
+        log.warning("node %s failed (%d in a row): %s", url, st["fails"], st["err"])
+
+
+def node_ok(url: str) -> None:
+    st = node_stat(url)
+    st["fails"], st["until"], st["err"] = 0, 0.0, ""
+    st["ok"] += 1
+    st["t_ok"] = time.time()
+
+
+def node_save_window(url: str, st: dict) -> None:
+    rad = state["radar"]
+    if not isinstance(rad.get("win"), dict):
+        rad["win"] = {}
+    if len(rad["win"]) > 40 and url not in rad["win"]:
+        rad["win"].clear()
+    rad["win"][url] = int(st["win"])
+
+
+def node_shrink(url: str, span: int, chain: str, hint: int | None = None) -> None:
+    """A node refused a request of 'span' blocks as too wide: from now on it is asked for what its message named (hint), or for half of that."""
+    if not url:
+        return
+    st = node_stat(url)
+    cur = st["win"] or NODE_WIN_START.get(chain, 5_000)
+    if hint and NODE_WIN_MIN <= hint < span:
+        st["win"], st["exact"] = int(hint), True
+    else:
+        st["win"], st["exact"] = int(max(NODE_WIN_MIN, min(cur, span) // 2)), False
+    st["wins"] = 0
+    node_save_window(url, st)
+    log.info("node %s allows fewer than %d blocks per log request - now asking for %d", url, span, st["win"])
+
+
+def node_grow(url: str, span: int, chain: str) -> None:
+    """A request of the node's full window worked: after enough of them the window is tried at twice the size."""
+    if not url:
+        return
+    st = node_stat(url)
+    cur = st["win"] or NODE_WIN_START.get(chain, 5_000)
+    if span < cur or st.get("exact"):
+        return                                                 # (a limit the node named itself is not tried again)
+    st["wins"] += 1
+    if st["wins"] >= NODE_GROW_AFTER and cur < NODE_WIN_MAX:
+        st["win"], st["wins"] = int(min(NODE_WIN_MAX, cur * 2)), 0
+        node_save_window(url, st)
+
+
+class NodePool:
+    """The free public nodes of one chain, best first. A node that fails rests for a while (longer each time in a row) and the next one is
+    asked instead. What a node allows (how many blocks per log request) is learned from its own answers. scope 'radar' counts failures apart
+    from the VIP wallets' (the radar must never make the VIP looks wait); scope 'vip' shares their count."""
+
+    def __init__(self, chain: str, scope: str = "radar", urls: list | None = None):
+        self.chain = chain
+        self.scope = scope
+        self.urls = list(urls) if urls is not None else chain_nodes(chain)
+        self.last_url = ""
+
+    def ready(self) -> list[str]:
+        """The nodes that are not resting, best first: the one you set yourself, then the ones that have shown they answer the widest ranges."""
+        now = time.time()
+        start = NODE_WIN_START.get(self.chain, 5_000)
+        mine = os.getenv(_RPC_ENV.get(self.chain, ""), "").strip() if self.chain in _RPC_ENV else ""
+        r = [u for u in self.urls if node_stat(u)["until"] <= now]
+        # (a stable sort: ties keep the listed order. Your own node counts three times as wide, so it stays first unless it has shown it is far worse.)
+        return sorted(r, key=lambda u: -(node_stat(u)["win"] or start) * (3 if mine and u == mine else 1))
+
+    def call(self, method: str, params: list, timeout: float = 30.0):
+        last: Exception | None = None
+        for u in self.ready():
+            try:
+                res = radar_rpc(u, method, params, timeout=timeout, scope=self.scope)
+            except RadarTooMany as ex:
+                ex.url = u
+                node_ok(u)
+                raise
+            except RuntimeError as ex:                         # (this node's link is resting inside radar_rpc: try the next one)
+                last = ex
+                continue
+            except (requests.RequestException, ValueError) as ex:
+                node_failed(u, ex)
+                last = ex
+                continue
+            node_ok(u)
+            self.last_url = u
+            return res
+        if last is not None:
+            raise last
+        raise RuntimeError("all the free nodes of " + CHAINS.get(self.chain, {}).get("name", self.chain) + " are resting after errors")
+
+    def batch(self, reqs: list, timeout: float = 30.0):
+        """Several requests in one. -> the list of answers, or None when no node took the batch (the caller then asks one by one)."""
+        for u in self.ready():
+            st = node_stat(u)
+            if not st["batch"]:
+                continue
+            try:
+                r = http.post(u, json=reqs, timeout=timeout)
+                r.raise_for_status()
+                d = r.json()
+            except (requests.RequestException, ValueError) as ex:
+                node_failed(u, ex)
+                continue
+            if isinstance(d, list):
+                node_ok(u)
+                self.last_url = u
+                return d
+            st["batch"] = False                                # (it answered with one error instead of a list: it does not take batches)
+        return None
+
+    def window(self) -> int:
+        """How many blocks one log request may span on the node that is asked first (what its answers have shown; at the start a safe guess)."""
+        for u in self.ready() or self.urls[:1]:
+            return node_stat(u)["win"] or NODE_WIN_START.get(self.chain, 5_000)
+        return NODE_WIN_START.get(self.chain, 5_000)
+
+    def down(self) -> bool:
+        return not self.ready()
+
+    def busy_with_vip(self) -> bool:
+        """Are all this chain's nodes struggling with the VIP looks right now (2+ failures in a row)?"""
+        now = time.time()
+        return bool(self.urls) and all(_rpc_fail.get(u, (0, 0.0))[0] >= 2 and now - _rpc_fail.get(u, (0, 0.0))[1] < 120 for u in self.urls)
+
+
+def rpc_any(node, method: str, params: list, timeout: float = 12.0):
+    """One request to a node: 'node' is a URL (one node) or a NodePool (a chain's nodes with backups)."""
+    return node.call(method, params, timeout) if isinstance(node, NodePool) else rpc_call(node, method, params, timeout)
+
+
+def chain_bps(chain: str, node=None) -> float:
+    """Blocks per second of a chain. Robinhood Chain's is fixed. For the others it is measured: two blocks and their time stamps from the node
+    (20,000 blocks apart) - BNB Chain has sped up several times, so a fixed number would soon be wrong. Remembered for 6 hours."""
+    if chain == "robinhood":
+        return RADAR_BLOCKS_PER_SECOND
+    hit = _bps.get(chain)
+    if hit and time.time() - hit[0] < (BPS_KEEP_SECONDS if hit[2] == "measured" else 600):
+        return hit[1]
+    bps, src = DEFAULT_BPS.get(chain, 1.0), "default"
+    if node is None:
+        node = NodePool(chain)
+    try:
+        latest = int(rpc_any(node, "eth_blockNumber", [], 15), 16)
+        old = max(1, latest - 20_000)
+        t1 = int((rpc_any(node, "eth_getBlockByNumber", [hex(latest), False], 15) or {})["timestamp"], 16)
+        t0 = int((rpc_any(node, "eth_getBlockByNumber", [hex(old), False], 15) or {})["timestamp"], 16)
+        if t1 > t0 and latest > old and 0.02 <= (latest - old) / (t1 - t0) <= 60:
+            bps, src = (latest - old) / (t1 - t0), "measured"
+    except (requests.RequestException, ValueError, RuntimeError, KeyError, TypeError, AttributeError):
+        pass
+    _bps[chain] = (time.time(), bps, src)
+    return bps
+
+
+def radar_chunks(a: int, b: int, win: int) -> list[tuple]:
+    """The block range a..b cut into pieces of at most 'win' blocks, in the order a stack gives them back (oldest first)."""
+    if win <= 0 or b - a + 1 <= win:
+        return [(a, b)]
+    out, lo = [], a
+    while lo <= b:
+        hi = min(b, lo + win - 1)
+        out.append((lo, hi))
+        lo = hi + 1
+    return out[::-1]
+
+
+def radar_get_logs(url, token: str, a: int, b: int, left: list) -> list[tuple]:
     """Every Transfer of one coin in blocks a..b -> [(block, from, to, raw amount)]. A range with too many results is cut in two and read
-    again; left[0] = how many node requests this coin may still use (RadarBusy when they run out)."""
+    again; left[0] = how many node requests this coin may still use (RadarBusy when they run out).
+    url = one node's address (the whole range is asked at once) or a NodePool (pieces of the size its nodes have shown they allow;
+    a node that says 'too many blocks' teaches the pool a smaller size)."""
     out: list[tuple] = []
-    stack = [(a, b)]
+    pool = url if isinstance(url, NodePool) else None
+    stack = radar_chunks(a, b, pool.window() if pool else 0)
     while stack:
         lo, hi = stack.pop()
         if left[0] <= 0:
             raise RadarBusy("more node requests than allowed")
         left[0] -= 1
+        params = [{"fromBlock": hex(lo), "toBlock": hex(hi), "address": token, "topics": [TRANSFER_TOPIC]}]
         try:
-            logs = radar_rpc(url, "eth_getLogs", [{"fromBlock": hex(lo), "toBlock": hex(hi), "address": token, "topics": [TRANSFER_TOPIC]}], timeout=45)
-        except RadarTooMany:
+            logs = pool.call("eth_getLogs", params, timeout=45) if pool else radar_rpc(url, "eth_getLogs", params, timeout=45)
+        except RadarTooMany as ex:
             if hi - lo < 100:
                 raise RadarBusy("too many transfers in a tiny range")
+            if pool and ex.kind == "range":
+                node_shrink(ex.url, hi - lo + 1, pool.chain, ex.limit)
+                w = pool.window()
+                if hi - lo + 1 > w:
+                    stack.extend(radar_chunks(lo, hi, w))
+                    continue
             mid = (lo + hi) // 2
             stack.append((mid + 1, hi))
             stack.append((lo, mid))
             continue
+        if pool:
+            node_grow(pool.last_url, hi - lo + 1, pool.chain)
         for lg in logs or []:
             try:
                 t = lg.get("topics") or []
@@ -5089,19 +6228,30 @@ def radar_get_logs(url: str, token: str, a: int, b: int, left: list) -> list[tup
     return out
 
 
-def radar_prefetch_codes(url: str, addrs: list[str]):
+def code_cache(chain: str = "robinhood") -> dict:
+    """What is known about which addresses are contracts, one place per chain (the same address can be a wallet on one chain and a contract on another)."""
+    if chain == "robinhood":
+        return _vip_rt["code"]
+    return _vip_rt.setdefault("code_" + chain, {})
+
+
+def radar_prefetch_codes(url, addrs: list[str], chain: str = "robinhood"):
     """Which of these addresses are contracts? One batched request per 30 addresses (remembered in the same cache the VIP wallets use);
-    anything the batch does not answer is asked for one by one later."""
-    cache = _vip_rt["code"]
+    anything the batch does not answer is asked for one by one later. url = one node's address or a NodePool."""
+    cache = code_cache(chain)
     need = [a for a in dict.fromkeys(addrs) if a not in cache and a not in FOMO_ROUTERS]
     for i in range(0, len(need), 30):
         chunk = need[i:i + 30]
-        try:
-            r = http.post(url, json=[{"jsonrpc": "2.0", "id": j, "method": "eth_getCode", "params": [a, "latest"]} for j, a in enumerate(chunk)], timeout=30)
-            r.raise_for_status()
-            d = r.json()
-        except (requests.RequestException, ValueError):
-            continue
+        reqs = [{"jsonrpc": "2.0", "id": j, "method": "eth_getCode", "params": [a, "latest"]} for j, a in enumerate(chunk)]
+        if isinstance(url, NodePool):
+            d = url.batch(reqs, timeout=30)
+        else:
+            try:
+                r = http.post(url, json=reqs, timeout=30)
+                r.raise_for_status()
+                d = r.json()
+            except (requests.RequestException, ValueError):
+                continue
         if not isinstance(d, list):
             continue
         for item in d:
@@ -5112,10 +6262,12 @@ def radar_prefetch_codes(url: str, addrs: list[str]):
         time.sleep(0.2)
 
 
-def radar_analyze(logs: list[tuple], dec: int, px: float, token: str, is_contract, prefetch=None) -> dict:
+def radar_analyze(logs: list[tuple], dec: int, px: float, token: str, is_contract, prefetch=None, strict: bool = False, seeds=None) -> dict:
     """The transfers of one coin -> per-wallet numbers. logs = [(block, from, to, raw amount)]; px = the coin's price in dollars.
     Returns {"rows": [...], "hubs": set, "special": set}. Each row: a (address), buy / sell (coins), nb / ns (how many), xin / xout (coins moved
-    between wallets), first / last (block of the first / last buy), buy_usd, sell_usd, held_usd (what it holds more of than a day ago)."""
+    between wallets), first / last (block of the first / last buy), buy_usd, sell_usd, held_usd (what it holds more of than a day ago).
+    v3.9: seeds = pool addresses already known to be pools (so they need no contract check); strict (the big chains, where coins pay
+    fees and airdrops out of themselves) = coins that come out of the coin's own contract or out of thin air (a mint) are not somebody buying."""
     scale = 10.0 ** dec
     flows: dict[tuple, list] = {}
     for blk, frm, to, raw in logs:
@@ -5132,7 +6284,7 @@ def radar_analyze(logs: list[tuple], dec: int, px: float, token: str, is_contrac
     for frm, to in flows:
         nb.setdefault(frm, set()).add(to)
         nb.setdefault(to, set()).add(frm)
-    hubs = set(RADAR_SEED_HUBS) | {token.lower()}
+    hubs = set(RADAR_SEED_HUBS) | {token.lower()} | {str(s).lower() for s in (seeds or ()) if isinstance(s, str) and len(s) == 42}
     special: set = set()                                           # busy addresses that are not contracts (a distributor, an exchange)
     cands = sorted(((a, len(s)) for a, s in nb.items() if len(s) >= RADAR_HUB_FANOUT and a not in hubs), key=lambda x: -x[1])[:20]
     if prefetch and cands:
@@ -5151,6 +6303,8 @@ def radar_analyze(logs: list[tuple], dec: int, px: float, token: str, is_contrac
         if fh and not th:
             if to in special:
                 continue
+            if strict and (frm == token.lower() or frm == ZERO_ADDR):
+                continue                                           # a mint, or the coin paying a fee / an airdrop out of itself
             w = get(to)
             w["buy"] += v
             w["nb"] += n
@@ -5174,101 +6328,172 @@ def radar_analyze(logs: list[tuple], dec: int, px: float, token: str, is_contrac
     return {"rows": rows, "hubs": hubs, "special": special}
 
 
-def radar_is_accumulator(r: dict) -> bool:
-    return (r["buy_usd"] >= RADAR_MIN_BUY_USD and r["sell_usd"] <= RADAR_MAX_SOLD * r["buy_usd"]
+def radar_is_accumulator(r: dict, chain: str = "robinhood") -> bool:
+    return (r["buy_usd"] >= radar_cfg(chain, "buy") and r["sell_usd"] <= RADAR_MAX_SOLD * r["buy_usd"]
             and r["held_usd"] >= RADAR_MIN_HELD * r["buy_usd"] and r["nb"] <= RADAR_MAX_BUYS)
 
 
-def radar_summarize(acc: list[dict], latest: int) -> dict:
-    """The accumulators of one coin -> the numbers the radar judges: how many, how much, how spread out, how recent, how patient."""
+def radar_rank(acc: list[dict], recency) -> dict:
+    """The accumulators of one coin -> the numbers the radar judges: how many, how much, how spread out, how recent, how patient.
+    recency(row) = hours since the wallet's latest buy (works for blocks and for time stamps alike)."""
     ranked = sorted(acc, key=lambda r: -(r["buy_usd"] - r["sell_usd"]))
     nets = [r["buy_usd"] - r["sell_usd"] for r in ranked]
     total = sum(nets)
-    b6, b1 = 6 * 3600 * RADAR_BLOCKS_PER_SECOND, 3600 * RADAR_BLOCKS_PER_SECOND
-    recent = [r for r in acc if latest - r["last"] <= b6]
+    recent = [r for r in acc if recency(r) <= 6.0]
     return {"acc": len(acc), "usd": total,
             "top1": (nets[0] / total) if nets and total > 0 else 0.0, "top3": (sum(nets[:3]) / total) if nets and total > 0 else 0.0,
-            "n6": len(recent), "n1": sum(1 for r in acc if latest - r["last"] <= b1), "net6": sum(r["buy_usd"] - r["sell_usd"] for r in recent),
+            "n6": len(recent), "n1": sum(1 for r in acc if recency(r) <= 1.0), "net6": sum(r["buy_usd"] - r["sell_usd"] for r in recent),
             "dca": sum(1 for r in acc if r["nb"] >= 3),
-            "last_h": min(((latest - r["last"]) / RADAR_BLOCKS_PER_SECOND / 3600 for r in acc), default=0.0),
+            "last_h": min((recency(r) for r in acc), default=0.0),
             "top": [[r["a"], round(r["buy_usd"] - r["sell_usd"]), r["nb"]] for r in ranked[:RADAR_TOP_KEEP]]}
 
 
-def radar_latest(url: str) -> int:
-    t, blk = _radar_rt["latest"]
+def radar_summarize(acc: list[dict], latest: int, bps: float | None = None) -> dict:
+    """radar_rank() for an EVM chain: a wallet's latest buy is a block number, so hours = blocks / (blocks per second) / 3600."""
+    bps = bps or RADAR_BLOCKS_PER_SECOND
+    return radar_rank(acc, lambda r: (latest - r["last"]) / bps / 3600)
+
+
+def radar_latest(url, chain: str = "robinhood") -> int:
+    rt = radar_rt(chain)
+    t, blk = rt["latest"]
     if blk and time.time() - t < 20:
         return blk
-    blk = int(radar_rpc(url, "eth_blockNumber", [], timeout=15), 16)
-    _radar_rt["latest"] = (time.time(), blk)
+    raw = url.call("eth_blockNumber", [], timeout=15) if isinstance(url, NodePool) else radar_rpc(url, "eth_blockNumber", [], timeout=15)
+    blk = int(raw, 16)
+    rt["latest"] = (time.time(), blk)
     return blk
 
 
-def radar_scan_coin(url: str, token: str, px: float, latest: int, budget: int | None = None) -> dict:
-    """Read one coin's transfers for the last RADAR_HOURS and find its accumulators -> radar_summarize() numbers (+ logs, hubs, calls)."""
+def radar_scan_coin(url, token: str, px: float, latest: int, budget: int | None = None, chain: str = "robinhood",
+                    bps: float | None = None, seeds=None) -> dict:
+    """Read one coin's transfers for the last RADAR_HOURS and find its accumulators -> radar_summarize() numbers (+ logs, hubs, calls, hrs).
+    url = one node's address (Robinhood Chain) or a NodePool. On a chain whose nodes only answer small block ranges, fewer hours are read
+    (but at least RADAR_MIN_HOURS) so that one coin never needs more than its budget of node requests; 'hrs' says how many were read."""
     token = token.lower()
     budget = budget or RADAR_MAX_CALLS
-    dec = evm_token_decimals(url, "robinhood", token)
-    left = [budget]
-    logs = radar_get_logs(url, token, max(0, latest - int(RADAR_HOURS * 3600 * RADAR_BLOCKS_PER_SECOND)), latest, left)
+    pool = url if isinstance(url, NodePool) else None
+    bps = bps or (chain_bps(chain, pool) if chain != "robinhood" else RADAR_BLOCKS_PER_SECOND)
+    dec = evm_token_decimals(url, chain, token)
+    for attempt in (1, 2):
+        left = [budget]
+        span = int(RADAR_HOURS * 3600 * bps)
+        win = pool.window() if pool else 0
+        if pool:
+            room = max(1, budget - 4)                               # (the rest of the budget: the contract checks, and a split or two)
+            if -(-span // win) > room:
+                span = room * win
+            if span / bps / 3600 < RADAR_MIN_HOURS:
+                raise RadarNodeLimit("this chain's nodes only answer small ranges (" + f"{win:,} blocks)")
+        hrs = span / bps / 3600
+        try:
+            logs = radar_get_logs(url, token, max(0, latest - span), latest, left)
+            break
+        except RadarBusy:
+            if pool and attempt == 1 and pool.window() < win:
+                continue                                            # the nodes taught the pool a smaller block limit during this very read: plan it again with that
+            raise
 
     def is_c(a):
         try:
-            return evm_is_contract(url, a)
+            return evm_is_contract(url, a, chain)
         except Exception:
             return True                                            # cannot tell: a busy address is far more likely a contract
-    res = radar_analyze(logs, dec, px, token, is_c, lambda addrs: radar_prefetch_codes(url, addrs))
-    acc = [r for r in res["rows"] if radar_is_accumulator(r)]
+    res = radar_analyze(logs, dec, px, token, is_c, lambda addrs: radar_prefetch_codes(url, addrs, chain), strict=(chain != "robinhood"),
+                        seeds=set(seeds or ()) | ({RADAR_V4_MANAGERS[chain]} if chain in RADAR_V4_MANAGERS else set()))
+    acc = [r for r in res["rows"] if radar_is_accumulator(r, chain)]
     acc.sort(key=lambda r: -(r["buy_usd"] - r["sell_usd"]))
-    radar_prefetch_codes(url, [r["a"] for r in acc[:40]])
+    radar_prefetch_codes(url, [r["a"] for r in acc[:40]], chain)
     contracts = {r["a"] for r in acc[:40] if is_c(r["a"])}        # a contract that bought a lot is a pool or a vault, not a person
     acc = [r for r in acc if r["a"] not in contracts]
-    out = radar_summarize(acc, latest)
-    out.update(logs=len(logs), hubs=len(res["hubs"]), calls=budget - left[0])
+    out = radar_summarize(acc, latest, bps)
+    out.update(logs=len(logs), hubs=len(res["hubs"]), calls=budget - left[0], hrs=round(hrs, 1), bps=round(bps, 3))
     return out
 
 
-def radar_qualifies(e: dict) -> tuple[bool, str]:
-    """Does a coin's latest reading look like real accumulation? -> (yes/no, what is missing). e = a state['radar']['coins'] entry."""
+def radar_hours(e: dict) -> float:
+    """How many hours of a coin's life one reading covers (24, unless slow nodes - or, on Solana, a young trade sample - cut it short)."""
+    h = e.get("hrs") if isinstance(e, dict) else None
+    return float(h) if isinstance(h, (int, float)) and not isinstance(h, bool) and h > 0 else float(RADAR_HOURS)
+
+
+def radar_window_text(e: dict, chain: str) -> str:
+    h = radar_hours(e)
+    if chain == "solana":
+        return f"in the {h:.0f}h of its trades that I have watched"
+    return f"in the last {h:g}h"
+
+
+def radar_stamp_name(chain: str) -> str:
+    """Where the day's alerts of one chain are counted (Robinhood Chain keeps the name the first version used)."""
+    return "rd_ts" if chain == "robinhood" else "rd_ts_" + chain
+
+
+def radar_qualifies(e: dict, chain: str | None = None) -> tuple[bool, str]:
+    """Does a coin's latest reading look like real accumulation? -> (yes/no, what is missing). e = a state['radar']['coins'] entry.
+    The numbers are the chain's own (radar_cfg): the small coins of the big chains need fewer wallets than Robinhood Chain's."""
+    chain = chain or radar_chain_of(e)
+    need_acc, need_net, need_recent = int(radar_cfg(chain, "acc")), radar_cfg(chain, "net"), int(radar_cfg(chain, "recent"))
+    run, drop = radar_cfg(chain, "run"), radar_cfg(chain, "drop")
     base = e["mc"] if e.get("mc", 0) > 0 else 2 * e.get("liq", 0)      # (market cap not known: twice the liquidity stands in for it)
-    if e.get("acc", 0) < RADAR_MIN_ACC:
-        return False, f"only {e.get('acc', 0)} accumulators (need {RADAR_MIN_ACC})"
-    if e.get("usd", 0) < RADAR_MIN_NET_USD:
-        return False, f"they bought only {fmt_usd(e.get('usd', 0))} together (need {fmt_usd(RADAR_MIN_NET_USD)})"
+    if radar_too_old(e, chain):
+        return False, (f"its pools are {e['age'] / 24:.0f} days old (this chain's limit is {radar_cfg(chain, 'age_d'):g} days: an old coin has had its run - "
+                       f"/radar set {chain} age 0 removes the limit)")
+    if chain == "solana":
+        if e.get("cover", 0) < SOL_MIN_COVER_H:
+            return False, f"I have watched only {e.get('cover', 0):.1f}h of its trades so far (need {SOL_MIN_COVER_H:g}h)"
+        if e.get("gap", 0) > SOL_MAX_GAP:
+            return False, f"I missed {e['gap']:.0%} of its trades between looks (too busy for the free feed)"
+    if e.get("acc", 0) < need_acc:
+        return False, f"only {e.get('acc', 0)} accumulators (need {need_acc})"
+    if e.get("usd", 0) < need_net:
+        return False, f"they bought only {fmt_usd(e.get('usd', 0))} together (need {fmt_usd(need_net)})"
     if base > 0 and e["usd"] / base < RADAR_MIN_SHARE_MC:
         return False, f"that is only {e['usd'] / base:.2%} of the coin's size (need {RADAR_MIN_SHARE_MC:.2%})"
     if e.get("top1", 0) > RADAR_MAX_TOP1:
         return False, f"one wallet is {e['top1']:.0%} of it (that is one big buyer, not many)"
-    if e.get("n6", 0) < RADAR_MIN_RECENT:
-        return False, f"only {e.get('n6', 0)} of them bought in the last 6 hours (need {RADAR_MIN_RECENT}) - it is cooling off"
-    if e.get("ch", 0) > RADAR_MAX_RUN:
+    if e.get("n6", 0) < need_recent:
+        return False, f"only {e.get('n6', 0)} of them bought in the last 6 hours (need {need_recent}) - it is cooling off"
+    if e.get("ch", 0) > run:
         return False, f"the price is already up {e['ch']:.0f}% in 24h - this alert is for buying BEFORE a run"
-    if e.get("ch", 0) < RADAR_MIN_DROP:
+    if e.get("ch", 0) < drop:
         return False, f"the price fell {abs(e['ch']):.0f}% in 24h - that is a falling knife, not accumulation"
     return True, ""
 
 
-def radar_is_small_steady(e: dict) -> bool:
+def radar_is_small_steady(e: dict, chain: str | None = None) -> bool:
     """Too few wallets for an alert, but a steady, patient build-up that is big for the coin's size (listed in /radar, never alerted)."""
+    chain = chain or radar_chain_of(e)
+    if radar_too_old(e, chain):
+        return False
     base = e["mc"] if e.get("mc", 0) > 0 else 2 * e.get("liq", 0)
-    return (e.get("acc", 0) >= RADAR_SMALL_MIN_ACC and base > 0 and e.get("usd", 0) / base >= RADAR_SMALL_MIN_SHARE
-            and e.get("top1", 1.0) <= RADAR_MAX_TOP1 and e.get("n6", 0) >= RADAR_SMALL_MIN_RECENT
-            and RADAR_MIN_DROP <= e.get("ch", 0) <= RADAR_MAX_RUN)
+    need = RADAR_SMALL_MIN_ACC if chain == "robinhood" else max(6, round(0.4 * radar_cfg(chain, "acc")))
+    rec = min(RADAR_SMALL_MIN_RECENT, int(radar_cfg(chain, "recent")))
+    return (e.get("acc", 0) >= need and base > 0 and e.get("usd", 0) / base >= RADAR_SMALL_MIN_SHARE
+            and e.get("top1", 1.0) <= RADAR_MAX_TOP1 and e.get("n6", 0) >= rec
+            and radar_cfg(chain, "drop") <= e.get("ch", 0) <= radar_cfg(chain, "run")
+            and (chain != "solana" or (e.get("cover", 0) >= SOL_MIN_COVER_H and e.get("gap", 0) <= SOL_MAX_GAP)))
 
 
 # --- which coins are read ---
-def radar_refresh_candidates(now: float) -> int:
-    """Rebuild the list of coins to read: Robinhood Chain's busiest pools by 24h volume (GeckoTerminal, the same free feed the volume-leader
-    search uses), one entry per coin. Launch-day coins, thin ones, tiny and huge ones, quote coins and steady assets are left out."""
-    net = GECKO_NETWORK["robinhood"]
+def radar_refresh_candidates(now: float, chain: str = "robinhood") -> int:
+    """Rebuild the list of coins to read on one chain: its busiest pools by 24h volume (GeckoTerminal, the same free feed the volume-leader
+    search uses), one entry per coin. Launch-day coins, old ones (v3.9: pools older than the chain's age limit), thin ones, tiny and huge ones,
+    quote coins and steady assets are left out (the limits are the chain's own: radar_cfg)."""
+    net = GECKO_NETWORK[chain]
+    rt = radar_rt(chain)
+    liq_min, mc_min, mc_max, age_min = (radar_cfg(chain, f) for f in ("liq", "mc_min", "mc_max", "age_h"))
+    age_max = radar_cfg(chain, "age_d") * 24                          # (0 = no limit)
+    pages = max(1, min(8, int(radar_cfg(chain, "pages"))))
     by_tok: dict[str, dict] = {}
-    for page in range(1, RADAR_LIST_PAGES + 1):
+    for page in range(1, pages + 1):
         try:
             r = gecko_get(f"https://api.geckoterminal.com/api/v2/networks/{net}/pools", tries=2,
                           params={"page": page, "sort": "h24_volume_usd_desc"}, timeout=20)
             pools = r.json().get("data") or []
         except (requests.RequestException, ValueError) as e:
             bot_stats["gecko_busy"] += 1
-            log.warning("radar: the pool list is busy (%s)", getattr(getattr(e, "response", None), "status_code", "error"))
+            log.warning("radar (%s): the pool list is busy (%s)", chain, getattr(getattr(e, "response", None), "status_code", "error"))
             break
         if not pools:
             break
@@ -5278,7 +6503,7 @@ def radar_refresh_candidates(now: float) -> int:
                 base_id = ((pool.get("relationships") or {}).get("base_token") or {}).get("data", {}).get("id", "")
                 if "_" not in base_id:
                     continue
-                addr = norm_addr("robinhood", base_id.split("_", 1)[1])
+                addr = norm_addr(chain, base_id.split("_", 1)[1])
                 sym = str(attrs.get("name") or "").split(" / ")[0].strip()[:14] or "?"
                 liq = float(attrs.get("reserve_in_usd") or 0)
                 mc = float(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or 0)
@@ -5291,7 +6516,7 @@ def radar_refresh_candidates(now: float) -> int:
                 continue
             c = by_tok.get(addr)
             if c is None:
-                by_tok[addr] = {"addr": addr, "key": sk("robinhood", addr), "sym": sym, "mc": mc, "liq": liq, "vol": vol, "ch": ch, "px": px,
+                by_tok[addr] = {"addr": addr, "key": sk(chain, addr), "sym": sym, "mc": mc, "liq": liq, "vol": vol, "ch": ch, "px": px,
                                 "age_h": age_h, "pool": pool_addr, "_main": liq}
             else:
                 c["liq"] += liq
@@ -5300,21 +6525,25 @@ def radar_refresh_candidates(now: float) -> int:
                 if liq > c["_main"]:                                # the deepest pool gives the price, market cap and change
                     c.update(mc=mc, ch=ch, px=px, pool=pool_addr, _main=liq)
     out = []
+    quotes = RH_QUOTES if chain == "robinhood" else set()
     for addr, c in by_tok.items():
-        if (addr in RH_QUOTES or c["sym"].upper() in QUOTE_SYMBOLS or is_quote_token("robinhood", addr) or c["key"] in state["steady"]
-                or c["px"] <= 0 or c["liq"] < RADAR_MIN_LIQ_USD or c["age_h"] < RADAR_MIN_AGE_H
-                or (c["mc"] > 0 and not RADAR_MIN_MC <= c["mc"] <= RADAR_MAX_MC)):
+        if (addr in quotes or c["sym"].upper() in QUOTE_SYMBOLS or is_quote_token(chain, addr) or c["key"] in state["steady"]
+                or c["px"] <= 0 or c["liq"] < liq_min or c["age_h"] < age_min or (age_max > 0 and c["age_h"] > age_max)
+                or (c["mc"] > 0 and not mc_min <= c["mc"] <= mc_max)):
             continue
         out.append(c)
     out.sort(key=lambda c: -c["liq"])
     if by_tok:                                                       # (a failed look-up keeps the old list)
-        _radar_rt["cands"] = out[:RADAR_MAX_COINS]
-        _radar_rt["cand_t"] = now
+        rt["cands"] = out[:(SOL_MAX_CANDS if chain == "solana" else RADAR_MAX_COINS)]
+        rt["cand_t"] = now
+        rt["built"] = (now, len(by_tok))                             # (when the list was last built from a real answer, and from how many coins)
         state["radar"]["last_list"] = now
+    elif chain != "robinhood":
+        rt["cand_t"] = now - RADAR_LIST_HOURS * 3600 + 600          # (the feed gave nothing: try again in 10 minutes, not every round)
     return len(out)
 
 
-def radar_due(cands: list[dict], now: float) -> list[dict]:
+def radar_due(cands: list[dict], now: float, chain: str | None = None) -> list[dict]:
     """The coins to read next: never read first, then the longest unread (a coin that qualifies is read again sooner)."""
     coins = radar_coins()
     scored = []
@@ -5324,6 +6553,10 @@ def radar_due(cands: list[dict], now: float) -> list[dict]:
             continue
         every = (25 if e.get("since") else RADAR_READ_EVERY_MIN) * 60
         gap = now - e.get("seen", 0)
+        if (chain or radar_chain_of(e, c["key"])) == "solana":
+            every = sol_every(c["key"], every)
+            if c["key"] not in _sol_store:                           # (no trades collected yet - after a restart, say: a first look brings up to a day at once)
+                gap = max(gap, every)
         if gap >= every:
             scored.append((gap / every, c))
     scored.sort(key=lambda x: -x[0])
@@ -5334,24 +6567,167 @@ def radar_prune(now: float):
     coins = radar_coins()
     for k in [k for k, e in coins.items() if now - e.get("seen", 0) > RADAR_KEEP_HOURS * 3 * 3600]:
         del coins[k]
+    for k in [k for k in _sol_store if now - _sol_store[k].get("last_look", 0) > 30 * 3600]:
+        _sol_store.pop(k, None)
+
+
+# ----------------------------------------------------------------------------
+# Solana: there is no transfer log to read, so the radar collects a SAMPLE - GeckoTerminal's latest trades of the coin's main pool
+# (up to 300 trades above $50 per look, going back at most 24 hours). Looks are repeated, trades seen before are not counted twice, and
+# when a busy coin's list was cut off before it reached back to the previous look, the missing stretch is written down as a GAP. An alert
+# needs at least SOL_MIN_COVER_H hours that were really seen and not much missing. Buys below $50 are not in the sample at all.
+# ----------------------------------------------------------------------------
+_sol_store: dict[str, dict] = {}
+_sol_lock = threading.Lock()
+
+
+def sol_store(key: str) -> dict:
+    st = _sol_store.get(key)
+    if st is None:
+        if len(_sol_store) >= SOL_MAX_COINS:
+            _sol_store.pop(min(_sol_store, key=lambda k: _sol_store[k].get("last_look", 0)), None)
+        st = _sol_store[key] = {"t": [], "seen": set(), "arb": set(), "t0": 0.0, "gaps": [], "last_look": 0.0, "looks": 0, "full": False, "full_h": 0.0}
+    return st
+
+
+def sol_every(key: str, base_s: float) -> float:
+    """Seconds until a coin is looked at again: normally the radar's reading interval, but a busy coin (its 300 trades cover only a short
+    time) is looked at before the list can overflow - at 70% of that time, at the earliest every 10 minutes."""
+    st = _sol_store.get(key)
+    if st and st.get("full") and st.get("full_h", 0) > 0:
+        return max(600.0, min(base_s, st["full_h"] * 3600 * 0.7))
+    return base_s
+
+
+def sol_trade_rows(trades: list) -> list[tuple]:
+    """GeckoTerminal trades -> [(time, wallet, 'b' / 's', dollars, id, tx)], oldest first (a broken row is dropped)."""
+    out = []
+    for t in trades or []:
+        a = t.get("attributes") if isinstance(t, dict) else None
+        if not isinstance(a, dict):
+            continue
+        w, kind = str(a.get("tx_from_address") or ""), a.get("kind")
+        if not w or kind not in ("buy", "sell"):
+            continue
+        try:
+            usd = float(a.get("volume_in_usd") or 0)
+            ts = datetime.fromisoformat(str(a.get("block_timestamp", "")).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            continue
+        if not (0 < usd < 1e12) or not math.isfinite(ts):
+            continue
+        tx = str(a.get("tx_hash") or "")
+        out.append((ts, w, kind[0], usd, hash(str(t.get("id") or "") or (tx + kind + str(round(usd, 2)))), tx))
+    out.sort(key=lambda r: r[0])
+    return out
+
+
+def sol_merge(st: dict, trades: list, now: float) -> int:
+    """Add one look at a coin's latest trades to what was collected before -> how many trades were new. A full list that does not reach back
+    to the previous look leaves a gap (written down); a list that is not full holds EVERY trade above the floor of the last 24 hours."""
+    rows = sol_trade_rows(trades)
+    full = len(trades or []) >= SOL_FULL_SAMPLE
+    horizon = now - SOL_API_HOURS * 3600
+    oldest = rows[0][0] if rows else now
+    prev = st["last_look"]
+    if st["looks"] == 0:
+        st["t0"] = max(horizon, oldest) if full else horizon
+    elif full and oldest > prev:
+        st["gaps"].append([prev, oldest])                            # (the newest trades filled the whole list before it reached back to the last look)
+    seen, new = st["seen"], 0
+    kinds: dict[tuple, set] = {}
+    for ts, w, k, usd, h, tx in rows:
+        if h in seen:
+            continue
+        seen.add(h)
+        st["t"].append((ts, w, k, usd, h))
+        new += 1
+        kinds.setdefault((w, tx), set()).add(k)
+    for (w, tx), ks in kinds.items():
+        if tx and len(ks) > 1:
+            st["arb"].add(w)                                         # bought AND sold inside one transaction: a router / arbitrage bot
+    if len(st["arb"]) > 500:
+        st["arb"].clear()
+    if st["t"]:
+        keep = [r for r in st["t"] if r[0] >= horizon]
+        if len(keep) != len(st["t"]):
+            kept = {r[4] for r in keep}
+            for r in st["t"]:
+                if r[4] not in kept:
+                    seen.discard(r[4])
+            st["t"] = keep
+        if len(st["t"]) > SOL_MAX_TRADES:                            # (a very busy coin: the oldest trades go, and the covered time starts later)
+            st["t"].sort(key=lambda r: r[0])
+            cut = len(st["t"]) - SOL_MAX_TRADES
+            for r in st["t"][:cut]:
+                seen.discard(r[4])
+            st["t0"] = max(st["t0"], st["t"][cut - 1][0])
+            st["t"] = st["t"][cut:]
+    st["gaps"] = [g for g in st["gaps"] if g[1] > horizon][-40:]
+    st["last_look"], st["looks"], st["full"] = now, st["looks"] + 1, full
+    st["full_h"] = (now - oldest) / 3600 if full and rows else 0.0
+    return new
+
+
+def sol_cover(st: dict, now: float) -> tuple[float, float, float]:
+    """-> (hours of the last 24 that were really seen, hours that were missed, hours since the collecting started)."""
+    start = max(st["t0"], now - SOL_API_HOURS * 3600)
+    span = max(0.0, (now - start) / 3600)
+    miss = 0.0
+    for a, b in st["gaps"]:
+        lo, hi = max(a, start), min(b, now)
+        if hi > lo:
+            miss += (hi - lo) / 3600
+    return max(0.0, span - miss), miss, span
+
+
+def sol_summarize(st: dict, now: float, skip=()) -> dict:
+    """The collected trades -> the same numbers the Ethereum-style reading gives (radar_rank). A wallet that trades a lot and sells a fair
+    share of it, trades more than BUYER_HARD_MAX_TRADES times, or bought AND sold inside one transaction is a bot, not an accumulator."""
+    cut = now - SOL_API_HOURS * 3600
+    per: dict[str, dict] = {}
+    for ts, w, k, usd, _h in st["t"]:
+        if ts < cut:
+            continue
+        d = per.get(w)
+        if d is None:
+            d = per[w] = {"a": w, "buy_usd": 0.0, "sell_usd": 0.0, "nb": 0, "ns": 0, "last": 0.0}
+        if k == "b":
+            d["buy_usd"] += usd
+            d["nb"] += 1
+            d["last"] = max(d["last"], ts)
+        else:
+            d["sell_usd"] += usd
+            d["ns"] += 1
+    acc = []
+    for d in per.values():
+        n = d["nb"] + d["ns"]
+        d["held_usd"] = d["buy_usd"] - d["sell_usd"]
+        bot = ((n > BUYER_MAX_TRADES and d["ns"] >= 0.2 * n) or n > BUYER_HARD_MAX_TRADES or d["a"] in st["arb"] or d["a"] in skip)
+        if not bot and radar_is_accumulator(d, "solana"):
+            acc.append(d)
+    out = radar_rank(acc, lambda r: (now - r["last"]) / 3600)
+    out.update(wallets=len(per), trades=len(st["t"]))
+    return out
+
+
+def sol_look(c: dict, now: float) -> dict:
+    """One look at a Solana coin: fetch its latest trades, add them to the collection, and read the collection -> the numbers of a reading
+    (radar_rank's, and cover / gap / hrs / full_h)."""
+    trades = gecko_trades("solana", c["pool"])
+    with _sol_lock:
+        st = sol_store(c["key"])
+        sol_merge(st, trades, now)
+        cover, miss, span = sol_cover(st, now)
+        s = sol_summarize(st, now, skip={c.get("pool", ""), c["addr"]})
+        s.update(cover=round(cover, 1), gap=round(miss / span, 3) if span > 0 else 0.0, hrs=round(cover, 1), full_h=round(st["full_h"], 2),
+                 full=bool(st["full"]), looks=st["looks"])
+    return s
 
 
 # --- reading a coin, judging it, telling you ---
-def radar_read_coin(url: str, c: dict, latest: int, now: float) -> bool:
-    """Read one listed coin, store what was found, and send the alert when it has qualified on two readings in a row."""
-    coins = radar_coins()
-    e = coins.get(c["key"])
-    if not isinstance(e, dict):
-        e = coins[c["key"]] = {"first": now}
-    e.update(sym=c["sym"], mc=round(c["mc"]), liq=round(c["liq"]), vol=round(c["vol"]), ch=round(c["ch"], 1), px=c["px"], age=round(c["age_h"]))
-    try:
-        s = radar_scan_coin(url, c["addr"], c["px"], latest)
-    except RadarBusy as ex:
-        e.update(seen=now, skip=now, why="too many transfers to read politely", acc=0, usd=0, since=0, ok2=0)
-        log.info("radar: %s skipped (%s)", c["sym"], ex)
-        return False
-    e.update(seen=now, skip=0, why="", acc=s["acc"], usd=round(s["usd"]), top1=round(s["top1"], 3), top3=round(s["top3"], 3), n6=s["n6"], n1=s["n1"],
-             net6=round(s["net6"]), dca=s["dca"], last_h=round(s["last_h"], 2), top=s["top"])
+def radar_judge(c: dict, e: dict, now: float) -> bool:
+    """A coin's reading is stored in e: does it qualify, and has it qualified on two readings (20+ minutes apart)? Then the alert."""
     ok, why = radar_qualifies(e)
     if ok:
         if not e.get("since"):
@@ -5363,6 +6739,49 @@ def radar_read_coin(url: str, c: dict, latest: int, now: float) -> bool:
     if ok and e.get("ok2", 0) >= 2:
         return radar_alert(c, e, now)
     return False
+
+
+def radar_entry(c: dict, now: float, chain: str) -> dict:
+    coins = radar_coins()
+    e = coins.get(c["key"])
+    if not isinstance(e, dict):
+        e = coins[c["key"]] = {"first": now}
+    e.update(sym=c["sym"], mc=round(c["mc"]), liq=round(c["liq"]), vol=round(c["vol"]), ch=round(c["ch"], 1), px=c["px"], age=round(c["age_h"]), chain=chain)
+    return e
+
+
+def radar_read_coin(url, c: dict, latest: int, now: float, chain: str | None = None, bps: float | None = None) -> bool:
+    """Read one listed coin, store what was found, and send the alert when it has qualified on two readings in a row.
+    url = one node's address (Robinhood Chain) or a NodePool."""
+    chain = chain or radar_chain_of({}, c["key"])
+    e = radar_entry(c, now, chain)
+    try:
+        s = radar_scan_coin(url, c["addr"], c["px"], latest, chain=chain, bps=bps,
+                            seeds=[c["pool"]] if chain != "robinhood" and c.get("pool") else None)
+    except RadarNodeLimit as ex:
+        e.update(seen=now, skip=0, why="the free nodes only answer small block ranges right now", acc=0, usd=0, since=0, ok2=0)
+        log.info("radar (%s): %s not read (%s)", chain, c["sym"], ex)
+        return False
+    except RadarBusy as ex:
+        e.update(seen=now, skip=now, why="too many transfers to read politely", acc=0, usd=0, since=0, ok2=0)
+        log.info("radar: %s skipped (%s)", c["sym"], ex)
+        return False
+    e.update(seen=now, skip=0, why="", acc=s["acc"], usd=round(s["usd"]), top1=round(s["top1"], 3), top3=round(s["top3"], 3), n6=s["n6"], n1=s["n1"],
+             net6=round(s["net6"]), dca=s["dca"], last_h=round(s["last_h"], 2), top=s["top"], hrs=s.get("hrs", RADAR_HOURS))
+    return radar_judge(c, e, now)
+
+
+def sol_read_coin(c: dict, now: float) -> bool:
+    """The Solana version of radar_read_coin: one look at the coin's latest trades, added to what was collected before."""
+    e = radar_entry(c, now, "solana")
+    s = sol_look(c, now)
+    if s["full"] and 0 < s["full_h"] < SOL_TOO_ACTIVE_H:
+        e.update(seen=now, skip=now, why="too many trades to follow with the free feed", acc=0, usd=0, since=0, ok2=0, cover=s["cover"], gap=s["gap"])
+        log.info("radar (solana): %s skipped (300 trades in %.1fh)", c["sym"], s["full_h"])
+        return False
+    e.update(seen=now, skip=0, why="", acc=s["acc"], usd=round(s["usd"]), top1=round(s["top1"], 3), top3=round(s["top3"], 3), n6=s["n6"], n1=s["n1"],
+             net6=round(s["net6"]), dca=s["dca"], last_h=round(s["last_h"], 2), top=s["top"], hrs=s["hrs"], cover=s["cover"], gap=s["gap"])
+    return radar_judge(c, e, now)
 
 
 def radar_baskets() -> Counter:
@@ -5402,19 +6821,23 @@ def radar_price_line(ch: float) -> str:
 
 
 def build_radar_message(key: str, pair: dict, e: dict, mc: float, now: float) -> str:
+    chain = radar_chain_of(e, key)
     base = pair.get("baseToken", {})
     addr, sym = base.get("address", ""), md_escape(str(base.get("symbol", "?")))
     liq, vol = num(pair, "liquidity", "usd"), num(pair, "volume", "h24")
     ref = mc if mc > 0 else 2 * liq
     share = (e["usd"] / ref) if ref > 0 else 0
-    L = [f"📡 *ACCUMULATION: ${sym}*  |  {CHAINS['robinhood']['name']}", "",
-         f"🧺 *{e['acc']} wallets* bought it in the last {RADAR_HOURS:g}h and kept it - together about *{fmt_usd(e['usd'])}*"
+    L = [f"📡 *ACCUMULATION: ${sym}*  |  {CHAINS[chain]['name']}", "",
+         f"🧺 *{e['acc']} wallets* bought it {radar_window_text(e, chain)} and kept it - together about *{fmt_usd(e['usd'])}*"
          + (f" ({share:.2%} of its market cap)" if mc > 0 else f" ({share:.1%} of twice its liquidity - market cap not known)") + ".",
          f"✋ None of them sold more than {RADAR_MAX_SOLD:.0%} of what they bought. {e['dca']} bought in 3+ steps (patient money); "
          f"the biggest is {e['top1']:.0%} of the total, the top 3 together {e['top3']:.0%}.",
          f"🔥 Still going: {e['n6']} of them bought again in the last 6 hours ({fmt_usd(e.get('net6', 0))})"
          + (f", the latest {e['last_h'] * 60:.0f} min ago" if e.get("last_h", 0) < 3 else "") + ".",
          radar_price_line(e.get("ch", 0.0))]
+    if chain == "solana":
+        L.append(f"🔎 Solana has no transfer log to read, so this comes from the latest trades above ${BUYER_TRADE_FLOOR_USD:g} that I collected "
+                 f"({e.get('cover', 0):.0f}h so far): smaller buys are not in it.")
     known = radar_known(e)
     if known:
         L.append("👀 Wallets I know in it: " + ", ".join(known[:4]))
@@ -5425,31 +6848,34 @@ def build_radar_message(key: str, pair: dict, e: dict, mc: float, now: float) ->
                  "more like a fund than a bet on this coin.")
     L.append("")
     L.append(f"💰 Market cap *{fmt_usd(mc)}*" if mc > 0 else "💰 Market cap: not known")
-    L.append(f"💧 liquidity {fmt_usd(liq)} · 📊 24h volume {fmt_usd(vol)}")
-    body = "\n".join(L) + "\n" + chain_note("robinhood")
+    L.append(f"💧 liquidity {fmt_usd(liq)} · 📊 24h volume {fmt_usd(vol)}" + (f" · ⏱ pool {fmt_age(e['age'])} old" if e.get("age", 0) > 0 else ""))
+    body = "\n".join(L) + "\n" + chain_note(chain)
     body += (f"📌 I follow this for {follow_text(RADAR_TRACK_HOURS, mc)} (win = +{(RADAR_WIN_X - 1) * 100:.0f}% before -{(1 - RADAR_STOP_X) * 100:.0f}%). "
              "Accumulation is a clue, not a promise: the buyers can be one person with many wallets, and a coin can still fall.\n"
-             f"\n`{addr}`\n\n[DexScreener](https://dexscreener.com/robinhood/{pair.get('pairAddress', '')}) | [Token]({link('robinhood', 'token', addr)})")
+             f"\n`{addr}`\n\n[DexScreener](https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}) | [Token]({link(chain, 'token', addr)})")
     return body
 
 
 def radar_alert(c: dict, e: dict, now: float) -> bool:
-    """A coin that has qualified on two readings in a row: one alert (once per RADAR_COOLDOWN_DAYS, RADAR_MAX_PER_DAY a day)."""
+    """A coin that has qualified on two readings in a row: one alert (once per RADAR_COOLDOWN_DAYS; RADAR_MAX_PER_DAY a day on Robinhood
+    Chain, RADAR_CHAIN_MAX_PER_DAY on each other chain, RADAR_TOTAL_PER_DAY over all of them)."""
     key = c["key"]
+    chain = radar_chain_of(e, key)
     cd = state["cooldowns"]
     quiet = not alert_on("radar")
-    stamps = day_count("rd_ts", now)
+    total = sum(len(day_count(radar_stamp_name(ch), now)) for ch in RADAR_ALL)       # (day_count hands out a fresh list each time: ask for ours LAST)
+    stamps = day_count(radar_stamp_name(chain), now)
     if now - cd.get("rd:" + key, 0) < RADAR_COOLDOWN_DAYS * 86400 or key in state["steady"]:
         return False
-    if not quiet and len(stamps) >= RADAR_MAX_PER_DAY:
+    if not quiet and (len(stamps) >= (RADAR_MAX_PER_DAY if chain == "robinhood" else RADAR_CHAIN_MAX_PER_DAY) or total >= RADAR_TOTAL_PER_DAY):
         return False
     try:
-        want = norm_addr("robinhood", c["addr"])
-        pairs = [p for p in fetch_pairs("robinhood", [c["addr"]]) if norm_addr("robinhood", p.get("baseToken", {}).get("address", "")) == want]
+        want = norm_addr(chain, c["addr"])
+        pairs = [p for p in fetch_pairs(chain, [c["addr"]]) if norm_addr(chain, p.get("baseToken", {}).get("address", "")) == want]
     except requests.RequestException:
         return False
     pair = best_live_pair(pairs)
-    if not pair or not clear_to_alert(key, "robinhood", pair):         # (a steady asset - or not checked yet: a later reading tries again)
+    if not pair or not clear_to_alert(key, chain, pair):               # (a steady asset - or not checked yet: a later reading tries again)
         return False
     mc = pair_mc(key, pair) or num(pair, "fdv")
     note_mc(key, mc, num(pair, "liquidity", "usd"))
@@ -5461,7 +6887,7 @@ def radar_alert(c: dict, e: dict, now: float) -> bool:
         stamps.append(now)
         bot_stats["radar"] += 1
     if m:
-        add_record("radar", key, "robinhood", pair, m, "", now,
+        add_record("radar", key, chain, pair, m, "", now,
                    extra={"th": RADAR_TRACK_HOURS, "wx": RADAR_WIN_X, "sx": RADAR_STOP_X, "n": e["acc"], "usd": round(e["usd"]),
                           "sig": signals_for(m), "quiet": quiet})
     log.info("ACCUMULATION radar: %s - %d wallets, %s%s", key, e["acc"], fmt_usd(e["usd"]), " (quiet)" if quiet else "")
@@ -5469,136 +6895,409 @@ def radar_alert(c: dict, e: dict, now: float) -> bool:
     return True
 
 
-def radar_tick(force: bool = False):
-    """One round of the radar: rebuild the coin list when it is old, then read the few coins that are due."""
-    if not RADAR_ON or not EVM_RPC.get("robinhood"):
+def radar_err(rt: dict, ex) -> None:
+    """Write down a problem of one chain's radar (shown by /radar and the check-in until a coin has been read again)."""
+    rt["last_err"] = ex if isinstance(ex, str) else scrub(ex)[:80]
+    rt["err_t"] = time.time()
+
+
+def radar_tick_chain(chain: str, force: bool = False):
+    """One round of the radar on one chain: rebuild the coin list when it is old, then read the few coins that are due."""
+    if not RADAR_ON:
         return
+    if chain == "robinhood":
+        if not EVM_RPC.get("robinhood"):
+            return
+    elif chain != "solana" and not chain_nodes(chain):
+        return
+    rt = radar_rt(chain)
     now = time.time()
-    _radar_rt["ticks"] += 1
-    if force or _radar_rt.pop("force", False) or not _radar_rt["cands"] or now - _radar_rt["cand_t"] >= RADAR_LIST_HOURS * 3600:
-        try:
-            n = radar_refresh_candidates(now)
-            log.info("radar: %d coins on the list to read", n)
-        except Exception:
-            log.exception("radar: the coin list could not be built")
-            if not _radar_rt["cands"]:
-                _radar_rt["cand_t"] = now - RADAR_LIST_HOURS * 3600 + 600          # (try again in 10 minutes)
-    due = radar_due(_radar_rt["cands"], now)[:RADAR_COINS_PER_ROUND]
+    rt["ticks"] += 1
+    if (force or rt.pop("force", False) or (not rt["cands"] and (chain == "robinhood" or not rt["cand_t"]))
+            or now - rt["cand_t"] >= RADAR_LIST_HOURS * 3600):             # (v3.9: a list that was built but came out empty - every coin too old, say - waits its normal 3 hours)
+        if chain != "robinhood" and gecko_backlog() > 30:
+            rt["cand_t"] = now - RADAR_LIST_HOURS * 3600 + 300
+            radar_err(rt, "GeckoTerminal is busy with the other parts of the bot - the coin list waits")
+        else:
+            try:
+                n = radar_refresh_candidates(now, chain)
+                log.info("radar (%s): %d coins on the list to read", chain, n)
+            except Exception:
+                log.exception("radar (%s): the coin list could not be built", chain)
+                if not rt["cands"]:
+                    rt["cand_t"] = now - RADAR_LIST_HOURS * 3600 + 600          # (try again in 10 minutes)
+    due = radar_due(rt["cands"], now, chain)[:(SOL_COINS_PER_ROUND if chain == "solana" else RADAR_COINS_PER_ROUND)]
     if not due:
         return
-    url = EVM_RPC["robinhood"]
-    bad, bad_t = _rpc_fail.get(url, (0, 0.0))
-    if bad >= 2 and time.time() - bad_t < 120:                       # the VIP looks are having trouble with this node: do not pile on
-        _radar_rt["last_err"] = "the node is busy with the VIP wallets - the radar waits"
+    if chain == "solana":
+        for c in due:
+            if gecko_backlog() > 12:                                 # GeckoTerminal is shared with the whole bot: the radar is the one that waits
+                radar_err(rt, "GeckoTerminal is busy with the other parts of the bot - the Solana radar waits")
+                break
+            try:
+                sol_read_coin(c, time.time())
+                rt["last_ok"] = time.time()
+            except Exception as ex:
+                radar_err(rt, ex)
+                log.warning("radar (solana): could not read %s: %s", c.get("sym"), scrub(ex))
+                e = radar_coins().setdefault(c["key"], {"first": now})
+                e.update(sym=c["sym"], seen=time.time(), chain="solana", why="could not be read: " + scrub(ex)[:40])
+        state["radar"]["last_round"] = time.time()
+        radar_prune(now)
         return
+    bps = None
+    if chain == "robinhood":
+        node = EVM_RPC["robinhood"]
+        bad, bad_t = _rpc_fail.get(node, (0, 0.0))
+        if bad >= 2 and time.time() - bad_t < 120:                   # the VIP looks are having trouble with this node: do not pile on
+            radar_err(rt, "the node is busy with the VIP wallets - the radar waits")
+            return
+    else:
+        node = NodePool(chain)
+        if node.down():
+            radar_err(rt, "all the free nodes of " + CHAINS[chain]["name"] + " are resting after errors - the radar waits")
+            return
+        if node.busy_with_vip():
+            radar_err(rt, "the nodes are busy with the VIP wallets - the radar waits")
+            return
     try:
-        latest = radar_latest(url)
+        latest = radar_latest(node, chain)
+        if chain != "robinhood":
+            bps = chain_bps(chain, node)
     except Exception as ex:
-        _radar_rt["last_err"] = scrub(ex)[:80]
+        radar_err(rt, ex)
         return
     for c in due:
         try:
-            radar_read_coin(url, c, latest, time.time())
+            radar_read_coin(node, c, latest, time.time(), chain=chain, bps=bps)
+            rt["last_ok"] = time.time()
         except RuntimeError as ex:                                   # the node link is resting: leave it alone for now
-            _radar_rt["last_err"] = scrub(ex)[:80]
+            radar_err(rt, ex)
             break
         except Exception as ex:
-            _radar_rt["last_err"] = scrub(ex)[:80]
-            log.warning("radar: could not read %s: %s", c.get("sym"), scrub(ex))
+            radar_err(rt, ex)
+            log.warning("radar (%s): could not read %s: %s", chain, c.get("sym"), scrub(ex))
             e = radar_coins().setdefault(c["key"], {"first": now})
-            e.update(sym=c["sym"], seen=time.time(), why="could not be read: " + scrub(ex)[:40])
+            e.update(sym=c["sym"], seen=time.time(), chain=chain, why="could not be read: " + scrub(ex)[:40])
         time.sleep(0.5)
     state["radar"]["last_round"] = time.time()
     radar_prune(now)
 
 
+def radar_tick(force: bool = False, chain: str = "robinhood"):
+    """One round of the radar on one chain (Robinhood Chain unless told otherwise). radar_tick_all() is the round of every chain."""
+    radar_tick_chain(chain, force)
+
+
+_radar_turn = [0]
+
+
+def radar_tick_all(force: bool = False):
+    """One round on every chain, the one that starts taking turns (so a slow chain cannot keep the others waiting for good)."""
+    chains = radar_chains_on()
+    if not chains:
+        return
+    k = _radar_turn[0] % len(chains)
+    _radar_turn[0] += 1
+    t0 = time.time()
+    for ch in chains[k:] + chains[:k]:
+        if time.time() - t0 > RADAR_TICK_BUDGET:
+            break
+        try:
+            radar_tick_chain(ch, force)
+        except Exception as ex:
+            log.exception("radar (%s) round failed", ch)
+            radar_err(radar_rt(ch), ex)
+
+
 async def radar_loop():
-    """Every couple of minutes: read a few coins for accumulation (nothing happens until the other loops have started)."""
+    """Every couple of minutes: read a few coins on each chain for accumulation (nothing happens until the other loops have started)."""
     await asyncio.sleep(RADAR_LOOP_START_DELAY)
     while True:
-        try:
-            await asyncio.to_thread(radar_tick)
-        except Exception:
-            log.exception("radar loop error")
-        await asyncio.sleep(RADAR_ROUND_SECONDS)
-
+        if not bw_paused():                  # v3.9.1: slower while the data saver is on, paused while it is resting
+            try:
+                await asyncio.to_thread(radar_tick_all)
+            except Exception:
+                log.exception("radar loop error")
+        await asyncio.sleep(RADAR_ROUND_SECONDS * bw_slow())
 
 # --- the /radar command ---
-def radar_fresh_coins() -> list[tuple[str, dict]]:
+def radar_fresh_coins(chain: str | None = None) -> list[tuple[str, dict]]:
     now = time.time()
     return [(k, e) for k, e in radar_coins().items()
-            if isinstance(e, dict) and e.get("seen") and now - e["seen"] <= RADAR_KEEP_HOURS * 3600 and e.get("acc", 0) > 0]
+            if isinstance(e, dict) and e.get("seen") and now - e["seen"] <= RADAR_KEEP_HOURS * 3600 and e.get("acc", 0) > 0
+            and (chain is None or radar_chain_of(e, k) == chain)]
 
 
-def radar_line(i: int, key: str, e: dict, now: float) -> str:
+def radar_read_counts(now: float) -> dict:
+    """{chain: coins read in the last 30 hours}."""
+    out: dict[str, int] = {}
+    for k, e in radar_coins().items():
+        if isinstance(e, dict) and e.get("seen") and now - e["seen"] <= RADAR_KEEP_HOURS * 3600:
+            ch = radar_chain_of(e, k)
+            out[ch] = out.get(ch, 0) + 1
+    return out
+
+
+def radar_line(i: int, key: str, e: dict, now: float, tag: bool = False) -> str:
+    chain = radar_chain_of(e, key)
     mc = e.get("mc", 0)
     ref = mc if mc > 0 else 2 * e.get("liq", 0)
     sh = f" ({e['usd'] / ref:.2%} of MC)" if mc > 0 and ref > 0 else ""
-    return (f"{i}. *${md_escape(str(e.get('sym', '?')))}*" + (f" · MC {fmt_usd(mc)}" if mc > 0 else f" · liq {fmt_usd(e.get('liq', 0))}")
+    return (f"{i}. *${md_escape(str(e.get('sym', '?')))}*" + (f" · {CHAINS[chain]['name']}" if tag else "")
+            + (f" · MC {fmt_usd(mc)}" if mc > 0 else f" · liq {fmt_usd(e.get('liq', 0))}")
             + f" - {e['acc']} wallets, {fmt_usd(e['usd'])}{sh}, {e['n6']} still buying (6h), top wallet {e['top1']:.0%}, price {e.get('ch', 0):+.0f}%"
             + f"\n   `{key.split(':', 1)[1]}`")
 
 
-def radar_list_text() -> str:
+def radar_chain_line(now: float) -> str:
+    counts = radar_read_counts(now)
+    parts = []
+    for ch in radar_chains_on():
+        bit = f"{CHAINS[ch]['name']} {counts.get(ch, 0)}"
+        rt = radar_rt(ch)
+        if not counts.get(ch) and rt.get("last_err") and now - STARTED_AT > 900:
+            bit += " ⚠️"
+        parts.append(bit)
+    return "Coins read in the last 30h: " + " · ".join(parts) if parts else ""
+
+
+def radar_rules_line(chain: str) -> str:
+    age_d = radar_cfg(chain, "age_d")
+    return (f"{int(radar_cfg(chain, 'acc'))}+ wallets, {fmt_usd(radar_cfg(chain, 'net'))} bought together, each at least {fmt_usd(radar_cfg(chain, 'buy'))}, "
+            f"{int(radar_cfg(chain, 'recent'))}+ still buying in the last 6h" + (f", coin no older than {age_d:g} days" if age_d > 0 else ""))
+
+
+def radar_list_text(chain: str | None = None) -> str:
     now = time.time()
-    rows = radar_fresh_coins()
-    rad = state["radar"]
     if not RADAR_ON:
         return "📡 The accumulation radar is switched off (RADAR=false on the server)."
+    on = radar_chains_on()
+    if chain and chain not in on:
+        return f"📡 The radar is not reading {CHAINS[chain]['name']} (`RADAR_CHAINS` on the server leaves it out)."
+    rows = radar_fresh_coins(chain)
+    if not rows and chain and radar_rt(chain).get("built") and not radar_rt(chain)["cands"]:
+        age_d = radar_cfg(chain, "age_d")                                   # (v3.9: the list was built, but no coin fits the rules - say so, not "no readings yet")
+        return (f"📡 *Accumulation radar* - {CHAINS[chain]['name']}: no coin on the list to read. Of the {radar_rt(chain)['built'][1]} coins in its busiest pools, none is "
+                f"{radar_cfg(chain, 'age_h') / 24:g}" + (f"-{age_d:g}" if age_d > 0 else "+") + f" days old with {fmt_usd(radar_cfg(chain, 'liq'))}+ liquidity and a market cap of "
+                f"{fmt_usd(radar_cfg(chain, 'mc_min'))}-{fmt_usd(radar_cfg(chain, 'mc_max'))}. "
+                + (f"/radar set {chain} age 90 allows older coins (0 = any age). " if age_d > 0 else "") + "The list is looked at again every few hours.\n"
+                "Send /radar <coin address> to read one coin right now.")
     if not rows:
-        err = str(_radar_rt.get("last_err") or "")
-        return ("📡 *Accumulation radar* - no readings yet. It reads a few Robinhood Chain coins every couple of minutes, so the first full list is "
+        err = str(radar_rt(chain).get("last_err") or "") if chain else next((str(radar_rt(c).get("last_err")) for c in on if radar_rt(c).get("last_err")), "")
+        return ("📡 *Accumulation radar* - no readings yet. It reads a few " + (f"{CHAINS[chain]['name']} coins" if chain else "coins on every chain")
+                + " every couple of minutes, so the first full list is "
                 f"ready about {int(RADAR_MAX_COINS / RADAR_COINS_PER_ROUND * RADAR_ROUND_SECONDS / 60) + 3} minutes after start-up.\n"
                 + (f"⚠️ Last problem: {md_escape(err[:90])}\n" if err else "")
                 + "Send /radar <coin address> to read one coin right now.")
-    good, bigone, small, other = [], [], [], 0
+    good, bigone, small, other, warm = [], [], [], 0, 0
     for k, e in rows:
-        ok, why = radar_qualifies(e)
+        ch = radar_chain_of(e, k)
+        ok, why = radar_qualifies(e, ch)
         if ok:
             good.append((k, e))
-        elif e.get("top1", 0) > RADAR_MAX_TOP1 and e.get("acc", 0) >= 15 and e.get("usd", 0) >= RADAR_MIN_NET_USD:
+        elif (e.get("top1", 0) > RADAR_MAX_TOP1 and e.get("acc", 0) >= max(10, round(0.6 * radar_cfg(ch, "acc"))) and e.get("usd", 0) >= radar_cfg(ch, "net")
+              and not radar_too_old(e, ch)):
             bigone.append((k, e))
-        elif radar_is_small_steady(e):
+        elif radar_is_small_steady(e, ch):
             small.append((k, e))
         else:
             other += 1
+            if ch == "solana" and e.get("cover", 0) < SOL_MIN_COVER_H:
+                warm += 1
     good.sort(key=lambda x: -x[1]["usd"])
     bigone.sort(key=lambda x: -x[1]["usd"])
     small.sort(key=lambda x: -(x[1]["usd"] / max(1.0, x[1]["mc"] if x[1].get("mc", 0) > 0 else 2 * x[1].get("liq", 0))))
-    L = [f"📡 *Accumulation radar* - Robinhood Chain coins that many wallets bought and KEPT in the last {RADAR_HOURS:g}h "
-         f"(read {len(rows)} coins; the oldest reading is {ago(now - min(e['seen'] for _, e in rows))} old)."
-         + ("" if alert_on("radar") else "\n⚠️ The radar alert is switched OFF (/alerts radar on). It still reads and follows quietly.")]
-    if good:
-        L.append("\n*Accumulating now* (" + f"{RADAR_MIN_ACC}+ wallets, not one big buyer, still buying, price not running):")
-        for i, (k, e) in enumerate(good[:8], 1):
-            L.append(radar_line(i, k, e, now))
+    names = [CHAINS[chain]["name"]] if chain else [CHAINS[c]["name"] for c in RADAR_ALL if any(radar_chain_of(e, k) == c for k, e in rows)]
+    tag = not chain and len(names) > 1
+    one = chain or (next((c for c in RADAR_ALL if any(radar_chain_of(e, k) == c for k, e in rows)), None) if len(names) == 1 else None)
+    need_txt = f"{int(radar_cfg(one, 'acc'))}+ wallets" if one else "enough wallets"
+    head = [f"📡 *Accumulation radar* - {', '.join(names)} coins that many wallets bought and KEPT in the last {RADAR_HOURS:g}h "
+            f"(read {len(rows)} coin{'' if len(rows) == 1 else 's'}; the oldest reading is {ago(now - min(e['seen'] for _, e in rows))} old)."
+            + ("" if alert_on("radar") else "\n⚠️ The radar alert is switched OFF (/alerts radar on). It still reads and follows quietly.")]
+    if chain:
+        head.append("Alert rules here: " + radar_rules_line(chain) + f" (change one: /radar set {chain} acc 12)")
+    foot = []
+    foot.append(f"\n{other} other coin{'' if other == 1 else 's'} read: too few accumulators, cooling off, running, falling or too old."
+                + (f" ({warm} Solana coin{'' if warm == 1 else 's'} still collecting trades - an alert needs {SOL_MIN_COVER_H:g}h of them.)" if warm else ""))
+    if not chain:
+        cl = radar_chain_line(now)
+        if cl:
+            foot.append(cl)
+    old_txt = (f"coins older than {radar_cfg(one, 'age_d'):g} days, " if one and radar_cfg(one, "age_d") > 0 else
+               ("old coins (the age limit: /radar set), " if not one else ""))
+    foot.append("Launch-day coins (younger than " + f"{(radar_cfg(one, 'age_h') if one else RADAR_MIN_AGE_H):g}h" + "), " + old_txt + "thin pools and stock / wrapped tokens are not read. "
+                "/radar <coin address> reads one coin now · /radar base|eth|bnb|solana|robinhood shows one chain · /radar nodes · /radar set · /alerts radar off")
+    sizes = [8, 3, 2] if not chain else [10, 5, 3]
+
+    def compose() -> str:
+        L = list(head)
+        if good:
+            L.append("\n*Accumulating now* (" + f"{need_txt}, not one big buyer, still buying, price not running):")
+            for i, (k, e) in enumerate(good[:sizes[0]], 1):
+                L.append(radar_line(i, k, e, now, tag))
+        else:
+            L.append("\nNothing meets all the rules right now.")
+        if small and sizes[1] > 0:
+            L.append("\n*Smaller but steady* (" + (f"not alerted: fewer than {int(radar_cfg(one, 'acc'))} wallets, " if one else "not alerted: too few wallets, ")
+                     + "but a patient build-up that is big for the coin):")
+            for i, (k, e) in enumerate(small[:sizes[1]], 1):
+                L.append(radar_line(i, k, e, now, tag))
+        if bigone and sizes[2] > 0:
+            L.append("\n*One big wallet is most of it* (not alerted):")
+            for i, (k, e) in enumerate(bigone[:sizes[2]], 1):
+                L.append(radar_line(i, k, e, now, tag))
+        return "\n".join(L + foot)
+    out = compose()
+    while len(out) > 3800 and (sizes[0] > 3 or sizes[1] > 0 or sizes[2] > 0):       # (too long for one message: the lists get shorter, the footer stays)
+        i = max(range(3), key=lambda j: sizes[j] - (3 if j == 0 else 0))
+        sizes[i] = max(3 if i == 0 else 0, sizes[i] - 1)
+        out = compose()
+    return out if len(out) <= 3900 else out[:3900].rsplit("\n", 1)[0]
+
+
+def radar_nodes_text() -> str:
+    """/radar nodes: which free nodes each chain is read from, which ones are resting, and the block limits the bot has learned."""
+    now = time.time()
+    on = radar_chains_on()
+    L = ["🛰 *Radar nodes* - where each chain's transfers are read from. The block limits are learned from the nodes' own answers; "
+         "a node that fails rests for a while and the next one is asked."]
+    for ch in RADAR_EVM:
+        if ch not in on:
+            continue
+        rt = radar_rt(ch)
+        hit = _bps.get(ch)
+        bps_txt = ("9.8 blocks/s (fixed)" if ch == "robinhood" else f"{hit[1]:.2f} blocks/s ({hit[2]})" if hit else "blocks/s not measured yet")
+        L.append(f"\n*{CHAINS[ch]['name']}* - {bps_txt}")
+        for u in chain_nodes(ch):
+            st = node_stat(u)
+            host = md_escape(u.split("//", 1)[-1][:46])
+            bits = []
+            if ch == "robinhood" and u == EVM_RPC.get("robinhood"):      # (its node is asked directly, not through the pool of backups)
+                ok_t = rt.get("last_ok", 0)
+                bits.append(f"✅ answering (last coin read {ago(now - ok_t)} ago)" if ok_t else "not used yet")
+            elif st["until"] > now:
+                bits.append(f"💤 resting {ago(st['until'] - now)}" + (f" after: {md_escape(st['err'][:50])}" if st["err"] else ""))
+            elif st["ok"]:
+                bits.append("✅ answering")
+            else:
+                bits.append("not used yet")
+            if st["win"]:
+                bits.append(f"{st['win']:,} blocks per request (learned)")
+            L.append(f"  • {host}: " + ", ".join(bits))
+        if rt.get("last_err") and rt.get("err_t", 0) > rt.get("last_ok", 0):
+            L.append(f"  ⚠️ last problem: {md_escape(str(rt['last_err'])[:80])}")
+    if "solana" in on:
+        warm = sum(1 for st in _sol_store.values() if sol_cover(st, now)[0] >= SOL_MIN_COVER_H)
+        L.append(f"\n*Solana* - trades from GeckoTerminal (shared with the rest of the bot): collecting the trades of {len(_sol_store)}, {warm} of them with {SOL_MIN_COVER_H:g}h or more.")
+        srt = radar_rt("solana")
+        if srt.get("last_err") and srt.get("err_t", 0) > srt.get("last_ok", 0):
+            L.append(f"  ⚠️ last problem: {md_escape(str(srt['last_err'])[:80])}")
+    L.append("\nYour own node: set `RPC_BASE`, `RPC_ETHEREUM` or `RPC_BSC` on the server (an address from a provider like Alchemy or QuickNode; its plan "
+             "has to allow reading logs over a few thousand blocks). It is asked first, unless it turns out to allow far less than the free nodes.")
+    return "\n".join(L)
+
+
+RADAR_SET_LIMITS = {"acc": (3, 200), "net": (500.0, 10_000_000.0), "buy": (20.0, 50_000.0), "recent": (1, 100), "age_d": (0, 3650)}
+RADAR_FIELD_WORDS = {"acc": "acc", "wallets": "acc", "net": "net", "money": "net", "usd": "net", "dollars": "net", "buy": "buy", "each": "buy",
+                     "recent": "recent", "still": "recent", "fresh": "recent",
+                     "age": "age_d", "days": "age_d", "old": "age_d", "oldest": "age_d", "older": "age_d", "maxage": "age_d"}
+
+
+def radar_settings_text(chain: str | None = None) -> str:
+    L = ["⚙️ *Radar alert rules* - a coin needs ALL of them (plus: not one big buyer, price not running, two readings 20+ min apart). ✏️ = you changed it."]
+    ov = state["tuning"].get("radar_cfg") if isinstance(state["tuning"].get("radar_cfg"), dict) else {}
+    for ch in ([chain] if chain else [c for c in RADAR_ALL]):
+        mine = ov.get(ch) if isinstance(ov.get(ch), dict) else {}
+        def mark(f, txt):
+            return txt + (" ✏️" if f in mine else "")
+        age_d = radar_cfg(ch, "age_d")
+        L.append(f"*{CHAINS[ch]['name']}*: " + " · ".join([mark("acc", f"{int(radar_cfg(ch, 'acc'))}+ wallets"), mark("net", f"{fmt_usd(radar_cfg(ch, 'net'))} together"),
+                                                           mark("buy", f"{fmt_usd(radar_cfg(ch, 'buy'))} each"), mark("recent", f"{int(radar_cfg(ch, 'recent'))}+ still buying (6h)"),
+                                                           mark("age_d", f"coin up to {age_d:g} days old" if age_d > 0 else "any coin age")]))
+    L.append("\nChange one: /radar set <chain|all> <wallets|money|each|fresh|age> <number>   e.g. /radar set base wallets 12   or   /radar set eth money 20k   "
+             "or   /radar set base age 60 (days; 0 = any age)")
+    L.append("Put them back: /radar reset [chain]. These are first guesses: the results of the alerts (/lowcap) show whether to tighten or loosen them.")
+    return "\n".join(L)
+
+
+def radar_set_cmd(args: list[str]) -> str:
+    if len(args) < 3:
+        return radar_settings_text(norm_chain(args[0]) if args and norm_chain(args[0]) in RADAR_ALL else None)
+    word = args[0].lower()
+    chains = list(RADAR_ALL) if word in ("all", "every", "everything") else ([norm_chain(word)] if norm_chain(word) in RADAR_ALL else [])
+    field = RADAR_FIELD_WORDS.get(args[1].lower())
+    raw = args[2].strip()
+    if field == "age_d":                                             # 30, 30d or 30days; off / none / any = no limit
+        raw = "0" if raw.lower() in ("off", "none", "any", "no", "nolimit", "unlimited") else re.sub(r"(days?|d)$", "", raw, flags=re.I)
+    mt = re.fullmatch(r"\$?([0-9][0-9,]*\.?[0-9]*)\s*([kKmM]?)", raw)
+    if not chains or not field or not mt:
+        return "I didn't get that. " + radar_settings_text()
+    try:
+        val = float(mt.group(1).replace(",", "")) * {"": 1, "k": 1_000, "m": 1_000_000}[mt.group(2).lower()]
+    except (ValueError, KeyError):
+        return "I didn't get that number. " + radar_settings_text()
+    lo, hi = RADAR_SET_LIMITS[field]
+    if not lo <= val <= hi:
+        return f"That is out of range: {'age (days)' if field == 'age_d' else field} must be between {lo:g} and {hi:g}."
+    if field == "age_d" and 0 < val < 1:
+        val = 1                                                      # (a fraction of a day must not round down to 0 = no limit at all: it is refused below as too short)
+    if field in ("acc", "recent", "age_d"):
+        val = int(round(val))
+    ov = state["tuning"].get("radar_cfg")
+    if not isinstance(ov, dict):
+        ov = state["tuning"]["radar_cfg"] = {}
+    for ch in chains:                                                # (checked for every chain first, so a refusal changes nothing)
+        acc_v = val if field == "acc" else radar_cfg(ch, "acc")
+        rec_v = val if field == "recent" else radar_cfg(ch, "recent")
+        if int(rec_v) > int(acc_v):
+            return f"{CHAINS[ch]['name']}: 'still buying' ({int(rec_v)}) can't be more than the number of wallets ({int(acc_v)}) - nothing changed."
+        if field == "age_d" and 0 < val * 24 <= radar_cfg(ch, "age_h"):
+            return (f"{CHAINS[ch]['name']}: coins younger than {radar_cfg(ch, 'age_h') / 24:g} days are not read at all, so the age limit has to be longer "
+                    "than that (or 0 for any age) - nothing changed.")
+    said = []
+    for ch in chains:
+        was = radar_cfg(ch, field)
+        ov.setdefault(ch, {})[field] = val
+        said.append(f"{CHAINS[ch]['name']}: {RADAR_TUNABLE[field]} was {was:,.0f}, now {val:,.0f}")
+        if field == "age_d":                                         # (the list of coins to read is built with this limit: build it again)
+            rt = radar_rt(ch)
+            rt["force"] = True
+            rt["cand_t"] = 0.0
+    save_state()
+    return "✅ " + "\n".join(said) + ("\nThe list of coins to read is rebuilt in the next minutes." if field == "age_d" else "\nIt counts from the next reading.")
+
+
+def radar_reset_cmd(args: list[str]) -> str:
+    ov = state["tuning"].get("radar_cfg")
+    if not isinstance(ov, dict) or not ov:
+        return "Nothing to put back: all the radar rules are the built-in ones."
+    word = args[0].lower() if args else ""
+    ch = norm_chain(word) if word else None
+    if word and ch not in RADAR_ALL:
+        return "Which chain? /radar reset base (or eth, bnb, solana, robinhood) - or just /radar reset for all."
+    if ch:
+        ov.pop(ch, None)
     else:
-        L.append("\nNothing meets all the rules right now.")
-    if small:
-        L.append(f"\n*Smaller but steady* (not alerted: fewer than {RADAR_MIN_ACC} wallets, but a patient build-up that is big for the coin):")
-        for i, (k, e) in enumerate(small[:4], 1):
-            L.append(radar_line(i, k, e, now))
-    if bigone:
-        L.append("\n*One big wallet is most of it* (not alerted):")
-        for i, (k, e) in enumerate(bigone[:4], 1):
-            L.append(radar_line(i, k, e, now))
-    L.append(f"\n{other} other coin{'' if other == 1 else 's'} read: too few accumulators, cooling off, running, or falling.")
-    L.append("Launch-day coins (younger than " + f"{RADAR_MIN_AGE_H:g}h" + "), thin pools and stock / wrapped tokens are not read. "
-             "/radar <coin address> reads one coin now · /alerts radar off")
-    out = "\n".join(L)
-    return out if len(out) <= 3800 else out[:3800].rsplit("\n", 1)[0]
+        ov.clear()
+    save_state()
+    return "✅ " + (CHAINS[ch]["name"] + "'s radar rules are" if ch else "All the radar rules are") + " back to the built-in numbers."
 
 
 def radar_check_one(ref: str, notify=None) -> str:
-    """/radar <coin address>: read that one coin now (takes about 20 seconds)."""
+    """/radar <coin address>: read that one coin now (about 20 seconds). Works on every chain the radar reads."""
     chain, addr, err = resolve_coin_ref(ref)
     if err:
         return err.replace("/check", "/radar")
-    if chain != "robinhood":
-        return "The accumulation radar reads Robinhood Chain coins only (that address is on " + CHAINS[chain]["name"] + ")."
-    url = EVM_RPC.get("robinhood")
-    if not url:
-        return "I have no node link for Robinhood Chain, so I can't read its transfers."
+    name = CHAINS[chain]["name"]
+    if chain == "robinhood":
+        node = EVM_RPC.get("robinhood")
+    elif chain == "solana":
+        node = True
+    else:
+        node = NodePool(chain) if chain_nodes(chain) else None
+    if not node:
+        return f"I have no node link for {name}, so I can't read its transfers."
     want = norm_addr(chain, addr)
     try:
         pairs = [p for p in fetch_pairs(chain, [addr]) if norm_addr(chain, p.get("baseToken", {}).get("address", "")) == want]
@@ -5607,37 +7306,61 @@ def radar_check_one(ref: str, notify=None) -> str:
     pair = best_live_pair(pairs)
     px = num(pair, "priceUsd") if pair else 0.0
     if not pair or px <= 0:
-        return "I couldn't find a live trading pool with a price for that address on Robinhood Chain."
+        return f"I couldn't find a live trading pool with a price for that address on {name}."
+    if chain == "solana" and (gecko_backlog() > 60 or not pair.get("pairAddress")):
+        return "GeckoTerminal is busy with the rest of the bot right now - try again in a minute." if pair.get("pairAddress") else "I couldn't find that coin's main pool."
     if notify:
-        notify("🔎 Reading that coin's transfers from the chain now - about 20 seconds.")
+        notify("🔎 Collecting that coin's latest trades now - about 10 seconds." if chain == "solana"
+               else "🔎 Reading that coin's transfers from the chain now - about 20 seconds.")
     sym = md_escape(str(pair.get("baseToken", {}).get("symbol", "?")))
+    key = sk(chain, addr)
+    mc = pair_mc(key, pair) or num(pair, "fdv")
+    liq = num(pair, "liquidity", "usd")
+    pool_addr = str(pair.get("pairAddress") or "")
+    now = time.time()
     try:
-        latest = radar_latest(url)
-        s = radar_scan_coin(url, addr, px, latest, budget=RADAR_MAX_CALLS * 2)
+        if chain == "solana":
+            s = sol_look({"key": key, "addr": addr, "pool": pool_addr}, now)
+            s.setdefault("logs", s.get("trades", 0))
+            s.setdefault("hubs", 0)
+        else:
+            latest = radar_latest(node, chain)
+            s = radar_scan_coin(node, addr, px, latest, budget=RADAR_MAX_CALLS * 2, chain=chain,
+                                seeds=[pool_addr] if chain != "robinhood" and pool_addr else None)
+    except RadarNodeLimit:
+        return f"The free nodes of {name} only answer very small block ranges right now, so I can't read ${sym}'s transfers. Try again later."
     except RadarBusy:
         return f"${sym} has too many transfers for me to read politely with the free node. I skipped it."
     except (RuntimeError, ValueError, requests.RequestException) as ex:
         return f"I couldn't read ${sym}'s transfers just now ({md_escape(scrub(ex)[:60])}). Try again in a minute."
-    key = sk(chain, addr)
-    mc = pair_mc(key, pair) or num(pair, "fdv")
-    liq = num(pair, "liquidity", "usd")
-    e = {"acc": s["acc"], "usd": s["usd"], "top1": s["top1"], "top3": s["top3"], "n6": s["n6"], "n1": s["n1"], "net6": s["net6"], "dca": s["dca"],
-         "last_h": s["last_h"], "mc": mc, "liq": liq, "ch": num(pair, "priceChange", "h24"), "top": s["top"]}
-    ok, why = radar_qualifies(e)
-    created = num(pair, "pairCreatedAt")
+    made = [c_ for c_ in (num(p_, "pairCreatedAt") for p_ in pairs) if c_ > 0]       # (the age is the OLDEST pool's, as in the radar's own coin list)
+    created = min(made) if made else 0.0
     age_h = (time.time() * 1000 - created) / 3_600_000 if created else 0.0
-    L = [f"📡 *${sym}* - accumulation over the last {RADAR_HOURS:g}h (read {s['logs']:,} transfers, {s['hubs']} pools / routers found)",
+    age_min = radar_cfg(chain, "age_h")
+    e = {"acc": s["acc"], "usd": s["usd"], "top1": s["top1"], "top3": s["top3"], "n6": s["n6"], "n1": s["n1"], "net6": s["net6"], "dca": s["dca"],
+         "last_h": s["last_h"], "mc": mc, "liq": liq, "ch": num(pair, "priceChange", "h24"), "top": s["top"], "chain": chain,
+         "hrs": s.get("hrs", RADAR_HOURS), "cover": s.get("cover", 0), "gap": s.get("gap", 0), "age": round(age_h)}
+    ok, why = radar_qualifies(e, chain)
+    hrs = radar_hours(e)
+    if chain == "solana":
+        first = (f"📡 *${sym}* - accumulation in the {hrs:.0f}h of its trades I have "
+                 f"(a sample: {s['trades']:,} trades above ${BUYER_TRADE_FLOOR_USD:g} from {s['wallets']} wallets)")
+    else:
+        first = f"📡 *${sym}* - accumulation over the last {hrs:g}h (read {s['logs']:,} transfers, {s['hubs']} pools / routers found)"
+    L = [first,
          f"🧺 {s['acc']} accumulating wallets · {fmt_usd(s['usd'])} net bought" + (f" ({s['usd'] / mc:.2%} of MC)" if mc > 0 else ""),
          f"✋ biggest wallet {s['top1']:.0%} of it, top 3 {s['top3']:.0%} · {s['dca']} bought in 3+ steps",
          f"🔥 {s['n6']} bought in the last 6h ({fmt_usd(s['net6'])}), {s['n1']} in the last hour",
          radar_price_line(e["ch"]),
          f"💰 MC {fmt_usd(mc) if mc > 0 else 'not known'} · 💧 liquidity {fmt_usd(liq)}" + (f" · ⏱ pool {fmt_age(age_h)} old" if age_h > 0 else "")]
+    if chain != "robinhood" and s.get("hrs", RADAR_HOURS) < RADAR_HOURS - 0.5 and chain != "solana":
+        L.append(f"ℹ️ The free nodes answered only small ranges, so this covers the last {hrs:g}h, not {RADAR_HOURS:g}h.")
     known = radar_known(e)
     if known:
         L.append("👀 Wallets I know in it: " + ", ".join(known[:4]))
-    if age_h and age_h < RADAR_MIN_AGE_H:
+    if age_h and age_h < age_min:
         L.append(f"⚠️ It is only {fmt_age(age_h)} old: a launch-day coin's buying is mostly pump and wash trading, so I would not call this accumulation.")
-    L.append("✅ This meets every rule of an accumulation alert." if ok and not (age_h and age_h < RADAR_MIN_AGE_H) else f"ℹ️ Not an alert: {why or 'too young'}.")
+    L.append("✅ This meets every rule of an accumulation alert." if ok and not (age_h and age_h < age_min) else f"ℹ️ Not an alert: {why or 'too young'}.")
     return "\n".join(L)
 
 
@@ -5647,12 +7370,23 @@ def cmd_radar(args: list[str], notify=None) -> str:
         set_alert("radar", sub == "on")
         return "✅ The radar alert is " + ("ON." if sub == "on" else "OFF. It keeps reading and following in silence.")
     if sub in ("scan", "refresh", "now", "rebuild"):
-        _radar_rt["force"] = True
-        _radar_rt["cand_t"] = 0.0
+        for ch in RADAR_ALL:
+            rt = radar_rt(ch)
+            rt["force"] = True
+            rt["cand_t"] = 0.0
         return "🔄 I'll rebuild the list of coins to read in the next minutes."
+    if sub in ("nodes", "node", "rpc", "status"):
+        return radar_nodes_text()
+    if sub in ("set", "settings", "setting", "rules", "tune"):
+        return radar_set_cmd(args[1:])
+    if sub == "reset":
+        return radar_reset_cmd(args[1:])
     refs = extract_refs(" ".join(args)) if args else []
     if refs:
         return radar_check_one(refs[0], notify)
+    ch = norm_chain(sub) if sub else None
+    if ch in RADAR_ALL:
+        return radar_list_text(ch)
     return radar_list_text()
 
 
@@ -5661,16 +7395,25 @@ def radar_status_lines() -> list[str]:
     try:
         if not RADAR_ON:
             return []
+        now = time.time()
         rows = radar_fresh_coins()
-        good = sorted(((e["usd"], e.get("sym", "?")) for _, e in rows if radar_qualifies(e)[0]), reverse=True)
-        sent = len(_last_day(state["tuning"].get("rd_ts"), time.time()))
+        good = sorted(((e["usd"], e.get("sym", "?"), radar_chain_of(e, k)) for k, e in rows if radar_qualifies(e)[0]), reverse=True)
+        sent = sum(len(_last_day(state["tuning"].get(radar_stamp_name(ch)), now)) for ch in RADAR_ALL)
+        on = radar_chains_on()
         if not rows:
-            err = str(_radar_rt.get("last_err") or "")
-            if err and time.time() - STARTED_AT > 1800:
+            err = next((f"{CHAINS[c]['name']}: {radar_rt(c).get('last_err')}" for c in on if radar_rt(c).get("last_err")), "")
+            if err and now - STARTED_AT > 1800:
                 return [f"📡 Accumulation radar: no coin read yet (last problem: {md_escape(err[:70])}) - I keep trying (/radar)"]
-            return ["📡 Accumulation radar: starting up (it reads a few Robinhood Chain coins every couple of minutes) - /radar"]
-        return [f"📡 Accumulation radar: {len(rows)} coins read lately" + (f", accumulating now: {', '.join('$' + md_escape(str(s)) for _, s in good[:4])}" if good else ", none accumulating right now")
-                + f" · alerts in the last 24h: {sent} (/radar)"]
+            return ["📡 Accumulation radar: starting up (it reads a few coins on every chain every couple of minutes) - /radar"]
+        multi = len({c for _, _, c in good}) > 1 or len(on) > 1
+        names = ", ".join("$" + md_escape(str(s)) + (f" ({CHAINS[c]['name']})" if multi else "") for _, s, c in good[:4])
+        out = [f"📡 Accumulation radar: {len(rows)} coins read lately" + (f", accumulating now: {names}" if good else ", none accumulating right now")
+               + f" · alerts in the last 24h: {sent} (/radar)"]
+        stuck = [c for c in on if radar_rt(c).get("err_t", 0) > radar_rt(c).get("last_ok", 0) and now - radar_rt(c).get("err_t", 0) < 6 * 3600
+                 and not radar_read_counts(now).get(c)]
+        if stuck and now - STARTED_AT > 1800:
+            out.append("   ⚠️ not reading yet: " + "; ".join(f"{CHAINS[c]['name']} ({md_escape(str(radar_rt(c).get('last_err'))[:50])})" for c in stuck[:3]) + " - /radar nodes")
+        return out
     except Exception:
         log.exception("radar status lines failed")
         return []
@@ -5686,32 +7429,33 @@ def vip_tick():
         vip_retry_due(now)
     except Exception:
         log.exception("VIP reminders error")
+    slow, rest = bw_slow(), bw_paused()       # v3.9.1: the data saver slows every look; while resting the hunters wait (the named VIP wallets go on, slowly)
     if VIP_SWEEPS_ON and vip_items():
-        if now - r.get("sol_vip", 0) >= VIP_SWEEP_SECONDS:
+        if now - r.get("sol_vip", 0) >= VIP_SWEEP_SECONDS * slow:
             r["sol_vip"] = now
             try:
                 vip_sweep_solana("vip")
             except Exception:
                 log.exception("VIP sweep (Solana) error")
-        if now - r.get("sol_hunt", 0) >= HUNTER_SWEEP_SECONDS:
+        if not rest and now - r.get("sol_hunt", 0) >= HUNTER_SWEEP_SECONDS * slow:
             r["sol_hunt"] = now
             try:
                 vip_sweep_solana("hunter")
             except Exception:
                 log.exception("hunter sweep (Solana) error")
-        if now - r.get("evm", 0) >= VIP_SWEEP_SECONDS:
+        if now - r.get("evm", 0) >= VIP_SWEEP_SECONDS * slow:
             r["evm"] = now
             try:
                 vip_sweep_evm()
             except Exception:
                 log.exception("VIP sweep (Robinhood Chain) error")
-    if state["kol"] and (r.pop("kol_now", False) or now - r.get("kol", 0) >= KOL_SECONDS):
+    if state["kol"] and (r.pop("kol_now", False) or now - r.get("kol", 0) >= KOL_SECONDS * slow):
         r["kol"] = now
         try:
             kol_pass()
         except Exception:
             log.exception("dip-watch error")
-    if now - r.get("hunt", 0) >= 1800:
+    if not rest and now - r.get("hunt", 0) >= 1800 * slow:
         r["hunt"] = now
         try:
             hunters_pass()
@@ -5736,7 +7480,7 @@ async def wallet_loop():
     while True:
         try:
             if any(d.get("kind") == "solana" for d in list(state["watch"].values())) and (
-                    _sweep["now"] or time.time() - _sweep["last"] >= WATCH_SWEEP_SECONDS):
+                    _sweep["now"] or (not bw_paused() and time.time() - _sweep["last"] >= WATCH_SWEEP_SECONDS * bw_slow())):
                 _sweep["now"], _sweep["last"] = False, time.time()
                 await asyncio.to_thread(wallet_sweep)
         except Exception:
@@ -8434,30 +10178,30 @@ HELP_TEXT = (
     "with a record buying it, the bottom signs, the chart shape, liquidity and volume, red flags, and how each sign has paid so far. "
     "It is a checklist, not a prediction. I follow every coin you ask about and later compare its score with what happened.\n\n"
     "/vip - the named wallets (cryptoklotz, 0xdetweiler, unipcs, notanicecat69, angery and the low-cap hunters I find). When one buys a low-cap coin I ping you "
-    "loud and repeat it. /vip add `<address>` `<name>` adds one, /vip remove `<name>` takes it off the list\n"
+    "loud and repeat it. /vip add `<address>` `<name>` adds one, /vip remove `<name>` takes it off the list. 0x wallets are watched on 4 chains; "
+    "/vip chains `<name>` base eth picks fewer\n"
     "/vip style - 🎯 a picky wallet (buys few coins, so each buy means more) gets the loud ping on bigger coins too, a 🔕 sprayer (buys everything) "
     "gets a silent message. I judge it from how many different coins a wallet buys, or you set it: /vip style `<name>` picky|spray|normal|auto "
     "(or /vip add `<address>` `<name>` picky)\n"
-    "/radar - 📡 coins on Robinhood Chain that many wallets keep buying and holding (accumulation); /radar `<coin address>` reads one coin now; "
-    "/alerts radar off silences the alert\n"
+    "/radar - 📡 coins that many wallets keep buying and holding, on Robinhood Chain, Base, Ethereum, BNB Chain and Solana; /radar eth (or base, bnb, solana, "
+    "rh) shows one chain; /radar `<coin address>` reads one coin now; /radar nodes; /radar set / reset change its limits; /alerts radar off silences it\n"
     "/lowcap - what counts as a low cap (now under $1M); /lowcap 500k changes it. The low-cap crowd alert only fires for a young coin whose "
     "wallets bought it in the last day: /lowcap age 30 and /lowcap fresh 12 change those two limits\n"
     "/links - 📌 the coins you sent me: the market cap you sent each at, where it is now, and the wallets I found buying early when one "
-    "went 2x or more. Send a coin again any time and I tell you how it did since\n"
+    "went 2x or more. Send a coin again and I tell you how it did since\n"
     "/shill `<coin address>` - put a coin unipcs shilled on the dip-watch; /kol lists the dip-watch (I alert when a coin on it is down 60-80% from its high)\n"
     "/coins - which coins the saved wallets are buying right now (with each coin's market cap), and which paid off lately\n"
-    "/smart - the wallet book: every accumulating wallet I have saved, who is winning, who earned a place on your list\n"
-    "/stars - ⭐ what the 1 to 3 star rating of a wallet means (a buy is a hit when the coin doubles before it halves; a hit that was mostly "
-    "done before I first saw the buy counts less), plus your wallets and the best rated ones with their stars. A wallet I added myself "
-    "that keeps losing is taken off your list; one you added stays, and I warn you about it\n"
+    "/smart - the wallet book: every accumulating wallet I saved, who is winning, who earned a place on your list\n"
+    "/stars - ⭐ what the 1 to 3 star rating of a wallet means (a buy is a hit when the coin doubles before it halves), plus your wallets and "
+    "the best rated ones. A wallet I added that keeps losing is taken off your list (one you added stays; I warn you)\n"
     "/alerts - which alerts are on; switch one with /alerts rerun off (names: vip, radar, lowcap, kol, smart, wallet, bottom, chart, rerun, narrative)\n"
-    "/data - sends you a fresh copy of my memory file (attach it when you ask Claude what worked)\n"
-    "/backup - sends my memory file now, plus your wallet list as lines to paste back. I also leave a 🗄 safety copy in this chat "
-    "before every update and once a week. To restore, just send me one of those files here: I only add what is missing and "
-    "never delete anything\n"
+    "/data - a fresh copy of my memory file (attach it when you ask Claude what worked)\n"
+    "/backup - my memory file now, plus your wallet list as lines to paste back. A 🗄 safety copy also appears before every update and "
+    "weekly. To restore, send me one of those files here: I only add what is missing, never delete\n"
+    "/bandwidth - 📶 data sent this month (Render's free plan allows 5 GB) and the automatic saver\n"
     "/watch `<wallet address>` `[name]` - add a wallet you trust. I'll say which of your wallets are still in each "
     "coin I flag, add the coins they hold to my watch list, and tell you when one buys or dumps a coin "
-    "(paste several /watch lines in one message to add many at once).\n"
+    "(several /watch lines in one message work).\n"
     "/unwatch `<name or address>` - stop watching it\n"
     "/wallets - your watched wallets (the ones marked 🧠 were found by the bot from results)\n"
     "/bottoms - every coin on Sparsity's bottom map, 3 of 3 down to 0 of 3 (I follow them all and look at who is buying)\n"
@@ -9305,7 +11049,7 @@ def cmd_data() -> str:
     return f"📦 Sent: {name} ({len(blob) / 1024:.0f} KB). Save it, then attach it to your chat with Claude."
 
 
-RESTORE_HINT = ("To restore my memory, send me the file right here in this chat (an attachment): the pinned `bot_memory.json`, "
+RESTORE_HINT = ("To restore my memory, send me the file right here in this chat (an attachment): the pinned `bot_memory.json.gz` (or `bot_memory.json`), "
                 "one of the 🗄 safety copies I leave, or a file from /backup or /data. I only ADD what is missing - wallets, "
                 "results, notes - and never delete or overwrite anything newer. Your /watch lines pasted in one message work too.")
 
@@ -9339,16 +11083,16 @@ def restore_from_file(doc: dict) -> str:
     nothing is removed, and newer data is never replaced by older data."""
     global restore_pending
     name = str(doc.get("file_name") or "that file")
-    if not name.lower().endswith(".json"):
-        return "That doesn't look like one of my memory files (they end in .json). " + RESTORE_HINT
+    if not name.lower().endswith((".json", ".json.gz", ".gz")):
+        return "That doesn't look like one of my memory files (they end in .json or .json.gz). " + RESTORE_HINT
     if int(doc.get("file_size") or 0) > MAX_MEMORY_FILE_MB * 1024 * 1024:
         return "That file is too big for me to read (Telegram lets me read files up to 20 MB). I changed nothing."
     info = tg_api("getFile", json={"file_id": doc["file_id"]})
     r = http.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}", timeout=60)
     r.raise_for_status()
     try:
-        loaded = r.json()
-    except ValueError:
+        loaded = unpack_memory(r.content)[0]          # (v3.9.1: a plain .json file or the compressed one)
+    except (ValueError, zlib.error, EOFError, OSError):
         loaded = None
     if not isinstance(loaded, dict) or not any(isinstance(loaded.get(k), (dict, list)) for k in ("watch", "book", "wallets", "records")):
         return f"I couldn't read {md_escape(name)} as one of my memory files, so I changed nothing."
@@ -9424,6 +11168,8 @@ def handle_command(text: str, notify=None):
         return cmd_data()
     if cmd == "backup":
         return cmd_backup()
+    if cmd in ("bandwidth", "bw", "traffic"):
+        return cmd_bandwidth(args)
     if cmd == "restore":
         return RESTORE_HINT
     if cmd in ("patterns", "charts"):
@@ -9444,6 +11190,13 @@ def handle_update(u: dict):
     msg = u.get("message") or {}
     if str((msg.get("chat") or {}).get("id")) != str(TELEGRAM_CHAT_ID):
         return    # only the owner can give commands
+    try:
+        handle_owner_message(msg)
+    finally:
+        _urgent["t"] = time.time()      # v3.9.1: whatever you just asked may have changed my memory - it is saved within ~10 minutes
+
+
+def handle_owner_message(msg: dict):
     text = (msg.get("text") or "").strip()
     if not text:
         if isinstance(msg.get("document"), dict):      # v3.4: a file sent into the chat = a memory file to restore from
@@ -9518,11 +11271,19 @@ def tg_api(method: str, **kw):
     return r.json().get("result")
 
 
+VOLATILE_TUNING = ("vip_cur", "bw")      # v3.9.1: change every minute (where the last look at each VIP wallet stopped) or are only the data meter: not a reason to save
+
+
 def core_hash() -> str:
     """Fingerprint of the things that matter for the memory file: which calls are open/closed, cooldowns,
-    tuning, tracked wallets. Price ticks don't change it, so the memory isn't re-saved every few minutes."""
+    tuning, tracked wallets. Price ticks don't change it, so the memory isn't re-saved every few minutes.
+    (v3.9.1: the VIP look-counters and the data meter are left out - they changed every minute and made every check look like a change.)"""
+    tun = {k: v for k, v in state["tuning"].items() if k not in VOLATILE_TUNING}
+    bwt = state["tuning"].get("bw")
+    bwt = bwt if isinstance(bwt, dict) else {}
+    tun["bw_cfg"] = [bwt.get("lim"), bwt.get("lv") or 0]      # (the allowance you set and the saver level do count)
     core = [[(r["key"], r["kind"], r["status"], round(r["t0"])) for r in state["records"]],
-            sorted(state["cooldowns"].items()), state["tuning"], sorted(state["wallets"]),
+            sorted(state["cooldowns"].items()), tun, sorted(state["wallets"]),
             sorted((w, d.get("name", "")) for w, d in state["watch"].items()),
             sorted((k, round(b.get("alerted", 0))) for k, b in state["bottoms"].items()),
             [len(state["book"]) // 25, sum(d.get("n", 0) for d in state["book"].values())]]
@@ -9551,42 +11312,83 @@ def backup_caption(others: dict | None = None) -> str:
     return BACKUP_TAG + " | live: " + "; ".join(f"{i},{h},{int(t)}" for i, (h, t) in newest)
 
 
+def backup_due(b: dict, h: str, since: float, now: float) -> bool:
+    """Is it time to save the memory now? (Not for a forced save - the one when I stop, or after a restore.)
+    v3.9.1: saved within ~10 minutes after something you did or a message I sent; otherwise (only prices and follow-ups drifting)
+    every 2 hours at most; at least every 6 hours; never more than BACKUP_DAY_MB a day; slower while the data saver is on."""
+    if _backup_fail["n"] and now - _backup_fail["t"] < min(10800.0, 300.0 * 2 ** min(10, _backup_fail["n"] - 1)):
+        return False                                   # (the last try failed: wait before trying again - 5 min, 10, 20... up to 3 hours - every try uploads the whole file)
+    slow = bw_slow()
+    if since >= BACKUP_REFRESH_SECONDS * (2 if slow >= 4 else 1):
+        return True
+    if h == b.get("hash"):
+        return False
+    first = b.get("hash") == ""                        # the first save after an update (or a late restore)
+    urgent = first or _urgent["t"] > b.get("ts", 0)
+    gap = (BACKUP_FIRST_GAP if first else BACKUP_URGENT_GAP) if urgent else BACKUP_ROUTINE_GAP
+    if since < gap * slow:
+        return False
+    cap = BACKUP_DAY_MB * 1e6
+    if cap > 0 and b.get("day") == utc_day(now):
+        cap = max(cap, 3.0 * float(b.get("size") or 0))
+        if float(b.get("day_n") or 0) + float(b.get("size") or 0) > cap:
+            return False                               # today's allowance for automatic saves is used up
+    return True
+
+
+def backup_done(b: dict, now: float, h: str, size: int):
+    """A save went through: note when, what it held, and how much it was (for the day's allowance)."""
+    b.update(ts=now, hash=h, size=int(size))
+    day = utc_day(now)
+    if b.get("day") != day:
+        b["day"], b["day_n"] = day, 0
+    b["day_n"] = int(b.get("day_n") or 0) + int(size)
+    _backup_fail["n"], _backup_fail["t"] = 0, 0.0
+
+
 def backup_state_to_telegram(force: bool = False):
     """Keep ONE pinned file in the chat up to date. It is edited in place, so the chat doesn't fill up with
-    'pinned a file' / 'pinned Deleted message' notices (a new file is only sent if the old one is gone)."""
+    'pinned a file' / 'pinned Deleted message' notices (a new file is only sent if the old one is gone).
+    v3.9.1: the file is compressed (about a third of the size) and is only re-sent when backup_due() says so."""
     if not (TELEGRAM_BACKUP and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) or restore_pending:
         return
     now, b = time.time(), state["backup"]
     h, since = core_hash(), now - b.get("ts", 0)
-    changed = h != b.get("hash")
-    if not force and not ((changed and since >= BACKUP_MIN_GAP) or since >= BACKUP_REFRESH_SECONDS):
+    if not force and not backup_due(b, h, since, now):
         return
     if b.get("hash") == "":     # the first save after an update (or a late restore): first see what the file in the chat has gained
         merge_chat_file_before_first_save()
         h = core_hash()
-    data, caption, old = memory_blob(), backup_caption(_hb_seen), b.get("msg_id")
+    data, caption, old = memory_blob_gz(), backup_caption(_hb_seen), b.get("msg_id")
     if not data:
         return              # (the scan kept changing the memory while it was being copied - nothing is sent, the next check tries again)
-    if old:
-        try:
-            tg_api("editMessageMedia",
-                   data={"chat_id": TELEGRAM_CHAT_ID, "message_id": old,
-                         "media": json.dumps({"type": "document", "media": "attach://memory", "caption": caption})},
-                   files={"memory": ("bot_memory.json", data)})
-            b.update(ts=now, hash=h)
-            return
-        except requests.RequestException as e:
-            body = getattr(getattr(e, "response", None), "text", "") or ""
-            if "not modified" in body:  # identical content - nothing to do
-                b.update(ts=now, hash=h)
+    try:
+        if old:
+            try:
+                tg_api("editMessageMedia",
+                       data={"chat_id": TELEGRAM_CHAT_ID, "message_id": old,
+                             "media": json.dumps({"type": "document", "media": "attach://memory", "caption": caption})},
+                       files={"memory": (BACKUP_FILE, data)})
+                backup_done(b, now, h, len(data))
                 return
-            log.info("Could not update the pinned memory file in place (%s) - sending a fresh one", scrub(body or e))
-    msg = tg_api("sendDocument", data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption,
-                                       "disable_notification": "true"},
-                 files={"document": ("bot_memory.json", data)})
-    tg_api("pinChatMessage", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": msg["message_id"],
-                                   "disable_notification": True})
-    b.update(msg_id=msg["message_id"], ts=now, hash=h)
+            except requests.RequestException as e:
+                body = getattr(getattr(e, "response", None), "text", "") or ""
+                if "not modified" in body:  # identical content - nothing to do
+                    backup_done(b, now, h, len(data))
+                    return
+                log.info("Could not update the pinned memory file in place (%s) - sending a fresh one", scrub(body or e))
+        msg = tg_api("sendDocument", data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption,
+                                           "disable_notification": "true"},
+                     files={"document": (BACKUP_FILE, data)})
+        tg_api("pinChatMessage", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": msg["message_id"],
+                                       "disable_notification": True})
+        b["msg_id"] = msg["message_id"]
+        backup_done(b, now, h, len(data))
+    except Exception:
+        if not force:
+            _backup_fail["n"] += 1
+            _backup_fail["t"] = time.time()
+        raise
     if old:
         try:
             tg_api("deleteMessage", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": old})
@@ -9610,14 +11412,39 @@ SAFETY_CAPTION_WEEKLY = ("🗄 Weekly safety copy of my memory (wallets, results
                          "memory, send the newest one back to me in this chat and I'll restore from it.")
 
 
-def memory_blob() -> bytes:
-    """The memory as a file's worth of bytes (b'' if the scan kept changing it while it was copied - just ask again later)."""
+def memory_blob(compact: bool = False) -> bytes:
+    """The memory as a file's worth of bytes (b'' if the scan kept changing it while it was copied - just ask again later).
+    compact=True leaves out the spaces (a bit smaller; used for the compressed pinned file)."""
+    try:
+        bw_flush()                  # (v3.9.1: the data meter's latest count goes into the copy)
+    except Exception:
+        log.exception("data meter could not be updated")
     for _ in range(3):
         try:
-            return json.dumps(state).encode()
+            return (json.dumps(state, separators=(",", ":")) if compact else json.dumps(state)).encode()
         except RuntimeError:        # the scan changed the memory while it was being copied: try again
             time.sleep(0.2)
     return b""
+
+
+def memory_blob_gz() -> bytes:
+    """v3.9.1: the memory compressed for the pinned file (about a third of the plain size). Always the same bytes for the same memory."""
+    raw = memory_blob(True)
+    return gzip.compress(raw, compresslevel=6, mtime=0) if raw else b""
+
+
+def unpack_memory(raw: bytes):
+    """A memory file's bytes -> (the memory, the plain JSON bytes). Reads the plain .json files of the earlier versions, the safety copies
+    and the compressed pinned file of v3.9.1 alike. A compressed file is never unpacked past MAX_UNPACKED_MB.
+    Raises ValueError (or zlib.error) when it is not one of my files."""
+    if raw[:2] == b"\x1f\x8b":
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        plain = d.decompress(raw, MAX_UNPACKED_MB * 1024 * 1024)
+        if not d.eof:
+            raise ValueError("the compressed memory file is cut short or too big")
+    else:
+        plain = raw
+    return json.loads(plain), plain
 
 
 def send_memory_copy(blob: bytes, label: str, caption: str) -> bool:
@@ -9644,7 +11471,7 @@ def restore_from_telegram() -> bool:
     info = tg_api("getFile", json={"file_id": doc["file_id"]})
     r = http.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}", timeout=60)
     r.raise_for_status()
-    loaded = r.json()
+    loaded, plain = unpack_memory(r.content)          # v3.9.1: the pinned file may be plain (an older version saved it) or compressed
     old_ver = (loaded.get("tuning") or {}).get("ver") if isinstance(loaded, dict) else None
     merge_state(loaded)
     _pin_problem["other"] = False
@@ -9653,8 +11480,8 @@ def restore_from_telegram() -> bool:
         state["backup"]["hash"] = ""         # the file in the chat is from another version: save this memory over it right at start-up
     state["tuning"]["ver"] = BOT_VERSION
     if old_ver != BOT_VERSION and SNAPSHOT_DAYS > 0:
-        # an update: leave the memory exactly as the old version saved it, so there is always a way back
-        if send_memory_copy(r.content, "before_v" + BOT_VERSION, SAFETY_CAPTION_UPDATE):
+        # an update: leave the memory exactly as the old version saved it, so there is always a way back (v3.9.1: always as a plain .json file)
+        if send_memory_copy(plain, "before_v" + BOT_VERSION, SAFETY_CAPTION_UPDATE):
             state["backup"]["snap_t"] = time.time()
     return True
 
@@ -9681,7 +11508,7 @@ def merge_chat_file_before_first_save():
         info = tg_api("getFile", json={"file_id": doc["file_id"]})
         r = http.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}", timeout=60)
         r.raise_for_status()
-        loaded = r.json()
+        loaded = unpack_memory(r.content)[0]
         if isinstance(loaded, dict):
             added = merge_state_live(loaded)
             if any(added.values()):
@@ -10046,6 +11873,10 @@ def build_checkin(with_wallets: bool = True) -> str:
     """with_wallets=False (the web page) uses only what is already known about the watched wallets - no lookups."""
     now, s = time.time(), last_scan
     L = [f"🩺 *BOT CHECK-IN*  (v{BOT_VERSION})", ""]
+    try:
+        L += [bw_status_line(), ""]
+    except Exception:
+        log.exception("data line of the check-in failed")
     if not s:
         L.append("✅ I'm running, but my first scan hasn't finished yet.")
     else:
@@ -10143,6 +11974,10 @@ _last_beat = 0.0
 def housekeeping():
     """Runs after every scan: memory-restore retry, double-copy check, status check-in."""
     global _last_beat
+    try:
+        bw_check()                       # v3.9.1: where the month's data is heading (judged every ~5 minutes)
+    except Exception as e:
+        log.warning("data meter check failed: %s", scrub(e))
     if time.time() - _last_beat >= HEARTBEAT_SECONDS:
         _last_beat = time.time()
         retry_restore()
@@ -10212,6 +12047,8 @@ async def lifespan(app: FastAPI):
     show37 = not state["tuning"].get("note37")
     show38 = not state["tuning"].get("note38")
     show381 = not state["tuning"].get("note381")
+    show39 = not state["tuning"].get("note39")
+    show391 = not state["tuning"].get("note391")
     log.info("Bot v%s copy %s starting at %s", BOT_VERSION, INSTANCE_ID, my_host())
     log.info("Tracking %d tokens across %s", len(TOKENS), sorted({c for c, _ in TOKENS}))
     log.info("EVM whale wallets configured: %d", len(EVM_WHALES))
@@ -10259,6 +12096,8 @@ async def lifespan(app: FastAPI):
         + (startup_note37() if show37 else "")
         + (startup_note38() if show38 else "")
         + (startup_note381() if show381 else "")
+        + (startup_note39() if show39 else "")
+        + (startup_note391() if show391 else "")
         + ("⚠️ I couldn't find my memory file: something else is pinned in this chat instead of it. If I had wallets or results saved "
            "here before, scroll up, find the newest `bot_memory` file and send it to me here (or pin it again) and I'll restore from it.\n"
            if _pin_problem["other"] else "")
@@ -10283,6 +12122,10 @@ async def lifespan(app: FastAPI):
         state["tuning"]["note38"] = True       # (...and the v3.8 note)
     if show381 and online_sent:
         state["tuning"]["note381"] = True      # (...and the v3.8.1 note)
+    if show39 and online_sent:
+        state["tuning"]["note39"] = True       # (...and the v3.9 note)
+    if show391 and online_sent:
+        state["tuning"]["note391"] = True      # (...and the v3.9.1 note)
     tasks = [asyncio.create_task(scanner_loop()), asyncio.create_task(keepalive_loop()),
              asyncio.create_task(wallet_loop()), asyncio.create_task(command_loop()),
              asyncio.create_task(vip_loop())]
